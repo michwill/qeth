@@ -20,6 +20,7 @@ from .chain import EthClient, wei_to_ether
 from .icons import IconCache, bundled_chain_icon, bundled_native_icon
 from .ledger import DiscoveredAccount, LedgerWorker, PATH_SCHEMES
 from .prices import DefiLlamaPrices, Price, PriceSource
+from .risk import GoPlusRisk, RiskCache
 from .token_metadata import TokenMetadataCache
 from .tokenlists import TokenListEntry, TokenLists
 from .tokens import BlockscoutSource, TokenBalance
@@ -279,19 +280,50 @@ class TokenListWorker(QThread):
                 for b in self.source.list_balances(self.chain, self.address):
                     if b.balance_raw <= 0:
                         continue
-                    if self.show_all:
-                        # Spotlight: pass everything through; scam filter
-                        # gets applied at the display layer via
-                        # _compute_visible_tokens.
-                        tokens.append(b)
+                    known_or_pinned = (
+                        self.lists.is_known(cid, b.contract)
+                        or self.store.is_force_shown(cid, b.contract)
+                    )
+                    if not known_or_pinned:
+                        # Random Blockscout discoveries don't surface in
+                        # any mode. Spotlight is "show my trusted tokens
+                        # regardless of value or hide-state", not "show
+                        # every unknown contract Blockscout knows about".
+                        # User can pin a contract explicitly via the +
+                        # button to bring it in.
                         continue
-                    if self.store.is_hidden(cid, b.contract):
+                    if not self.show_all and self.store.is_hidden(cid, b.contract):
+                        # Hide list applies in normal mode; spotlight
+                        # ignores it (that's the whole point).
                         continue
-                    if (self.lists.is_known(cid, b.contract)
-                            or self.store.is_force_shown(cid, b.contract)):
-                        tokens.append(b)
+                    tokens.append(b)
                 tokens.sort(key=lambda x: x.balance, reverse=True)
             self.fetched.emit(native_wei, tokens)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class RiskWorker(QThread):
+    """Fetch GoPlus per-contract risk reports for any uncached contracts.
+
+    Runs after the balance multicall and before the price fetch so the
+    combined update can already factor risk into the visibility filter.
+    Emits ``fetched(chain_id, {addr_lower: RiskReport})``."""
+
+    fetched = Signal(int, object)
+    failed = Signal(str)
+
+    def __init__(self, source: GoPlusRisk, chain_id: int,
+                 contracts: list[str], parent=None):
+        super().__init__(parent)
+        self.source = source
+        self.chain_id = chain_id
+        self.contracts = list(contracts)
+
+    def run(self) -> None:
+        try:
+            reports = self.source.fetch(self.chain_id, self.contracts)
+            self.fetched.emit(self.chain_id, reports)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -377,8 +409,12 @@ class PricesWorker(QThread):
         self.prices_ready.emit(self.chain.chain_id, prices)
 
 
-def _is_scam_via_lists(lists, chain_id: int, b: TokenBalance) -> bool:
-    return lists.is_likely_scam(chain_id, b.contract, b.symbol, b.name)
+def _is_scam_via_lists(lists, chain_id: int, b: TokenBalance,
+                       risk_cache=None) -> bool:
+    risk = None
+    if risk_cache is not None:
+        risk = risk_cache.get(chain_id, b.contract)
+    return lists.is_likely_scam(chain_id, b.contract, b.symbol, b.name, risk=risk)
 
 
 def _format_usd(value: Decimal) -> str:
@@ -567,8 +603,11 @@ class TokenListPanel(QWidget):
         # and context-menu actions.
         self._chain_id: int | None = None
         # Set externally by MainWindow so we can mark scams with an alarm
-        # icon and short-circuit `_is_likely_scam` against the curated lists.
+        # icon and short-circuit `is_likely_scam` against the curated lists.
         self._token_lists: "TokenLists | None" = None
+        # Same — MainWindow injects so the alarm icon also reflects GoPlus
+        # high-risk verdicts (honeypot / hidden owner / >50% sell tax).
+        self._risk_cache: "RiskCache | None" = None
 
     # ---- displaying data -------------------------------------------------
 
@@ -645,7 +684,10 @@ class TokenListPanel(QWidget):
             # the heuristic" — exactly when a warning is most useful.
             scam = (
                 self._token_lists is not None
-                and _is_scam_via_lists(self._token_lists, chain.chain_id, b)
+                and _is_scam_via_lists(
+                    self._token_lists, chain.chain_id, b,
+                    risk_cache=self._risk_cache,
+                )
             )
             if scam:
                 sym.setIcon(alarm_icon)
@@ -967,6 +1009,8 @@ class MainWindow(QMainWindow):
         self._price_source = DefiLlamaPrices()
         self._wallet_cache = WalletCache()
         self._token_metadata = TokenMetadataCache()
+        self._risk_source = GoPlusRisk()
+        self._risk_cache = RiskCache()
         self._show_all = False
         # (chain_id, address_lower) the panel currently shows; used to
         # skip needless show_cached rebuilds on subsequent refresh calls
@@ -1314,10 +1358,7 @@ class MainWindow(QMainWindow):
                         out[al] = blockscout_meta[al]
                 return out
 
-            def on_balances(cid: int, mc_native, mc_balances: dict) -> None:
-                pv["native_wei"] = int(mc_native)
-                pv["balances_raw"] = {k.lower(): int(v) for k, v in mc_balances.items()}
-                pv["metadata"] = build_metadata()
+            def kick_prices() -> None:
                 pw = PricesWorker(
                     self._price_source, chain,
                     contracts, include_native=True,
@@ -1326,6 +1367,42 @@ class MainWindow(QMainWindow):
                     lambda c, p: self._on_combined_ready(pv, c, p)
                 )
                 self._start_worker(pw)
+
+            def kick_risk_then_prices() -> None:
+                """GoPlus first for any uncached non-whitelisted contracts
+                (whitelisted ones can never be scams, no need to ask),
+                then prices. Risk fetch is fast (~300 ms batched) and
+                only happens once per token thanks to the disk cache."""
+                needed_risk = self._risk_cache.missing(
+                    chain.chain_id,
+                    [c for c in contracts
+                     if not self._token_lists.is_known(chain.chain_id, c)],
+                )
+                if not needed_risk:
+                    kick_prices()
+                    return
+
+                def on_risk(cid: int, reports: dict) -> None:
+                    if reports:
+                        self._risk_cache.put_many(cid, reports)
+                    kick_prices()
+
+                def on_risk_fail(msg: str) -> None:
+                    logging.getLogger("qeth.ui").warning(
+                        "risk fetch failed: %s", msg
+                    )
+                    kick_prices()
+
+                rw = RiskWorker(self._risk_source, chain.chain_id, needed_risk)
+                rw.fetched.connect(on_risk)
+                rw.failed.connect(on_risk_fail)
+                self._start_worker(rw)
+
+            def on_balances(cid: int, mc_native, mc_balances: dict) -> None:
+                pv["native_wei"] = int(mc_native)
+                pv["balances_raw"] = {k.lower(): int(v) for k, v in mc_balances.items()}
+                pv["metadata"] = build_metadata()
+                kick_risk_then_prices()
 
             def on_balances_fail(msg: str) -> None:
                 logging.getLogger("qeth.ui").warning(
@@ -1336,14 +1413,7 @@ class MainWindow(QMainWindow):
                     b.contract.lower(): int(b.balance_raw) for b in blockscout_tokens
                 }
                 pv["metadata"] = build_metadata()
-                pw = PricesWorker(
-                    self._price_source, chain,
-                    contracts, include_native=True,
-                )
-                pw.prices_ready.connect(
-                    lambda c, p: self._on_combined_ready(pv, c, p)
-                )
-                self._start_worker(pw)
+                kick_risk_then_prices()
 
             def kick_balance_multicall() -> None:
                 bw = BalanceWorker(chain, address, contracts)
@@ -1475,11 +1545,11 @@ class MainWindow(QMainWindow):
                                 show_all: bool | None = None) -> list:
         """Apply dust + force-show filter and sort by USD value desc.
 
-        When ``show_all`` is True (spotlight mode) the only filter is
-        the scam heuristic — dust and the user's hide list are ignored.
-        Defaults to ``self._show_all`` so callers can leave it out;
-        ``_save_wallet_cache`` passes False explicitly so it never
-        persists the spotlight superset.
+        Spotlight mode (``show_all``): worker already restricted the
+        input to known-or-pinned, so the only thing the display layer
+        needs to do is skip the dust check. The scam heuristic still
+        runs at render time so pinned-but-scammy contracts get the
+        alarm icon, but it doesn't *filter* anything here.
         """
         if show_all is None:
             show_all = self._show_all
@@ -1488,10 +1558,6 @@ class MainWindow(QMainWindow):
         for b in tokens:
             addr = b.contract.lower()
             if show_all:
-                if self._token_lists.is_likely_scam(
-                    chain.chain_id, addr, b.symbol, b.name
-                ):
-                    continue
                 out.append(b)
                 continue
             if self.store.is_force_shown(chain.chain_id, addr):
@@ -1685,9 +1751,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Token lists loaded ({n} known tokens)", 3000
         )
-        # Hand the lists to the panel so it can run the scam heuristic
-        # for the alarm-icon decision.
+        # Hand the lists + risk cache to the panel so it can run the
+        # combined scam check for the alarm-icon decision.
         self.token_panel._token_lists = self._token_lists
+        self.token_panel._risk_cache = self._risk_cache
         # If a single account is already selected, fetch its tokens now.
         addrs = self._selected_addresses()
         if len(addrs) == 1:

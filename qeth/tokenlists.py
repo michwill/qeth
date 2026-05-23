@@ -319,21 +319,30 @@ class TokenLists:
         return (chain_id, address.lower()) in self._index
 
     def is_likely_scam(self, chain_id: int, contract: str,
-                       symbol: str, name: str) -> bool:
+                       symbol: str, name: str,
+                       risk=None) -> bool:
         """Loose heuristic for "shitcoin pretending to be something".
 
         Presence on any curated whitelist short-circuits to False — if
         a token's contract is in Uniswap/CoinGecko/Curve/1inch we trust
-        it regardless of how scammy the on-chain name reads (some real
-        tokens have weird names). Otherwise:
+        it regardless of how scammy the on-chain name reads.
 
-        - URL fragments (``http``, ``.com``, ``t.me/`` …) or claim/visit
-          keywords in the name or symbol -> scam.
-        - Symbol matches a canonical major token (ETH/USDC/USDT/…) but
-          the contract isn't on any whitelist -> impersonation scam.
+        Otherwise, in order of confidence:
+        - ``risk.is_high_risk()`` returns True (GoPlus reported a
+          honeypot / hidden owner / blacklist / >50% sell tax / etc.)
+        - URL fragments (``http``, ``.com``, ``t.me/`` …) or
+          claim/visit keywords in the name or symbol.
+        - Symbol matches a canonical major (ETH/USDC/…) but the
+          contract isn't whitelisted (= impersonation).
+
+        ``risk`` is a ``qeth.risk.RiskReport`` or None; passing None is
+        the same as having no GoPlus data yet — the heuristic still
+        catches the obvious URL/keyword/impersonation cases.
         """
         if self.is_known(chain_id, contract):
             return False
+        if risk is not None and risk.is_high_risk():
+            return True
         blob = f" {(name or '').lower()} {(symbol or '').lower()} "
         if any(n in blob for n in _SCAM_URL_NEEDLES):
             return True
