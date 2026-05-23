@@ -194,6 +194,7 @@ class MainWindow(QMainWindow):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Accounts"])
         self.tree.setRootIsDecorated(True)
+        self.tree.setTextElideMode(Qt.ElideMiddle)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection)
         splitter.addWidget(self.tree)
 
@@ -233,11 +234,16 @@ class MainWindow(QMainWindow):
                 ledger_root.addChild(grp)
                 groups[scheme] = grp
             addr = a["address"]
-            it = QTreeWidgetItem([addr])
+            is_default = (
+                self.store.default_account is not None
+                and addr.lower() == self.store.default_account.lower()
+            )
+            label = f"[{addr}]" if is_default else f" {addr} "
+            it = QTreeWidgetItem([label])
             it.setData(0, Qt.UserRole, addr)
             it.setFont(0, QFont("monospace"))
             grp.addChild(it)
-            if addr == self.store.default_account:
+            if is_default:
                 default_item = it
         ledger_root.setExpanded(True)
         for g in groups.values():
