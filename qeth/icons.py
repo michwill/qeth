@@ -13,8 +13,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 
 log = logging.getLogger("qeth.icons")
 
@@ -25,25 +25,59 @@ USER_AGENT = "qeth/0.1"
 FETCH_TIMEOUT = 10.0
 
 
+CIRCULAR_RENDER_SIZE = 64   # Rendered once, scaled down by Qt for display.
+
+
+def to_circular(src: QPixmap, size: int = CIRCULAR_RENDER_SIZE) -> QPixmap:
+    """Return a copy of ``src`` cropped to a circle, anti-aliased.
+
+    Source is centre-cropped to a square first (KeepAspectRatioByExpanding)
+    so non-square inputs don't get squashed. Rendered at a fixed 64×64 and
+    then scaled down by the view at draw time — fine for the 18–20 px
+    cells we display in and avoids re-rendering on every paint.
+    """
+    if src.isNull() or size <= 0:
+        return src
+    out = QPixmap(size, size)
+    out.fill(Qt.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    path = QPainterPath()
+    path.addEllipse(0.0, 0.0, float(size), float(size))
+    painter.setClipPath(path)
+    scaled = src.scaled(
+        size, size,
+        Qt.KeepAspectRatioByExpanding,
+        Qt.SmoothTransformation,
+    )
+    x = (scaled.width() - size) // 2
+    y = (scaled.height() - size) // 2
+    painter.drawPixmap(-x, -y, scaled)
+    painter.end()
+    return out
+
+
 def bundled_native_icon(symbol: str) -> QPixmap | None:
     """Return the bundled native-asset icon for a chain symbol (ETH, MATIC,
-    …), or None if no file ships for that symbol."""
+    …), or None if no file ships for that symbol. Cropped to a circle for
+    visual consistency with token icons."""
     p = BUNDLED_NATIVE_DIR / f"{symbol.upper()}.png"
     if not p.exists():
         return None
     pix = QPixmap(str(p))
-    return pix if not pix.isNull() else None
+    return to_circular(pix) if not pix.isNull() else None
 
 
 def bundled_chain_icon(chain_id: int) -> QPixmap | None:
     """Return the bundled chain logo by chain id, or None if no file ships
     for that chain. Distinct from the native-asset icon: e.g. Optimism's
-    chain logo is the red O, not the ETH diamond."""
+    chain logo is the red O, not the ETH diamond. Circular-cropped."""
     p = BUNDLED_CHAIN_DIR / f"{int(chain_id)}.png"
     if not p.exists():
         return None
     pix = QPixmap(str(p))
-    return pix if not pix.isNull() else None
+    return to_circular(pix) if not pix.isNull() else None
 
 
 class _IconFetchWorker(QThread):
@@ -97,8 +131,9 @@ class IconCache(QObject):
             return pix
         for p in self._candidate_paths(chain_id, contract):
             if p.exists():
-                pix = QPixmap(str(p))
-                if not pix.isNull():
+                raw = QPixmap(str(p))
+                if not raw.isNull():
+                    pix = to_circular(raw)
                     self._mem[key] = pix
                     return pix
         return None
@@ -143,17 +178,17 @@ class IconCache(QObject):
             self._inflight.discard(key)
         if data is None:
             return
-        pix = QPixmap()
-        if not pix.loadFromData(bytes(data)):
+        raw = QPixmap()
+        if not raw.loadFromData(bytes(data)):
             return  # unsupported format (e.g. SVG) — could add QSvgRenderer later
-        self._mem[key] = pix
-        # Persist using the URL's extension so re-loads work.
-        # (We don't know the original URL here; saving as .png is safe since
-        #  QPixmap can re-encode.)
+        # Memory cache stores the circular-cropped version that will be
+        # handed to QIcon directly; the original square image is what we
+        # write to disk so a future code change can re-process it.
+        self._mem[key] = to_circular(raw)
         path = self._dir(chain_id) / f"{contract.lower()}.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            pix.save(str(path), "PNG")
+            raw.save(str(path), "PNG")
         except Exception as e:
             log.debug("icon save failed: %s — %s", path, e)
         self.icon_ready.emit(chain_id, contract.lower())
