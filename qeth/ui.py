@@ -354,6 +354,21 @@ def _format_usd(value: Decimal) -> str:
     return f"${value:,.2f}"
 
 
+# Map "e[+-]?N" suffixes to typographic ×10ⁿ notation, since balances on
+# scam-airdrop tokens routinely land in the 10¹⁵+ range and "9.12e+10" reads
+# noticeably worse than "9.12 × 10¹⁰".
+_SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
+
+
+def _format_balance(value: Decimal) -> str:
+    s = f"{value:.6g}"
+    if "e" not in s and "E" not in s:
+        return s
+    mantissa, _, exp = s.lower().partition("e")
+    exp = exp.lstrip("+")              # drop leading "+", keep "-"
+    return f"{mantissa} × 10{exp.translate(_SUPERSCRIPT)}"
+
+
 class _NumericItem(QTableWidgetItem):
     """QTableWidgetItem that sorts numerically by an associated Decimal,
     regardless of the formatted display text. Falls back to string compare
@@ -471,7 +486,7 @@ class TokenListPanel(QWidget):
         native_pix = bundled_native_icon(chain.symbol)
         if native_pix is not None:
             sym.setIcon(QIcon(native_pix))
-        bal = _NumericItem(f"{native_balance:.6g}", native_balance)
+        bal = _NumericItem(_format_balance(native_balance), native_balance)
         bal.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         bal.setFont(bf)
         val = _NumericItem("", Decimal(0))
@@ -497,7 +512,7 @@ class TokenListPanel(QWidget):
                 sym.setIcon(QIcon(pix))
             elif entry and entry.logo_uri:
                 self._icons.request(chain.chain_id, b.contract, entry.logo_uri)
-            bal = _NumericItem(f"{b.balance:.6g}", b.balance)
+            bal = _NumericItem(_format_balance(b.balance), b.balance)
             bal.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             val = _NumericItem("", Decimal(0))
             val.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -612,7 +627,7 @@ class TokenListPanel(QWidget):
             bal_cell = self.table.item(row, 1)
             if bal_cell is None:
                 continue
-            bal_cell.setText(f"{value:.6g}")
+            bal_cell.setText(_format_balance(value))
             if isinstance(bal_cell, _NumericItem):
                 bal_cell.set_value(value)
         self.table.setSortingEnabled(True)
