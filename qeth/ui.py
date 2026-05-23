@@ -421,12 +421,24 @@ class TokenListPanel(QWidget):
         tokens: list[TokenBalance],
         list_entries: dict,    # (chain_id, addr_lower) -> TokenListEntry
     ) -> None:
-        """Populate the table with the native asset on top, then ERC-20s."""
+        """Populate the table with the native asset on top, then ERC-20s.
+
+        Caller is responsible for wrapping this (and any subsequent
+        set_prices) in ``setUpdatesEnabled(False/True)`` when invoked
+        during a refresh — otherwise the row-count change can produce a
+        brief blank frame between rows being resized and cells being
+        re-populated. See ``render_full`` for the safe one-shot helper.
+        """
         self._chain_id = chain.chain_id
         # Disable sorting while populating; re-enabling at the end triggers
         # a single sort by the current header indicator.
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
+        # Set the new row count directly. If smaller than current, Qt
+        # truncates from the bottom; if larger, it appends empty rows. Old
+        # cells in surviving rows persist until we overwrite them just
+        # below, avoiding the all-blank moment that setRowCount(0) would
+        # cause. Callers that need to fully replace contents still get
+        # correct results.
         row_count = 1 + len(tokens)
         self.table.setRowCount(row_count)
 
@@ -482,6 +494,18 @@ class TokenListPanel(QWidget):
 
         self.table.setSortingEnabled(True)
 
+    def render_full(self, chain, native_wei: int, tokens: list[TokenBalance],
+                    entries: dict, prices: dict) -> None:
+        """Atomic full re-render: rows + balances + prices in one go,
+        with paint events suspended so the user never sees an
+        intermediate blank or pre-price-filter state."""
+        self.setUpdatesEnabled(False)
+        try:
+            self.show_balances(chain, native_wei, tokens, entries)
+            self.set_prices(chain.chain_id, prices)
+        finally:
+            self.setUpdatesEnabled(True)
+
     def show_cached(self, chain, cached: CachedWallet) -> None:
         """Render immediately from a cached wallet snapshot. Reuses the
         normal show_balances + set_prices code paths so display + sort +
@@ -501,8 +525,6 @@ class TokenListPanel(QWidget):
                     symbol=t.symbol, name=t.name, decimals=t.decimals,
                     source="cache", logo_uri=t.logo_uri,
                 )
-        self.show_balances(chain, cached.native_balance_wei, tokens, entries)
-
         prices: dict = {}
         if cached.native_price_usd:
             prices[""] = Price(
@@ -514,7 +536,7 @@ class TokenListPanel(QWidget):
                 prices[t.contract.lower()] = Price(
                     Decimal(t.price_usd), t.price_updated, "cache",
                 )
-        self.set_prices(chain.chain_id, prices)
+        self.render_full(chain, cached.native_balance_wei, tokens, entries, prices)
 
     def contract_set_matches(self, chain, tokens: list[TokenBalance]) -> bool:
         """True if the panel currently displays exactly the contract set
@@ -1056,10 +1078,13 @@ class MainWindow(QMainWindow):
         chain = pv["chain"]
         if chain.chain_id != chain_id:
             return
-        # If the user moved on to a different view in the meantime, just
-        # let the prices update whatever's showing (cheap, idempotent).
+        # Drop stale results. If the user switched wallets while this
+        # pipeline was running, pushing prices/balances from the previous
+        # wallet would hide every row whose address doesn't happen to
+        # appear in both wallets (the "tokens disappear and reappear"
+        # flicker), then the current view's own pipeline would restore
+        # them moments later.
         if self._displayed_view != pv["view_key"]:
-            self.token_panel.set_prices(chain_id, prices)
             return
 
         address = pv["address"]
@@ -1102,9 +1127,9 @@ class MainWindow(QMainWindow):
             self.token_panel.set_prices(chain.chain_id, prices)
         else:
             # Token set genuinely changed (new airdrop / removed token):
-            # rebuild, then apply prices.
-            self.token_panel.show_balances(chain, native_wei, visible, entries)
-            self.token_panel.set_prices(chain.chain_id, prices)
+            # atomic rebuild + price application so the table never shows
+            # an intermediate row-resize blank.
+            self.token_panel.render_full(chain, native_wei, visible, entries, prices)
 
         # Cache only the visible (post-dust, post-force-show) set in the
         # same order the panel rendered them.
