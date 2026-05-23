@@ -46,12 +46,29 @@ the last digits, and the bug compounds when the value reaches tx
 construction or comparisons. `float` is fine for non-money: HTTP
 timeouts, TTLs, UI sizes, animation frames.
 
-### PySide6 signals: `Signal(object, ...)` for big ints
+### PySide6 signals: `Signal(object, ...)` for big ints (and any container holding them)
 
 `Signal(int, ...)` maps to `qint32` and overflows past ~2.1×10⁹. Any
 signal carrying wei, gas, block numbers, nonces, or token amounts
-must use `Signal(object, ...)`. `int` is fine only for small, bounded
-values (chain ids, list indices, derivation indices, table rows).
+must use `Signal(object, ...)`.
+
+The trap is bigger than it looks: PySide6 also marshals the *contents*
+of container parameters declared as `dict` / `list` / `tuple`, so
+`Signal(int, dict)` overflows when any dict value is a big int (we
+hit qint64 overflow at ~3.2×10¹⁹ on raw ERC-20 balances). Treat
+container parameters carrying chain values the same way — use
+`Signal(..., object, ...)` not `Signal(..., dict, ...)`. `int` is
+fine only for small, bounded primitives (chain ids, list indices,
+derivation indices, table rows).
+
+### Long-lived QThreads
+
+Don't park a `QThread` in a single attribute slot (`self._worker = …`)
+that gets reassigned on the next refresh. Overwriting drops the
+previous worker; if it's still running, Qt's QThread destructor
+`abort()`s the whole process. Track workers in a `set[QThread]` and
+let them self-evict via the `finished` signal (`MainWindow._start_worker`
+in this codebase is the pattern).
 
 ### Use the chain abstraction, don't reinvent JSON-RPC
 
