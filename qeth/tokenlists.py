@@ -278,12 +278,13 @@ class TokenLists:
     def __init__(
         self,
         sources: list[TokenListSource] | None = None,
-        cache_dir: Path = CACHE_DIR,
+        cache_dir: Path | None = None,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         timeout: float = DEFAULT_TIMEOUT,
     ):
         self.sources = sources if sources is not None else list(DEFAULT_SOURCES)
-        self.cache_dir = cache_dir
+        # See RiskCache for why we don't bind the default at def-time.
+        self.cache_dir = cache_dir if cache_dir is not None else CACHE_DIR
         self.ttl_seconds = ttl_seconds
         self.timeout = timeout
         self._lock = threading.RLock()

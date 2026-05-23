@@ -25,8 +25,9 @@ class TokenMetadataCache:
     after a multicall and the whole chain file is rewritten once.
     """
 
-    def __init__(self, cache_dir: Path = CACHE_DIR):
-        self.cache_dir = cache_dir
+    def __init__(self, cache_dir: Optional[Path] = None):
+        # See RiskCache for why we don't bind the default at def-time.
+        self.cache_dir = cache_dir if cache_dir is not None else CACHE_DIR
         self._lock = threading.RLock()
         self._chains: dict[int, dict[str, dict]] = {}
 

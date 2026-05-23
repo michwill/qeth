@@ -155,9 +155,13 @@ class RiskCache:
     callers re-fetch them.
     """
 
-    def __init__(self, cache_dir: Path = CACHE_DIR,
+    def __init__(self, cache_dir: Optional[Path] = None,
                  ttl_seconds: float = DEFAULT_TTL_SECONDS):
-        self.cache_dir = cache_dir
+        # Look up CACHE_DIR at instantiation, not at function definition
+        # time, so monkeypatch.setattr(qeth.risk, "CACHE_DIR", ...) in
+        # tests actually takes effect. (Default-arg expressions evaluate
+        # once at def-time and capture the *current* value of CACHE_DIR.)
+        self.cache_dir = cache_dir if cache_dir is not None else CACHE_DIR
         self.ttl_seconds = ttl_seconds
         self._lock = threading.RLock()
         self._chains: dict[int, dict[str, RiskReport]] = {}

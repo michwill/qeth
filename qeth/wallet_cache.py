@@ -48,8 +48,9 @@ class CachedWallet:
 
 
 class WalletCache:
-    def __init__(self, cache_dir: Path = CACHE_DIR):
-        self.cache_dir = cache_dir
+    def __init__(self, cache_dir: Optional[Path] = None):
+        # See RiskCache for why we don't bind the default at def-time.
+        self.cache_dir = cache_dir if cache_dir is not None else CACHE_DIR
         self._lock = threading.Lock()
 
     def _path(self, chain_id: int, address: str) -> Path:
