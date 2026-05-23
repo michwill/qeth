@@ -1,3 +1,5 @@
+import json
+import urllib.request
 from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal
@@ -13,28 +15,35 @@ PATH_SCHEMES: dict[str, str] = {
     "BIP44 Standard": BIP44,
 }
 
+AUTO_STOP_CONSECUTIVE_ZEROS = 3
+AUTO_DETECT_HARD_CAP = 100
+
 
 @dataclass
 class DiscoveredAccount:
     address: str
     path: str
     index: int
+    balance_wei: int = 0
 
 
 class LedgerWorker(QThread):
     """Enumerates Ledger accounts in a background thread.
 
-    Emits `discovered` per account, then `finished_ok`, or `failed` with message.
+    If `count` is 0, scans until `AUTO_STOP_CONSECUTIVE_ZEROS` empty accounts
+    in a row (up to `AUTO_DETECT_HARD_CAP`). Balances are fetched from
+    `rpc_url` if provided.
     """
 
     discovered = Signal(object)
     finished_ok = Signal()
     failed = Signal(str)
 
-    def __init__(self, scheme: str, count: int, parent=None):
+    def __init__(self, scheme: str, count: int, rpc_url: str | None = None, parent=None):
         super().__init__(parent)
         self.scheme = scheme
         self.count = count
+        self.rpc_url = rpc_url
 
     def run(self) -> None:
         try:
@@ -58,13 +67,51 @@ class LedgerWorker(QThread):
             self.failed.emit(f"Unknown derivation scheme: {self.scheme}")
             return
 
+        auto = self.count == 0
+        max_scan = AUTO_DETECT_HARD_CAP if auto else self.count
+        consecutive_zero = 0
+
         try:
-            for i in range(self.count):
+            for i in range(max_scan):
                 path = template.format(i=i)
                 acct = get_account_by_path(path, dongle=dongle)
-                self.discovered.emit(
-                    DiscoveredAccount(address=acct.address, path=path, index=i)
-                )
+                balance = self._balance(acct.address) if self.rpc_url else 0
+                self.discovered.emit(DiscoveredAccount(
+                    address=acct.address, path=path, index=i, balance_wei=balance
+                ))
+                if auto:
+                    if balance == 0:
+                        consecutive_zero += 1
+                        if consecutive_zero >= AUTO_STOP_CONSECUTIVE_ZEROS:
+                            break
+                    else:
+                        consecutive_zero = 0
             self.finished_ok.emit()
         except Exception as e:
             self.failed.emit(f"Error reading account: {e}")
+
+    def _balance(self, address: str) -> int:
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+            "params": [address, "latest"],
+        }
+        req = urllib.request.Request(
+            self.rpc_url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                # DRPC's Cloudflare front rejects requests with the default
+                # Python-urllib/x.y User-Agent (HTTP 403, "error code: 1010").
+                "User-Agent": "qeth/0.1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read())
+            result = data.get("result")
+            if isinstance(result, str):
+                return int(result, 16)
+        except Exception:
+            pass
+        return 0

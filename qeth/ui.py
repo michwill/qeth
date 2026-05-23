@@ -17,10 +17,11 @@ from .ledger import DiscoveredAccount, LedgerWorker, PATH_SCHEMES
 # --- Add Ledger dialog -------------------------------------------------------
 
 class AddLedgerDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, chain, parent=None):
         super().__init__(parent)
+        self._chain = chain
         self.setWindowTitle("Add Ledger accounts")
-        self.setMinimumSize(560, 420)
+        self.setMinimumSize(640, 460)
 
         layout = QVBoxLayout(self)
 
@@ -29,13 +30,15 @@ class AddLedgerDialog(QDialog):
         self.scheme_combo.addItems(list(PATH_SCHEMES.keys()))
         form.addRow("Derivation scheme:", self.scheme_combo)
         self.count_spin = QSpinBox()
-        self.count_spin.setRange(1, 50)
-        self.count_spin.setValue(5)
+        self.count_spin.setRange(0, 100)
+        self.count_spin.setValue(0)
+        self.count_spin.setSpecialValueText("Auto-detect (stop after 3 empty)")
         form.addRow("Accounts to scan:", self.count_spin)
         layout.addLayout(form)
 
         layout.addWidget(QLabel(
-            "Connect your Ledger, unlock it, and open the Ethereum app, then click Scan."
+            "Connect your Ledger, unlock it, and open the Ethereum app, then click Scan.\n"
+            f"Balances are queried on {chain.name}; non-empty accounts are pre-selected."
         ))
 
         self.results = QListWidget()
@@ -72,22 +75,33 @@ class AddLedgerDialog(QDialog):
         self.results.clear()
         self.add_btn.setEnabled(False)
         n = self.count_spin.value()
-        self.progress.setRange(0, n)
-        self.progress.setValue(0)
+        if n == 0:
+            self.progress.setRange(0, 0)  # indeterminate spinner
+        else:
+            self.progress.setRange(0, n)
+            self.progress.setValue(0)
         self.progress.setVisible(True)
         self.scan_btn.setEnabled(False)
-        self._worker = LedgerWorker(self.scheme_combo.currentText(), n)
+        self._worker = LedgerWorker(
+            self.scheme_combo.currentText(), n, rpc_url=self._chain.rpc_url
+        )
         self._worker.discovered.connect(self._on_found)
         self._worker.finished_ok.connect(self._on_done)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
     def _on_found(self, acct: DiscoveredAccount) -> None:
-        item = QListWidgetItem(f"#{acct.index:<3} {acct.address}   {acct.path}")
+        balance = acct.balance_wei / 1e18
+        label = (
+            f"#{acct.index:<3} {acct.address}   "
+            f"{balance:.6f} {self._chain.symbol}"
+        )
+        item = QListWidgetItem(label)
         item.setData(Qt.UserRole, acct)
-        item.setSelected(True)
+        item.setSelected(acct.balance_wei > 0)
         self.results.addItem(item)
-        self.progress.setValue(self.progress.value() + 1)
+        if self.progress.maximum() > 0:
+            self.progress.setValue(self.progress.value() + 1)
 
     def _on_done(self) -> None:
         self.progress.setVisible(False)
@@ -331,7 +345,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Copied {addr} to clipboard", 3000)
 
     def _add_ledger(self) -> None:
-        dlg = AddLedgerDialog(self)
+        dlg = AddLedgerDialog(self.store.current_chain(), self)
         if dlg.exec() != QDialog.Accepted:
             return
         scheme = dlg.scheme_combo.currentText()
