@@ -18,8 +18,9 @@ from .chain import EthClient, wei_to_ether
 from .icons import IconCache, bundled_chain_icon, bundled_native_icon
 from .ledger import DiscoveredAccount, LedgerWorker, PATH_SCHEMES
 from .prices import DefiLlamaPrices, Price, PriceSource
-from .tokenlists import TokenLists
+from .tokenlists import TokenListEntry, TokenLists
 from .tokens import BlockscoutSource, TokenBalance
+from .wallet_cache import CachedWallet, WalletCache
 
 
 # --- Add Ledger dialog -------------------------------------------------------
@@ -444,6 +445,86 @@ class TokenListPanel(QWidget):
 
         self.table.setSortingEnabled(True)
 
+    def show_cached(self, chain, cached: CachedWallet) -> None:
+        """Render immediately from a cached wallet snapshot. Reuses the
+        normal show_balances + set_prices code paths so display + sort +
+        dust filter behave identically to a fresh fetch."""
+        tokens: list[TokenBalance] = [
+            TokenBalance(
+                contract=t.contract, symbol=t.symbol, name=t.name,
+                decimals=t.decimals, balance_raw=t.balance_raw,
+            )
+            for t in cached.tokens
+        ]
+        entries: dict = {}
+        for t in cached.tokens:
+            if t.logo_uri:
+                entries[(chain.chain_id, t.contract.lower())] = TokenListEntry(
+                    chain_id=chain.chain_id, address=t.contract.lower(),
+                    symbol=t.symbol, name=t.name, decimals=t.decimals,
+                    source="cache", logo_uri=t.logo_uri,
+                )
+        self.show_balances(chain, cached.native_balance_wei, tokens, entries)
+
+        prices: dict = {}
+        if cached.native_price_usd:
+            prices[""] = Price(
+                Decimal(cached.native_price_usd),
+                cached.native_price_updated, "cache",
+            )
+        for t in cached.tokens:
+            if t.price_usd:
+                prices[t.contract.lower()] = Price(
+                    Decimal(t.price_usd), t.price_updated, "cache",
+                )
+        self.set_prices(chain.chain_id, prices)
+
+    def update_balances_if_set_unchanged(
+        self,
+        chain,
+        native_wei: int,
+        tokens: list[TokenBalance],
+    ) -> bool:
+        """If the displayed contract set matches the new fetch, update
+        balance cells in place (no table rebuild → no flicker). Returns
+        False to tell the caller "fall back to show_balances rebuild"
+        when contracts changed (token added/removed)."""
+        if self._chain_id != chain.chain_id:
+            return False
+        expected = {(chain.chain_id, self.NATIVE_CONTRACT)} | {
+            (chain.chain_id, b.contract.lower()) for b in tokens
+        }
+        if set(self._balances.keys()) != expected:
+            return False
+        self.table.setSortingEnabled(False)
+        native_balance = wei_to_ether(native_wei)
+        self._balances[(chain.chain_id, self.NATIVE_CONTRACT)] = native_balance
+        by_addr = {b.contract.lower(): b for b in tokens}
+        for row in range(self.table.rowCount()):
+            sym = self.table.item(row, 0)
+            if sym is None:
+                continue
+            key = sym.data(Qt.UserRole)
+            if not key:
+                continue
+            _, addr = key
+            bal_cell = self.table.item(row, 1)
+            if bal_cell is None:
+                continue
+            if addr == self.NATIVE_CONTRACT:
+                value = native_balance
+            else:
+                b = by_addr.get(addr)
+                if b is None:
+                    continue
+                value = b.balance
+                self._balances[key] = value
+            bal_cell.setText(f"{value:.6g}")
+            if isinstance(bal_cell, _NumericItem):
+                bal_cell.set_value(value)
+        self.table.setSortingEnabled(True)
+        return True
+
     def show_error(self, msg: str) -> None:
         self.table.setRowCount(0)
         self._chain_id = None
@@ -565,6 +646,10 @@ class MainWindow(QMainWindow):
         self._icon_cache = IconCache(self)
         self._price_source = DefiLlamaPrices()
         self._prices_worker: PricesWorker | None = None
+        self._wallet_cache = WalletCache()
+        # Stashed after a successful balance fetch so the post-price callback
+        # has the data it needs to write the wallet cache.
+        self._pending_save: dict | None = None
 
         self._build_toolbar()
         self._build_central()
@@ -756,38 +841,115 @@ class MainWindow(QMainWindow):
         self.token_panel.clear()
 
     def _refresh_tokens(self, address: str) -> None:
-        if not self._token_lists.loaded:
-            self.token_panel.show_message(
-                "Loading token lists… selection will refresh automatically"
-            )
-            return
         chain = self.store.current_chain()
+        cached = self._wallet_cache.load(chain.chain_id, address)
+        if cached is not None:
+            # Immediate render from cache; no flicker while we refresh.
+            self.token_panel.show_cached(chain, cached)
+
+        if not self._token_lists.loaded:
+            if cached is None:
+                self.token_panel.show_message(
+                    "Loading token lists… selection will refresh automatically"
+                )
+            return
+
         # Cancel any in-flight worker (best-effort; QThread won't truly stop).
         self._token_worker = TokenListWorker(
             chain, address, self._token_source, self._token_lists, self.store,
         )
 
         def on_fetched(native_wei: int, tokens: list) -> None:
-            # Build the metadata dict the panel needs for icon URLs.
             entries = {}
             for b in tokens:
                 e = self._token_lists.get(chain.chain_id, b.contract)
                 if e is not None:
                     entries[(chain.chain_id, b.contract.lower())] = e
-            self.token_panel.show_balances(chain, native_wei, tokens, entries)
-            # Now fetch USD prices for the visible set; updates the column in place.
+            # If the displayed token set is unchanged (common case: revisit
+            # an account with no new airdrops since last view) we can update
+            # balance cells in place and avoid a table rebuild flicker.
+            if not self.token_panel.update_balances_if_set_unchanged(
+                chain, native_wei, tokens
+            ):
+                self.token_panel.show_balances(chain, native_wei, tokens, entries)
+            # Stash for cache save after prices land.
+            self._pending_save = {
+                "chain": chain, "address": address, "native_wei": native_wei,
+                "tokens": tokens, "entries": entries,
+            }
             self._prices_worker = PricesWorker(
                 self._price_source, chain,
                 [b.contract for b in tokens],
                 include_native=True,
             )
-            self._prices_worker.prices_ready.connect(self.token_panel.set_prices)
+            self._prices_worker.prices_ready.connect(self._on_prices_ready)
             self._prices_worker.start()
 
+        def on_failed(msg: str) -> None:
+            # Blockscout failed; keep the cache view rather than wiping it.
+            if cached is None:
+                self.token_panel.show_error(msg)
+
         self._token_worker.fetched.connect(on_fetched)
-        self._token_worker.failed.connect(self.token_panel.show_error)
-        self.token_panel.show_loading(address)
+        self._token_worker.failed.connect(on_failed)
+        if cached is None:
+            self.token_panel.show_loading(address)
         self._token_worker.start()
+
+    def _on_prices_ready(self, chain_id: int, prices: dict) -> None:
+        self.token_panel.set_prices(chain_id, prices)
+        ps = self._pending_save
+        if not ps or ps["chain"].chain_id != chain_id:
+            return
+        self._pending_save = None
+        self._save_wallet_cache(
+            ps["chain"], ps["address"], ps["native_wei"],
+            ps["tokens"], prices, ps["entries"],
+        )
+
+    def _save_wallet_cache(
+        self, chain, address: str, native_wei: int,
+        tokens: list, prices: dict, entries: dict,
+    ) -> None:
+        import time
+        from .wallet_cache import CachedToken
+        now = int(time.time())
+        cached = CachedWallet(
+            chain_id=chain.chain_id,
+            address=address.lower(),
+            native_balance_wei=int(native_wei),
+            native_balance_updated=now,
+        )
+        np = prices.get("")
+        if np is not None:
+            cached.native_price_usd = str(np.price_usd)
+            cached.native_price_updated = np.timestamp or now
+
+        # Only cache what the panel would actually display (passes dust /
+        # force-show filter). Sort by USD value desc so the on-disk order
+        # matches the displayed order.
+        from decimal import Decimal as D
+        kept: list[tuple[D, CachedToken]] = []
+        for b in tokens:
+            addr = b.contract.lower()
+            price = prices.get(addr)
+            entry = entries.get((chain.chain_id, addr))
+            force = self.store.is_force_shown(chain.chain_id, addr)
+            value = b.balance * price.price_usd if price else D(0)
+            if not force and (price is None or value < TokenListPanel.DUST_USD_THRESHOLD):
+                continue
+            kept.append((value, CachedToken(
+                contract=addr, symbol=b.symbol, name=b.name,
+                decimals=b.decimals,
+                logo_uri=entry.logo_uri if entry else None,
+                balance_raw=int(b.balance_raw),
+                price_usd=str(price.price_usd) if price else None,
+                balance_updated=now,
+                price_updated=price.timestamp if price else 0,
+            )))
+        kept.sort(key=lambda kv: kv[0], reverse=True)
+        cached.tokens = [t for _, t in kept]
+        self._wallet_cache.save(cached)
 
     def _on_hide_token(self, chain_id: int, contract: str) -> None:
         self.store.hide_token(chain_id, contract)
