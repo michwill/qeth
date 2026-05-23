@@ -59,6 +59,18 @@ class Store:
         self.save()
         return True
 
+    def remove_account(self, address: str) -> bool:
+        with self._lock:
+            addr = address.lower()
+            before = len(self.accounts)
+            self.accounts = [a for a in self.accounts if a["address"].lower() != addr]
+            if len(self.accounts) == before:
+                return False
+            if self.default_account and self.default_account.lower() == addr:
+                self.default_account = self.accounts[0]["address"] if self.accounts else None
+        self.save()
+        return True
+
     def current_chain(self) -> Chain:
         with self._lock:
             for c in self.chains:

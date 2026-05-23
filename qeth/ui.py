@@ -228,6 +228,17 @@ class MainWindow(QMainWindow):
         self.act_copy.setEnabled(False)
         self.act_copy.triggered.connect(self._copy_selected_address)
         tb.addAction(self.act_copy)
+        tb.addSeparator()
+
+        self.act_remove = QAction(
+            QIcon.fromTheme("list-remove",
+                            self.style().standardIcon(QStyle.SP_TrashIcon)),
+            "Remove account",
+            self,
+        )
+        self.act_remove.setEnabled(False)
+        self.act_remove.triggered.connect(self._remove_selected_account)
+        tb.addAction(self.act_remove)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -327,6 +338,7 @@ class MainWindow(QMainWindow):
         items = self.tree.selectedItems()
         addr = items[0].data(0, Qt.UserRole) if items else None
         self.act_copy.setEnabled(bool(addr))
+        self.act_remove.setEnabled(bool(addr))
         if not addr:
             self.details.clear()
             return
@@ -343,6 +355,27 @@ class MainWindow(QMainWindow):
             return
         QApplication.clipboard().setText(addr)
         self.statusBar().showMessage(f"Copied {addr} to clipboard", 3000)
+
+    def _remove_selected_account(self) -> None:
+        items = self.tree.selectedItems()
+        addr = items[0].data(0, Qt.UserRole) if items else None
+        if not addr:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Remove account",
+            f"Remove {addr} from this wallet?\n\n"
+            "The key on your Ledger is untouched; this only forgets the "
+            "address locally. You can re-add it via Scan at any time.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if self.store.remove_account(addr):
+            self._rebuild_tree()
+            self._refresh_status()
+            self.statusBar().showMessage(f"Removed {addr}", 3000)
 
     def _add_ledger(self) -> None:
         dlg = AddLedgerDialog(self.store.current_chain(), self)
