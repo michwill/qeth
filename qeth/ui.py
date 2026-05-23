@@ -9,8 +9,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QSpinBox, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
-    QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
+    QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from decimal import Decimal
@@ -440,9 +441,32 @@ class TokenListPanel(QWidget):
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Symbol", "Balance", "Value (USD)", "Name"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
+        # Disable focus rectangle on the table — many themes draw a 1px
+        # focus border on the current cell which shifts contents on
+        # hover/click. Selection still works without it.
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setShowGrid(False)
+        # Pin padding + border explicitly for every state so no theme can
+        # add an on-hover/on-selected border that shifts the text by 1px.
+        # Selection still highlights the whole row (SelectRows + the rule
+        # below). Hover style is set to match default so it produces no
+        # visible change.
+        self.table.setStyleSheet(
+            "QTableView::item {"
+            "  padding: 3px 6px;"
+            "  border: 0;"
+            "}"
+            "QTableView::item:hover { background: transparent; }"
+            "QTableView::item:selected,"
+            "QTableView::item:selected:hover {"
+            "  background: palette(highlight);"
+            "  color: palette(highlighted-text);"
+            "}"
+        )
         self.table.setIconSize(QSize(20, 20))
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
