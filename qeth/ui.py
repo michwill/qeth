@@ -995,7 +995,7 @@ class MainWindow(QMainWindow):
         self.store = store
         self.rpc = rpc
         self.setWindowTitle("qeth — Ethereum wallet")
-        self.resize(1200, 720)
+        self.resize(1060, 720)
         # Override QMainWindow's inflated minimumSizeHint (it reports
         # ~950x565 even when child widgets only need ~370x500). Floor at
         # something a bit below what the QR + a usable table need.
@@ -1170,7 +1170,7 @@ class MainWindow(QMainWindow):
         left.addWidget(details_wrap)
         left.setStretchFactor(0, 1)
         left.setStretchFactor(1, 1)
-        left.setSizes([320, 400])
+        left.setSizes([290, 365])
 
         outer.addWidget(left)
 
@@ -1184,7 +1184,7 @@ class MainWindow(QMainWindow):
 
         outer.setStretchFactor(0, 1)
         outer.setStretchFactor(1, 1)
-        outer.setSizes([520, 680])
+        outer.setSizes([480, 580])
 
         self.setCentralWidget(outer)
 
