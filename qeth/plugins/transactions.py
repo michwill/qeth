@@ -55,94 +55,64 @@ def _is_full_history(txs: list[Transaction]) -> bool:
 
 
 class TransactionsWorker(QThread):
-    """Walk every page of a wallet's tx history via the configured
-    TransactionSource, emitting each page as it arrives so the UI can
-    render incrementally (newest first, growing as we paginate).
+    """Fetch ONE page of (sent) transactions from Blockscout.
 
-    ``sent_only=True`` filters each page to outgoing transactions
-    (``tx.from_addr == address``). This is the default because the
-    panel sorts by nonce: received-tx nonces are the *sender's* and
-    interleave non-monotonically with the wallet's own nonces. The
-    filter is applied per page so the empty-page-after-filter case
-    (a whole page of received-only txs) just continues walking
-    without misinterpreting as end-of-history.
+    Single-page-per-fetch is what enables the "load on scroll" UX:
+    the plugin kicks one worker on tab open (page 1), then one more
+    per scroll-to-bottom (page 2, 3, …). Auto-walking the entire
+    history at once is too aggressive for accounts with thousands of
+    txs (e.g. the 0x7a16… test address has 17 000+ sent).
 
-    Early-exits when a (filtered) page contains a hash already in the
-    caller's ``known_hashes`` set — that's how repeated runs stay
-    fast: the first page typically overlaps prior history, the merge
-    handles dedup, and we stop without walking the entire history.
-
-    A small inter-page sleep is polite to Blockscout's rate limit;
-    ``max_pages`` is a runaway guard for accounts with deep history."""
+    ``sent_only`` filters out received entries before the signal —
+    their nonces are the *sender's* and would break the nonce-desc
+    sort. ``has_more`` distinguishes "this was a normal full page"
+    from "Blockscout returned fewer than we asked, so we've reached
+    the end" — lets the plugin stop fetching without trying another
+    empty round-trip."""
 
     # Object signal carries Python objects (avoids qint64 marshalling).
-    page_fetched = Signal(int, str, object)   # chain_id, addr_lower, page
-    completed = Signal(int, str)              # chain_id, addr_lower
+    fetched = Signal(int, str, int, object, bool)
+    # (chain_id, addr_lower, page_idx, list[Transaction], has_more)
     failed = Signal(str)
 
     def __init__(self, source: TransactionSource, chain, address: str,
-                 known_hashes=None, page_size: int = 50,
-                 max_pages: int = 1000, page_pause_s: float = 0.2,
-                 sent_only: bool = True, walk_to_end: bool = True,
-                 parent=None):
+                 page: int = 1, page_size: int = 50,
+                 sent_only: bool = True, parent=None):
         super().__init__(parent)
         self.source = source
         self.chain = chain
         self.address = address
-        self.known_hashes = set(known_hashes or ())
+        self.page = page
         self.page_size = page_size
-        self.max_pages = max_pages
-        self.page_pause_s = page_pause_s
         self.sent_only = sent_only
-        # walk_to_end=True ignores the known-hashes overlap check and
-        # walks until Blockscout returns an empty page. Used the first
-        # time we visit a wallet (or whenever the cache is missing
-        # older history). After a full backfill the plugin flips this
-        # off so subsequent refreshes early-exit on overlap.
-        self.walk_to_end = walk_to_end
 
     def run(self) -> None:
         viewer = self.address.lower()
         try:
-            for page_idx in range(1, self.max_pages + 1):
-                raw_page = self.source.list_transactions(
-                    self.chain, self.address,
-                    page=page_idx, limit=self.page_size,
-                )
-                if not raw_page:
-                    # No more rows on the wire — done.
-                    break
-                page = raw_page
-                if self.sent_only:
-                    page = [t for t in raw_page
-                            if t.from_addr.lower() == viewer]
-
-                if page:
-                    self.page_fetched.emit(
-                        self.chain.chain_id, viewer, page,
-                    )
-                    # Caught up: this page already contains entries we
-                    # have cached, so anything older is also cached.
-                    # Skipped when walk_to_end is True — that's used
-                    # the first time we visit (cache may be missing
-                    # older history we haven't yet discovered).
-                    if (not self.walk_to_end
-                            and any(t.hash in self.known_hashes
-                                    for t in page)):
-                        break
-                # Note: an empty page *after filter* doesn't mean the
-                # end of history — it just means this raw page was all
-                # received txs. Keep walking.
-
-                if page_idx < self.max_pages and self.page_pause_s > 0:
-                    self.msleep(int(self.page_pause_s * 1000))
-            self.completed.emit(self.chain.chain_id, viewer)
+            raw = self.source.list_transactions(
+                self.chain, self.address,
+                page=self.page, limit=self.page_size,
+            )
+            # A partial page means Blockscout has nothing more — used
+            # by the plugin to flag the (chain, addr) as exhausted.
+            has_more = len(raw) >= self.page_size
+            page = raw
+            if self.sent_only:
+                page = [t for t in raw if t.from_addr.lower() == viewer]
+            self.fetched.emit(
+                self.chain.chain_id, viewer, self.page, page, has_more,
+            )
         except Exception as e:
             self.failed.emit(str(e))
 
 
 class TransactionsPlugin(Plugin):
     name = "Transactions"
+
+    # How many rows to render at first (and to extend by on each
+    # scroll-to-bottom event). Chosen so the initial open is snappy
+    # even for accounts with thousands of cached txs.
+    INITIAL_BATCH = 50
 
     def __init__(
         self,
@@ -161,8 +131,21 @@ class TransactionsPlugin(Plugin):
         # Active fetches — prevents duplicate Blockscout calls when
         # on_activated / on_account_changed / on_chain_changed all fire
         # close together (e.g. user clicks a new account while the tab
-        # is open).
+        # is open). Also coalesces repeated scroll-to-bottom triggers.
         self._in_flight: set[tuple[int, str]] = set()
+        # Per-key paging state for the load-on-scroll UX.
+        # next_page = page index to fetch on the next scroll-to-bottom.
+        # exhausted = we've fetched the last page (a partial page came
+        # back, OR the cached set now includes nonce 0) — further
+        # network scrolls are ignored for this account.
+        # displayed_count = how many of the cached rows are currently
+        # rendered on the table. Bounded growth via INITIAL_BATCH +
+        # scroll-driven appends keeps rendering O(visible), not
+        # O(cache) — critical for accounts with thousands of cached
+        # entries where rebuilding the whole table freezes the UI.
+        self._next_page: dict[tuple[int, str], int] = {}
+        self._exhausted: set[tuple[int, str]] = set()
+        self._displayed_count: dict[tuple[int, str], int] = {}
         # The widget is built lazily so the plugin can be instantiated
         # outside a Qt event loop (useful in pure-Python imports).
         self._panel = None
@@ -172,6 +155,7 @@ class TransactionsPlugin(Plugin):
     def widget(self) -> QWidget:
         if self._panel is None:
             self._panel = TransactionListPanel()
+            self._panel.scrolled_to_bottom.connect(self._on_scroll_bottom)
         return self._panel
 
     # No bottom-row actions yet. Future: a Refresh button, a "load
@@ -253,9 +237,16 @@ class TransactionsPlugin(Plugin):
                 disk = [t for t in disk if t.from_addr.lower() == addr_l]
                 self._cache[key] = disk
                 cached = disk
+        # Render only the first batch of the cache. Bounded rendering
+        # keeps the open snappy even when the cache holds thousands of
+        # entries (rebuilding a 17 000-row QTableWidget freezes the UI
+        # for tens of seconds).
         if cached is not None:
-            self._panel.show_transactions(cached)
+            count = min(self.INITIAL_BATCH, len(cached))
+            self._displayed_count[key] = count
+            self._panel.show_transactions(cached[:count])
         elif force_fetch or self._is_active():
+            self._displayed_count[key] = 0
             self._panel.show_loading()
 
         if not (force_fetch or self._is_active()):
@@ -265,51 +256,118 @@ class TransactionsPlugin(Plugin):
                 f"Transactions aren't available for {chain.name}."
             )
             return
-        if key in self._in_flight:
+        # If we already hold the wallet's full sent history (nonce 0
+        # present + contiguous), there's nothing newer to refresh and
+        # nothing older to scroll for. Skip the network call.
+        if _is_full_history(cached or []):
+            self._exhausted.add(key)
             return
-        self._in_flight.add(key)
+        # Always (re-)fetch page 1 on open: cheapest way to pick up
+        # txs the user might have sent from another wallet client
+        # since the last visit. Older pages come from scroll.
+        self._fetch_page(key, address, page=1)
 
-        # Decide whether we already hold the wallet's full sent
-        # history — sent nonces are strictly monotonic per sender, so
-        # contiguous + includes nonce 0 ⇒ complete. When complete, the
-        # worker can early-exit on hash overlap (incremental refresh);
-        # otherwise it walks until Blockscout returns an empty page.
-        complete = _is_full_history(cached or [])
-        known = {t.hash for t in (cached or [])}
+    def _fetch_page(self, key, address: str, page: int) -> None:
+        """Kick a single-page fetch. No-op if a fetch for this key is
+        already in flight or if the history is known to be exhausted."""
+        if self.host is None or self._panel is None:
+            return
+        if key in self._in_flight or key in self._exhausted:
+            return
+        chain = self.host.current_chain()
+        self._in_flight.add(key)
         worker = TransactionsWorker(
-            self._source, chain, address,
-            known_hashes=known, walk_to_end=not complete,
+            self._source, chain, address, page=page,
         )
-        worker.page_fetched.connect(self._on_page_fetched)
-        worker.completed.connect(
-            lambda _cid, _addr, k=key: self._in_flight.discard(k)
-        )
+        worker.fetched.connect(self._on_page_fetched)
         worker.failed.connect(
             lambda msg, k=key: self._on_failed(k, msg)
         )
         self.host.start_worker(worker)
 
-    def _on_page_fetched(self, chain_id: int, address_lower: str,
-                         page: list) -> None:
-        """One page of newest-first transactions arrived. Merge it into
-        the cache, save, and re-render — so the list grows as pages
-        come in instead of waiting for the whole backfill to finish."""
-        key = (chain_id, address_lower)
-        existing = self._cache.get(key) or []
-        merged = merge_txs(page, existing)
-        self._cache[key] = merged
-        # Persist after every page so an interrupted backfill leaves
-        # the disk cache holding everything we did fetch.
-        self._disk_cache.save(chain_id, address_lower, merged)
-        # Only repaint if the user still has this view selected.
+    def _on_scroll_bottom(self) -> None:
+        """Panel says the user reached the bottom — extend the view by
+        one more batch. Pulls from the in-memory cache first (cheap),
+        then falls back to a network page when the cache is exhausted."""
         if self.host is None:
             return
         addr = self.host.selected_address
-        if addr is None or addr.lower() != address_lower:
+        if not addr:
             return
-        if self.host.current_chain().chain_id != chain_id:
+        chain = self.host.current_chain()
+        key = (chain.chain_id, addr.lower())
+        cache = self._cache.get(key) or []
+        shown = self._displayed_count.get(key, 0)
+
+        # If there are cached rows we haven't rendered yet, reveal the
+        # next batch without hitting the network.
+        if shown < len(cache):
+            new_count = min(shown + self.INITIAL_BATCH, len(cache))
+            self._displayed_count[key] = new_count
+            self._panel.append_transactions(cache[shown:new_count])
             return
-        self._panel.show_transactions(merged)
+
+        # Otherwise we need fresh data from older pages.
+        next_page = self._next_page.get(key, 1)
+        self._fetch_page(key, addr, page=next_page)
+
+    def _on_page_fetched(self, chain_id: int, address_lower: str,
+                         page_idx: int, page: list, has_more: bool) -> None:
+        """One page arrived. Merge it into the cache, persist, advance
+        the paging cursor, and incrementally update the visible table
+        — never rebuilding it from the full cache (which can be tens
+        of thousands of rows)."""
+        key = (chain_id, address_lower)
+        self._in_flight.discard(key)
+        existing = self._cache.get(key) or []
+        existing_hashes = {t.hash for t in existing}
+        merged = merge_txs(page, existing)
+        self._cache[key] = merged
+        self._disk_cache.save(chain_id, address_lower, merged)
+
+        self._next_page[key] = max(
+            self._next_page.get(key, 1), page_idx + 1,
+        )
+        new_rows = [t for t in page if t.hash not in existing_hashes]
+
+        if not has_more or _is_full_history(merged):
+            self._exhausted.add(key)
+        elif not new_rows:
+            # Every entry in this page is already cached — typical when
+            # a previous session left the cache N pages deep and we're
+            # resuming. Auto-advance to the next page so the load-on-
+            # scroll UX doesn't dead-end silently on overlap.
+            self._fetch_page(key, address_lower, page=page_idx + 1)
+
+        # Only touch the panel if the user is still on this view.
+        if (self.host is None
+                or self.host.selected_address is None
+                or self.host.selected_address.lower() != address_lower
+                or self.host.current_chain().chain_id != chain_id):
+            return
+        if not new_rows:
+            return
+        # Newer entries (refresh case, nonce above old top) prepend;
+        # older entries (scroll case) append. Both grow the visible
+        # window without re-rendering the rest of the table.
+        shown = self._displayed_count.get(key, 0)
+        top_nonce = existing[0].nonce if existing else -1
+        newer = [t for t in new_rows if t.nonce > top_nonce]
+        older = [t for t in new_rows if t.nonce <= top_nonce]
+        if newer:
+            newer.sort(key=lambda t: t.nonce, reverse=True)
+            self._panel.prepend_transactions(newer)
+            shown += len(newer)
+        # Append older rows only if the user has already scrolled
+        # past the existing window — otherwise they'd appear between
+        # the displayed top section and the not-yet-revealed cache
+        # entries below, which would look weird. We just save them
+        # to the cache and let the next scroll-to-bottom reveal them.
+        if older and shown >= len(existing):
+            older.sort(key=lambda t: t.nonce, reverse=True)
+            self._panel.append_transactions(older)
+            shown += len(older)
+        self._displayed_count[key] = shown
 
     def _on_failed(self, key: tuple[int, str], msg: str) -> None:
         self._in_flight.discard(key)
@@ -333,7 +391,13 @@ class TransactionsPlugin(Plugin):
 class TransactionListPanel(QWidget):
     """Right pane / Transactions tab: top-level txs for the selected
     account, newest first. Double-click opens the tx in the block
-    explorer; right-click offers copy-hash / copy-counterparty."""
+    explorer; right-click offers copy-hash / copy-counterparty.
+
+    Emits ``scrolled_to_bottom`` whenever the user reaches (or stays
+    at) the end of the visible rows — the plugin uses this as a cue
+    to fetch one more older page."""
+
+    scrolled_to_bottom = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -375,6 +439,10 @@ class TransactionListPanel(QWidget):
         # Short-text cells (Status/Nonce/Time, all ResizeToContents)
         # always fit, so this setting only ever takes effect on Hash.
         self.table.setTextElideMode(Qt.ElideMiddle)
+        # Scroll-to-bottom drives the load-more UX.
+        self.table.verticalScrollBar().valueChanged.connect(
+            self._on_scroll_change
+        )
         h = self.table.horizontalHeader()
         # Status / Nonce / Time auto-fit content (no user-drag — there's
         # nothing meaningful to widen them to). Hash stretches to fill
@@ -403,6 +471,15 @@ class TransactionListPanel(QWidget):
     def set_context(self, chain, viewer_address: str) -> None:
         self._chain = chain
         self._viewer = viewer_address
+
+    def _on_scroll_change(self, value: int) -> None:
+        """Emit ``scrolled_to_bottom`` when the user reaches the
+        bottom of the table. The 4-pixel slack matches Qt's default
+        item-view fuzz so a kinetic scroll that stops a hair short
+        still triggers."""
+        bar = self.table.verticalScrollBar()
+        if bar.maximum() > 0 and value >= bar.maximum() - 4:
+            self.scrolled_to_bottom.emit()
 
     def header_state(self) -> str:
         """Hex-encoded QHeaderView.saveState() — captures column widths,
@@ -451,28 +528,56 @@ class TransactionListPanel(QWidget):
         self.status_lbl.setVisible(False)
         self.table.setRowCount(len(txs))
         for row, tx in enumerate(txs):
-            status = QTableWidgetItem("✓" if tx.success else "✗")
-            status.setTextAlignment(Qt.AlignCenter)
-            status.setToolTip("Success" if tx.success else "Reverted")
+            self._populate_row(row, tx)
 
-            nonce = QTableWidgetItem(str(tx.nonce))
-            nonce.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    def append_transactions(self, txs: list[Transaction]) -> None:
+        """Add rows at the bottom of the existing list (older entries
+        for our nonce-desc sort). No setRowCount-on-the-whole-cache —
+        only the new rows get materialized."""
+        if not txs:
+            return
+        self.status_lbl.setVisible(False)
+        start = self.table.rowCount()
+        self.table.setRowCount(start + len(txs))
+        for offset, tx in enumerate(txs):
+            self._populate_row(start + offset, tx)
 
-            time_item = QTableWidgetItem(_format_datetime(tx.timestamp))
+    def prepend_transactions(self, txs: list[Transaction]) -> None:
+        """Add rows at the top of the existing list (newer entries —
+        used when a page-1 refresh discovers txs the user sent from
+        another wallet client). ``txs`` is expected newest-first;
+        we insertRow in reverse so each ends up at row 0 in order."""
+        if not txs:
+            return
+        self.status_lbl.setVisible(False)
+        for tx in reversed(txs):
+            self.table.insertRow(0)
+            self._populate_row(0, tx)
 
-            # Full hash stored as the cell text; the view elides it
-            # in the middle at paint time based on the column's
-            # current width, so widening the column reveals more
-            # characters until the whole 0x… string fits.
-            hash_item = QTableWidgetItem(tx.hash)
-            hash_item.setFont(QFont("monospace"))
-            hash_item.setToolTip(tx.hash)
-            hash_item.setData(Qt.UserRole, tx.hash)
+    def _populate_row(self, row: int, tx: Transaction) -> None:
+        """Render one tx into ``row``. Shared by show / append /
+        prepend so the cell shape stays consistent across paths."""
+        status = QTableWidgetItem("✓" if tx.success else "✗")
+        status.setTextAlignment(Qt.AlignCenter)
+        status.setToolTip("Success" if tx.success else "Reverted")
 
-            self.table.setItem(row, 0, status)
-            self.table.setItem(row, 1, nonce)
-            self.table.setItem(row, 2, time_item)
-            self.table.setItem(row, 3, hash_item)
+        nonce = QTableWidgetItem(str(tx.nonce))
+        nonce.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        time_item = QTableWidgetItem(_format_datetime(tx.timestamp))
+
+        # Full hash as the cell text; the view elides it in the middle
+        # at paint time based on the column width, so widening the
+        # column reveals more characters until the whole 0x… fits.
+        hash_item = QTableWidgetItem(tx.hash)
+        hash_item.setFont(QFont("monospace"))
+        hash_item.setToolTip(tx.hash)
+        hash_item.setData(Qt.UserRole, tx.hash)
+
+        self.table.setItem(row, 0, status)
+        self.table.setItem(row, 1, nonce)
+        self.table.setItem(row, 2, time_item)
+        self.table.setItem(row, 3, hash_item)
 
     # Column 3 (Hash) carries the full tx hash on UserRole. The
     # explorer-open and context-menu handlers read it from there.

@@ -150,7 +150,9 @@ class TestTransactionsPlugin:
                 method_id="", input_data="0x", success=True,
             )
         ]
-        plugin._on_page_fetched(ETH.chain_id, ADDR.lower(), new_only)
+        plugin._on_page_fetched(
+            ETH.chain_id, ADDR.lower(), 1, new_only, True,
+        )
 
         merged = plugin._cache[(ETH.chain_id, ADDR.lower())]
         # Both entries present, newer first.
@@ -175,7 +177,9 @@ class TestTransactionsPlugin:
                 success=True,
             )
         ]
-        plugin._on_page_fetched(ETH.chain_id, ADDR.lower(), fetched)
+        plugin._on_page_fetched(
+            ETH.chain_id, ADDR.lower(), 1, fetched, True,
+        )
 
         # On disk now — a fresh TransactionCache instance can read it.
         reloaded = TransactionCache().load(ETH.chain_id, ADDR)
@@ -223,37 +227,33 @@ class TestTransactionsPlugin:
                 method_id="", input_data="0x", success=True,
             )
 
-        # Mixed page: one sent + two received with their senders'
-        # (unrelated) nonces.
-        page1 = [
+        rows = [
             _mk("aa", ADDR, 100),               # sent by us
             _mk("bb", "0xstrangeaddress1", 7),  # received
             _mk("cc", "0xstrangeaddress2", 3),  # received
         ]
 
         class _Source:
-            def __init__(self):
-                self.calls = 0
-
             def supports(self, _c):
                 return True
 
-            def list_transactions(self, chain, address, page=1, limit=50):
-                self.calls += 1
-                return page1 if page == 1 else []
+            def list_transactions(self, _c, _a, page=1, limit=50):
+                return rows
 
-        emitted: list[list[Transaction]] = []
-        worker = TransactionsWorker(
-            _Source(), ETH, ADDR, page_pause_s=0,
-        )
-        worker.page_fetched.connect(
-            lambda _c, _a, p: emitted.append(list(p))
+        emitted: list[tuple] = []
+        worker = TransactionsWorker(_Source(), ETH, ADDR, page=1)
+        worker.fetched.connect(
+            lambda cid, addr, idx, txs, more: emitted.append(
+                (cid, addr, idx, list(txs), more)
+            )
         )
         worker.run()
 
-        # Only the sent row survives the filter.
         assert len(emitted) == 1
-        assert [t.hash for t in emitted[0]] == ["0x" + "aa" * 32]
+        cid, addr, idx, txs, more = emitted[0]
+        # Only the sent row survives the filter.
+        assert [t.hash for t in txs] == ["0x" + "aa" * 32]
+        assert (cid, addr, idx) == (1, ADDR.lower(), 1)
 
     def test_worker_filter_can_be_disabled(self, qtbot, tmp_qeth):
         from qeth.plugins.transactions import TransactionsWorker
@@ -274,79 +274,209 @@ class TestTransactionsPlugin:
                 return True
 
             def list_transactions(self, _c, _a, page=1, limit=50):
-                return rows if page == 1 else []
+                return rows
 
         emitted = []
         worker = TransactionsWorker(
-            _Source(), ETH, ADDR, page_pause_s=0, sent_only=False,
+            _Source(), ETH, ADDR, page=1, sent_only=False,
         )
-        worker.page_fetched.connect(
-            lambda _c, _a, p: emitted.append(list(p))
+        worker.fetched.connect(
+            lambda _c, _a, _i, txs, _m: emitted.append(list(txs))
         )
         worker.run()
 
         # Filter off → both rows pass through unchanged.
         assert len(emitted[0]) == 2
 
-    def test_paginating_worker_early_exits_on_known_hash(self, qtbot, tmp_qeth):
-        """When ``walk_to_end=False`` the worker stops the moment a
-        page contains a hash from ``known_hashes``. This is the
-        incremental-refresh path used after the cache has been fully
-        backfilled at least once: page 1 typically overlaps prior
-        history and we're done in one HTTP call."""
-        from qeth.plugins.transactions import TransactionsWorker
+    def test_large_cache_renders_only_initial_batch(self, qtbot, tmp_qeth):
+        """Regression: with thousands of cached entries from a prior
+        auto-walk, opening the tab used to rebuild the whole table at
+        once and freeze the UI for tens of seconds. Initial render
+        must be bounded by INITIAL_BATCH."""
+        from qeth.transactions_cache import TransactionCache
 
-        def _mk(hash_suffix: str, nonce: int) -> Transaction:
+        # Pre-write 1000 sent txs to disk.
+        big = [
+            Transaction(
+                chain_id=1, hash="0x" + format(i, "064x"),
+                block_number=i, timestamp=i, nonce=i,
+                from_addr=ADDR, to_addr="0xfeed",
+                value_wei=0, gas_used=0, gas_price_wei=0,
+                method_id="", input_data="0x", success=True,
+            )
+            for i in range(1000)
+        ]
+        TransactionCache().save(ETH.chain_id, ADDR, big)
+
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        plugin.on_account_changed(ADDR)
+
+        # Cache is fully hydrated …
+        assert len(plugin._cache[(ETH.chain_id, ADDR.lower())]) == 1000
+        # …but the table only materialized INITIAL_BATCH rows.
+        assert plugin.widget().table.rowCount() == plugin.INITIAL_BATCH
+        assert plugin._displayed_count[(ETH.chain_id, ADDR.lower())] \
+            == plugin.INITIAL_BATCH
+
+    def test_scroll_bottom_reveals_more_cached_rows_without_network(
+        self, qtbot, tmp_qeth,
+    ):
+        """When there are still cached rows below the visible window,
+        scroll-to-bottom expands the view from the cache rather than
+        hitting Blockscout."""
+        from qeth.transactions_cache import TransactionCache
+        # Cache holds 200 sent txs; initial display shows 50.
+        cache = [
+            Transaction(
+                chain_id=1, hash="0x" + format(i, "064x"),
+                block_number=i, timestamp=i, nonce=i,
+                from_addr=ADDR, to_addr="0xfeed",
+                value_wei=0, gas_used=0, gas_price_wei=0,
+                method_id="", input_data="0x", success=True,
+            )
+            for i in range(200)
+        ]
+        TransactionCache().save(ETH.chain_id, ADDR, cache)
+
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        plugin.on_account_changed(ADDR)
+        host.started_workers.clear()
+
+        # First scroll-to-bottom: 50 → 100 rendered, no worker.
+        plugin._on_scroll_bottom()
+        assert plugin.widget().table.rowCount() == 2 * plugin.INITIAL_BATCH
+        assert host.started_workers == []
+
+    def test_overlapping_fetch_auto_advances_to_new_data(self, qtbot, tmp_qeth):
+        """When a fetched page contains only entries we already have
+        (typical after a partial backfill from a prior session), the
+        plugin auto-advances to the next page so the load-on-scroll
+        UX doesn't dead-end silently. Stops once a page brings new
+        rows OR Blockscout reports has_more=False."""
+        from qeth.transactions_cache import TransactionCache
+
+        def _mk(n: int) -> Transaction:
             return Transaction(
-                chain_id=1, hash="0x" + hash_suffix * 32,
-                block_number=nonce, timestamp=nonce,
-                nonce=nonce, from_addr=ADDR, to_addr="0xbeef",
+                chain_id=1, hash="0x" + format(n, "064x"),
+                block_number=n, timestamp=n, nonce=n,
+                from_addr=ADDR, to_addr="0xfeed",
                 value_wei=0, gas_used=0, gas_price_wei=0,
                 method_id="", input_data="0x", success=True,
             )
 
-        page1 = [_mk("aa", 5), _mk("bb", 4), _mk("cc", 3)]   # all new
-        page2 = [_mk("dd", 2), _mk("known", 1)]              # overlap
-        page3 = [_mk("ee", 0)]                               # not reached
+        # Pre-cache nonces 100..149 — that's two Blockscout pages
+        # worth of overlap before the real new data shows up.
+        cached = [_mk(n) for n in range(149, 99, -1)]
+        TransactionCache().save(ETH.chain_id, ADDR, cached)
 
-        class _FakeSource:
+        class _Source:
             def __init__(self):
                 self.calls: list[int] = []
 
-            def supports(self, _chain):
+            def supports(self, _c):
                 return True
 
-            def list_transactions(self, chain, address, page=1, limit=50):
+            def list_transactions(self, _c, _a, page=1, limit=50):
                 self.calls.append(page)
                 if page == 1:
-                    return page1
+                    return [_mk(n) for n in range(149, 99, -1)]  # overlap
                 if page == 2:
-                    return page2
-                return page3
+                    return [_mk(n) for n in range(149, 99, -1)]  # overlap
+                if page == 3:
+                    return [_mk(n) for n in range(99, 49, -1)]   # new!
+                return []
 
-        source = _FakeSource()
+        source = _Source()
+        plugin = TransactionsPlugin(source=source)
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        # Drive each kicked worker synchronously the moment it lands
+        # on the host so the auto-advance chain runs end to end.
+        original_start = host.start_worker
+
+        def _start(worker):
+            original_start(worker)
+            worker.run()
+
+        host.start_worker = _start
+
+        plugin.on_activated()   # force_fetch=True path
+
+        # Walked all three pages without further user input.
+        assert source.calls == [1, 2, 3]
+        # The newly-discovered nonces are now in the cache.
+        merged = plugin._cache[(ETH.chain_id, ADDR.lower())]
+        assert min(t.nonce for t in merged) == 50
+
+    def test_scroll_bottom_advances_to_next_page(self, qtbot, tmp_qeth):
+        """The scrolled_to_bottom signal is what drives the
+        load-on-scroll UX: each emission should kick off one
+        single-page worker for the next unfetched page."""
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+
+        # Pretend page 1 landed with one sent tx: cursor advances to 2.
+        seed = [Transaction(
+            chain_id=1, hash="0x" + "aa" * 32, block_number=5,
+            timestamp=1, nonce=5, from_addr=ADDR, to_addr="0xbeef",
+            value_wei=0, gas_used=0, gas_price_wei=0,
+            method_id="", input_data="0x", success=True,
+        )]
+        plugin._on_page_fetched(ETH.chain_id, ADDR.lower(), 1, seed, True)
+        host.started_workers.clear()
+
+        plugin._on_scroll_bottom()
+        assert len(host.started_workers) == 1
+        assert host.started_workers[0].page == 2
+
+        # Once we record an exhausted history, further scrolls no-op.
+        plugin._exhausted.add((ETH.chain_id, ADDR.lower()))
+        host.started_workers.clear()
+        plugin._on_scroll_bottom()
+        assert host.started_workers == []
+
+    def test_worker_signals_has_more_only_on_full_page(self, qtbot, tmp_qeth):
+        """Blockscout returns a partial last page; the worker uses
+        ``len(raw) >= page_size`` to detect it and tells the caller
+        not to ask for more — that's what stops the load-on-scroll
+        cascade gracefully."""
+        from qeth.plugins.transactions import TransactionsWorker
+
+        def _mk(suffix):
+            return Transaction(
+                chain_id=1, hash="0x" + suffix * 32, block_number=1,
+                timestamp=1, nonce=1, from_addr=ADDR, to_addr="0xfeed",
+                value_wei=0, gas_used=0, gas_price_wei=0,
+                method_id="", input_data="0x", success=True,
+            )
+
+        # Page returns 3 rows out of a 5-row limit — that's a partial
+        # page, meaning no more data on the wire.
+        class _Source:
+            def supports(self, _c):
+                return True
+
+            def list_transactions(self, _c, _a, page=1, limit=50):
+                return [_mk("aa"), _mk("bb"), _mk("cc")]
+
+        captured = []
         worker = TransactionsWorker(
-            source, ETH, ADDR,
-            known_hashes={"0x" + "known" * 32}, page_pause_s=0,
-            walk_to_end=False,
+            _Source(), ETH, ADDR, page=1, page_size=5,
         )
-        emitted: list[list[Transaction]] = []
-        worker.page_fetched.connect(
-            lambda _cid, _addr, p: emitted.append(list(p))
+        worker.fetched.connect(
+            lambda _c, _a, _i, _txs, more: captured.append(more)
         )
-        completed: list[tuple] = []
-        worker.completed.connect(
-            lambda cid, addr: completed.append((cid, addr))
-        )
-
-        # Run synchronously so the test doesn't race the QThread.
         worker.run()
-
-        assert source.calls == [1, 2]   # page 3 never fetched
-        assert len(emitted) == 2
-        assert emitted[0] == page1
-        assert emitted[1] == page2
-        assert completed == [(1, ADDR.lower())]
+        assert captured == [False]
 
     def test_unsupported_chain_shows_error_when_activated(self, qtbot, tmp_qeth):
         from qeth.chains import Chain
