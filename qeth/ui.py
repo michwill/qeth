@@ -195,6 +195,12 @@ class MainWindow(QMainWindow):
     def status_message(self, text: str, timeout_ms: int = 3000) -> None:
         self.statusBar().showMessage(text, timeout_ms)
 
+    def token_info(self, chain_id: int, address: str):
+        return self.tokens_plugin.token_lists.get(chain_id, address)
+
+    def icon_cache(self):
+        return self.tokens_plugin.icon_cache
+
     # --- transitional aliases (kept so existing tests / external code
     # that pokes at the panels directly keeps working).
 

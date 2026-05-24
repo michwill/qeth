@@ -244,6 +244,17 @@ class TokensPlugin(Plugin):
         """Alias used by tests + transitional MainWindow code."""
         return self.widget()
 
+    # Read-only accessors so sibling plugins (notably TransactionsPlugin's
+    # details dialog) can look up curated token metadata + share the icon
+    # cache through the Host, without binding to this plugin's class.
+    @property
+    def token_lists(self) -> TokenLists:
+        return self._token_lists
+
+    @property
+    def icon_cache(self) -> IconCache:
+        return self._icon_cache
+
     def widget(self) -> QWidget:
         if self._panel is None:
             self._panel = TokenListPanel(self._icon_cache, self._store)

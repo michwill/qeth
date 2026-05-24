@@ -18,8 +18,13 @@ a cached page yet.
 from __future__ import annotations
 
 import datetime
+import html as _html
 import logging
 from typing import Optional
+
+
+def _escape_html(text: str) -> str:
+    return _html.escape(text, quote=False)
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
@@ -27,7 +32,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout,
-    QHeaderView, QLabel, QMenu, QPushButton, QSizePolicy,
+    QHBoxLayout, QHeaderView, QLabel, QMenu, QPushButton, QSizePolicy,
     QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -312,11 +317,19 @@ class TransactionsPlugin(Plugin):
         if self.host is None or self._panel is None:
             return
         chain = self.host.current_chain()
+        # Pull token-annotation deps from the host. They're optional on
+        # the dialog (so it stays unit-testable without a TokensPlugin),
+        # but in the running app the host always supplies them.
+        token_info = getattr(self.host, "token_info", None)
+        icon_cache_fn = getattr(self.host, "icon_cache", None)
+        icon_cache = icon_cache_fn() if callable(icon_cache_fn) else None
         dialog = TransactionDetailsDialog(
             tx, chain,
             abi_source=self._abi_source,
             abi_cache=self._abi_cache,
             start_worker=self.host.start_worker,
+            token_info=token_info,
+            icon_cache=icon_cache,
             parent=self._panel,
         )
         dialog.show()
@@ -876,6 +889,8 @@ class TransactionDetailsDialog(QDialog):
                  abi_source: BlockscoutAbiSource,
                  abi_cache: AbiCache,
                  start_worker,
+                 token_info=None,
+                 icon_cache=None,
                  parent=None):
         super().__init__(parent)
         self.tx = tx
@@ -883,6 +898,13 @@ class TransactionDetailsDialog(QDialog):
         self._abi_source = abi_source
         self._abi_cache = abi_cache
         self._start_worker = start_worker
+        # Optional dependencies for ERC-20 annotation on the "To:" row.
+        # Plugin passes both when available; tests can leave them None
+        # and the dialog falls back to a plain address line.
+        self._token_info = token_info
+        self._icon_cache = icon_cache
+        self._to_icon_label: Optional[QLabel] = None
+        self._to_addr_lower: Optional[str] = None
 
         self.setWindowTitle(f"Transaction {tx.hash[:10]}…")
         self.resize(720, 560)
@@ -924,9 +946,7 @@ class TransactionDetailsDialog(QDialog):
         form.addRow("Block:", _value_label(str(tx.block_number)))
         form.addRow("Hash:", _value_label(tx.hash, monospace=True))
         form.addRow("From:", _value_label(tx.from_addr, monospace=True))
-        form.addRow("To:",
-                    _value_label(tx.to_addr or "(contract creation)",
-                                 monospace=True))
+        form.addRow("To:", self._build_to_row(tx, chain, mono))
         # Value rendered through wei_to_ether (Decimal) — never float.
         if tx.value_wei:
             ether = wei_to_ether(tx.value_wei)
@@ -1000,3 +1020,77 @@ class TransactionDetailsDialog(QDialog):
             return
         url = f"{self.chain.explorer.rstrip('/')}/tx/{self.tx.hash}"
         QDesktopServices.openUrl(QUrl(url))
+
+    # --- "To:" row composition ------------------------------------------
+
+    def _build_to_row(self, tx: Transaction, chain, mono: QFont) -> QWidget:
+        """The To: cell. Plain address text when the recipient isn't a
+        known ERC-20; address with a leading icon + symbol when it is."""
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        addr = tx.to_addr
+        if not addr:
+            label = QLabel("(contract creation)")
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setFont(mono)
+            row.addWidget(label)
+            row.addStretch(1)
+            return container
+
+        entry = (self._token_info(chain.chain_id, addr)
+                 if self._token_info is not None else None)
+
+        if entry is not None:
+            # Icon on the left, then "SYMBOL (0xaddr…)" rendered as
+            # rich text in a single QLabel so symbol and address sit
+            # flush against the parentheses, with the address in a
+            # monospace face. Icon label is created even when the
+            # pixmap isn't cached yet so the async callback can fill
+            # it without a relayout.
+            self._to_addr_lower = addr.lower()
+            self._to_icon_label = QLabel()
+            # Icon dims match what TokenListPanel uses for inline rows.
+            self._to_icon_label.setFixedSize(20, 20)
+            self._to_icon_label.setScaledContents(True)
+            row.addWidget(self._to_icon_label)
+
+            label = QLabel(
+                f"{_escape_html(entry.symbol)} "
+                f'(<span style="font-family: monospace;">'
+                f"{_escape_html(addr)}</span>)"
+            )
+            label.setTextFormat(Qt.RichText)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            row.addWidget(label, 1)
+
+            if self._icon_cache is not None:
+                pix = self._icon_cache.get(chain.chain_id, addr)
+                if pix is not None and not pix.isNull():
+                    self._to_icon_label.setPixmap(pix)
+                else:
+                    self._icon_cache.icon_ready.connect(self._on_to_icon_ready)
+                    self._icon_cache.request(
+                        chain.chain_id, addr, entry.logo_uri,
+                    )
+        else:
+            addr_label = QLabel(addr)
+            addr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            addr_label.setFont(mono)
+            addr_label.setWordWrap(True)
+            row.addWidget(addr_label, 1)
+
+        return container
+
+    def _on_to_icon_ready(self, chain_id: int, contract: str) -> None:
+        if (self._to_icon_label is None
+                or self._to_addr_lower is None
+                or self._icon_cache is None):
+            return
+        if chain_id != self.chain.chain_id or contract != self._to_addr_lower:
+            return
+        pix = self._icon_cache.get(chain_id, contract)
+        if pix is not None and not pix.isNull():
+            self._to_icon_label.setPixmap(pix)

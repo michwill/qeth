@@ -45,6 +45,18 @@ class Host(Protocol):
     def status_message(self, text: str, timeout_ms: int = 3000) -> None:
         """Show a transient message in the status bar."""
 
+    def token_info(self, chain_id: int, address: str):
+        """Curated token metadata for (chain_id, address), or None.
+        Returns a ``qeth.tokenlists.TokenListEntry`` when the address
+        is in the merged whitelist — used by sibling plugins (e.g. the
+        transactions details dialog) to annotate contract addresses
+        with symbol + icon without coupling to TokensPlugin."""
+
+    def icon_cache(self):
+        """The shared ``qeth.icons.IconCache`` — used by sibling
+        plugins that need to display token icons (after looking up
+        the contract via ``token_info``)."""
+
 
 class Plugin(QObject):
     """One topic in the UI. Subclasses define a ``name`` class attribute
