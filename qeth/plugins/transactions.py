@@ -885,53 +885,71 @@ class TransactionDetailsDialog(QDialog):
         self._start_worker = start_worker
 
         self.setWindowTitle(f"Transaction {tx.hash[:10]}…")
-        self.resize(720, 480)
+        self.resize(720, 560)
 
-        v = QVBoxLayout(self)
+        # Outer layout: comfortable margins so the contents don't bump
+        # against the window chrome.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 16)
+        outer.setSpacing(8)
+
+        # Header fields go in a QFormLayout — labels left-aligned, the
+        # value column starts at the widest label's width so values
+        # line up cleanly underneath each other.
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        v.addLayout(form)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(6)
+        outer.addLayout(form)
 
         mono = QFont("monospace")
 
-        def _label(text: str, *, monospace: bool = False) -> QLabel:
+        def _value_label(text: str, *, monospace: bool = False) -> QLabel:
             lbl = QLabel(text)
             lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
             if monospace:
                 lbl.setFont(mono)
-            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            # Wrap long values (full hashes etc.) so they don't push
+            # the dialog width past the user's screen.
+            lbl.setWordWrap(True)
             return lbl
 
-        form.addRow("Status:", _label("✓ Success" if tx.success else "✗ Reverted"))
-        form.addRow("Nonce:", _label(str(tx.nonce)))
+        form.addRow("Status:",
+                    _value_label("✓ Success" if tx.success else "✗ Reverted"))
+        form.addRow("Nonce:", _value_label(str(tx.nonce)))
         dt = datetime.datetime.fromtimestamp(tx.timestamp)
-        form.addRow("Date:", _label(dt.strftime("%c")))
-        form.addRow("Timestamp:", _label(f"{tx.timestamp} (unix)"))
-        form.addRow("Block:", _label(str(tx.block_number)))
-        form.addRow("Hash:", _label(tx.hash, monospace=True))
-        form.addRow("From:", _label(tx.from_addr, monospace=True))
-        to_text = tx.to_addr or "(contract creation)"
-        form.addRow("To:", _label(to_text, monospace=True))
+        form.addRow("Date:", _value_label(dt.strftime("%c")))
+        form.addRow("Timestamp:", _value_label(f"{tx.timestamp} (unix)"))
+        form.addRow("Block:", _value_label(str(tx.block_number)))
+        form.addRow("Hash:", _value_label(tx.hash, monospace=True))
+        form.addRow("From:", _value_label(tx.from_addr, monospace=True))
+        form.addRow("To:",
+                    _value_label(tx.to_addr or "(contract creation)",
+                                 monospace=True))
         # Value rendered through wei_to_ether (Decimal) — never float.
         if tx.value_wei:
             ether = wei_to_ether(tx.value_wei)
             value_text = f"{ether} {chain.symbol}  ({tx.value_wei} wei)"
         else:
             value_text = "0"
-        form.addRow("Value:", _label(value_text))
-        form.addRow("Method ID:", _label(tx.method_id or "(none — plain transfer)",
-                                        monospace=True))
+        form.addRow("Value:", _value_label(value_text))
+        form.addRow("Method ID:",
+                    _value_label(tx.method_id or "(none — plain transfer)",
+                                 monospace=True))
 
-        # Decoded call goes in a read-only QTextEdit so we can render
-        # syntax-highlighted HTML (function bold, types and values
-        # coloured). QPlainTextEdit would only do flat text.
+        # Decoded call sits below the form: label on its own line,
+        # then the QTextEdit (read-only, syntax-highlighted via
+        # QTextCharFormat) underneath claiming leftover vertical space.
+        outer.addSpacing(4)
+        outer.addWidget(QLabel("Decoded call:"))
         self.decoded_view = QTextEdit()
         self.decoded_view.setReadOnly(True)
         self.decoded_view.setFont(mono)
         self.decoded_view.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding,
         )
-        form.addRow("Decoded call:", self.decoded_view)
+        outer.addWidget(self.decoded_view, 1)
 
         # Buttons row: Explorer + Close.
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -940,7 +958,7 @@ class TransactionDetailsDialog(QDialog):
         explorer_btn.clicked.connect(self._open_explorer)
         buttons.addButton(explorer_btn, QDialogButtonBox.ActionRole)
         buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
+        outer.addWidget(buttons)
 
         # Start ABI fetch + decode (only when there's calldata).
         if tx.input_data and tx.input_data not in ("0x", "0X") and tx.to_addr:
