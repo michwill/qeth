@@ -58,6 +58,26 @@ log = logging.getLogger("qeth.plugin.transactions")
 # get distinct colours so the eye can scan them quickly.
 _TYPE_COLOR = "#0066cc"     # cool blue
 _VALUE_COLOR = "#22863a"    # green
+_COMMENT_COLOR = "#999999"  # mid-grey for trailing "# X SYMBOL" notes
+
+
+# Functions on the canonical ERC-20 surface (plus the widespread
+# burn/mint extensions). When the called contract is a known token,
+# every uintN argument to one of these is a value denominated in the
+# token's decimals — there's no other meaning for an integer arg on
+# these signatures. Param names vary across ABIs ("_value", "amount",
+# "wad", "rawAmount", …) so we key on the function rather than the
+# arg name; the whitelist is what tells us "any number here is a
+# token amount".
+_ERC20_AMOUNT_FUNCTIONS = frozenset({
+    "transfer", "transferFrom", "approve",
+    "increaseAllowance", "decreaseAllowance",
+    "burn", "burnFrom", "mint",
+})
+
+# 2**256 − 1 — the canonical "infinite approval" sentinel. Anything
+# this large isn't a real amount worth converting to a decimal.
+_UINT256_MAX = (1 << 256) - 1
 
 # Monospace families we prefer for the decoded-call view, in order.
 # All ship a Bold style — that's what made the function name fail to
@@ -96,7 +116,27 @@ def _pick_mono_font() -> QFont:
     return f
 
 
-def _render_decoded(text_edit, decoded: dict) -> None:
+def _format_token_amount(raw: int, decimals: int, symbol: str) -> str:
+    """Render an ERC-20 amount as ``"5000 crvUSD"`` etc. Uses Decimal
+    end-to-end so the 18-place precision of wei-scale values survives
+    division — ``raw / 10**decimals`` as floats silently corrupts the
+    last few digits."""
+    if raw == _UINT256_MAX:
+        return f"unlimited {symbol}"
+    from decimal import Decimal
+    if decimals <= 0:
+        return f"{raw} {symbol}"
+    scaled = Decimal(raw) / (Decimal(10) ** decimals)
+    # normalize() collapses trailing zeros (Decimal("5000.000") →
+    # Decimal("5E+3")), then "f" formatting expands the exponent so
+    # the output is the plain "5000" the user expects rather than
+    # scientific notation.
+    text = format(scaled.normalize(), "f")
+    return f"{text} {symbol}"
+
+
+def _render_decoded(text_edit, decoded: dict,
+                    token_context: Optional[dict] = None) -> None:
     """Render a decoded call into ``text_edit`` as Python-style
     annotated text. Top-level args render as
 
@@ -137,34 +177,55 @@ def _render_decoded(text_edit, decoded: dict) -> None:
     value_fmt = QTextCharFormat(base)
     value_fmt.setForeground(QColor(_VALUE_COLOR))
 
-    formats = (base, type_fmt, value_fmt)
+    comment_fmt = QTextCharFormat(base)
+    comment_fmt.setForeground(QColor(_COMMENT_COLOR))
 
-    cursor.insertText(decoded.get("function") or "?", bold)
+    formats = (base, type_fmt, value_fmt, comment_fmt)
+
+    fn_name = decoded.get("function") or "?"
+    cursor.insertText(fn_name, bold)
     cursor.insertText("(\n", base)
+    # Token-amount annotation only kicks in at top level (struct
+    # fields are passed token_context=None below). The function
+    # must be one of the canonical ERC-20 amount-carrying functions
+    # AND the contract must be on the curated token list — both
+    # together is what guarantees "uint here means token amount".
+    inner_context = (
+        token_context
+        if token_context is not None
+        and fn_name in _ERC20_AMOUNT_FUNCTIONS
+        else None
+    )
     args = decoded.get("args") or []
     for i, arg in enumerate(args):
         _insert_arg(
             cursor, arg, indent=1, formats=formats,
             last=(i == len(args) - 1),
+            token_context=inner_context,
         )
     cursor.insertText(")", base)
 
 
 def _insert_arg(cursor, arg: dict, *, indent: int, formats,
-                last: bool) -> None:
+                last: bool,
+                token_context: Optional[dict] = None) -> None:
     """Write one ``arg`` node (leaf or struct branch) at the current
     cursor, indented to ``indent`` levels. ``last`` controls the
     trailing punctuation: non-final entries get a comma, the last
     in any group just gets a newline (Python-style without trailing
     commas)."""
-    base, type_fmt, value_fmt = formats
+    base, type_fmt, value_fmt, comment_fmt = formats
     pad = "    " * indent
     tail = "\n" if last else ",\n"
     cursor.insertText(pad + (arg.get("name") or "") + ": ", base)
-    cursor.insertText(arg.get("type") or "", type_fmt)
+    type_ = arg.get("type") or ""
+    cursor.insertText(type_, type_fmt)
     cursor.insertText(" = ", base)
     children = arg.get("children")
     if children is not None:
+        # Struct branch — don't propagate token_context into the
+        # children; nested fields aren't part of the ERC-20 surface
+        # the heuristic was scoped to.
         if children:
             cursor.insertText("{\n", base)
             for j, child in enumerate(children):
@@ -178,6 +239,25 @@ def _insert_arg(cursor, arg: dict, *, indent: int, formats,
     else:
         value = arg.get("value")
         cursor.insertText("" if value is None else str(value), value_fmt)
+        # Trailing "# X SYMBOL" comment for ERC-20 amounts. Only
+        # uintN leaves on a function the caller marked as amount-
+        # carrying — see _render_decoded for that gating.
+        comment = None
+        if (token_context is not None
+                and type_.startswith("uint")
+                and value is not None):
+            try:
+                raw = int(str(value))
+            except ValueError:
+                raw = None
+            if raw is not None:
+                comment = _format_token_amount(
+                    raw,
+                    token_context["decimals"],
+                    token_context["symbol"],
+                )
+        if comment:
+            cursor.insertText("  # " + comment, comment_fmt)
         cursor.insertText(tail, base)
 
 
@@ -1013,7 +1093,18 @@ class TransactionDetailsDialog(QDialog):
                 "function in it — possibly a fallback or proxy call)"
             )
             return
-        _render_decoded(self.decoded_view, decoded)
+        # If the called contract is on the curated whitelist, pass
+        # its (symbol, decimals) so the renderer can annotate token-
+        # amount uints with the human-readable "# 5000 crvUSD" form.
+        token_context = None
+        if self._token_info is not None and self.tx.to_addr:
+            entry = self._token_info(self.chain.chain_id, self.tx.to_addr)
+            if entry is not None:
+                token_context = {
+                    "symbol": entry.symbol,
+                    "decimals": entry.decimals,
+                }
+        _render_decoded(self.decoded_view, decoded, token_context)
 
     def _open_explorer(self) -> None:
         if not self.chain.explorer:
