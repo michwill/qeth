@@ -773,6 +773,64 @@ def wallets_plugin(qtbot, tmp_qeth):
     return plugin
 
 
+class TestTokensStartupNonBlocking:
+    """Pin the no-wait-for-token-lists startup behaviour: when the
+    wallet cache holds tokens for the selected view, the panel must
+    render them straight away, even when the curated token lists
+    haven't loaded yet (slow network)."""
+
+    def test_cached_wallet_renders_before_lists_load(self, qtbot, tmp_qeth):
+        from qeth.plugins.tokens import TokensPlugin
+        from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+
+        # Pre-populate the wallet cache for a real ledger account.
+        wallet_addr = "0x7a16ff8270133f063aab6c9977183d9e72835428"
+        WalletCache().save(CachedWallet(
+            chain_id=1,
+            address=wallet_addr,
+            native_balance_wei=10**18,
+            tokens=[
+                CachedToken(
+                    contract="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    symbol="USDC", name="USD Coin", decimals=6,
+                    balance_raw=1_000_000,
+                ),
+            ],
+        ))
+
+        from qeth.store import Store
+        store = Store.load()
+        plugin = TokensPlugin(store)
+
+        class _StubHost:
+            selected_address = wallet_addr
+            def current_chain(self):
+                from qeth.chains import DEFAULT_CHAINS
+                return next(c for c in DEFAULT_CHAINS if c.chain_id == 1)
+            def start_worker(self, w):
+                pass   # don't actually start network workers
+            def status_message(self, *a, **kw):
+                pass
+
+        plugin.attach(_StubHost())
+        qtbot.addWidget(plugin.widget())
+
+        # Crucial: lists haven't loaded (the test fixture neutralized
+        # the TokenListsLoader worker). Without the cached-render
+        # branch, the panel would sit on "Loading token lists…".
+        assert plugin._token_lists.loaded is False
+        plugin.on_account_changed(wallet_addr)
+
+        # Native + cached ERC-20 → 2 rows immediately.
+        assert plugin.widget().table.rowCount() == 2
+        # And specifically the USDC symbol made it onto the table.
+        symbols = [
+            plugin.widget().table.item(r, 0).text()
+            for r in range(plugin.widget().table.rowCount())
+        ]
+        assert "USDC" in symbols
+
+
 class TestWalletsPlugin:
     def test_widget_holds_tree_and_details(self, wallets_plugin):
         from qeth.plugins.wallets import DetailsPanel

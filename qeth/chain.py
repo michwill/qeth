@@ -20,16 +20,34 @@ import logging
 from decimal import Decimal
 from typing import Callable, Optional
 
-import requests
-from eth_abi import decode as abi_decode
-from eth_abi import encode as abi_encode
-from web3 import Web3
-from web3.exceptions import Web3RPCError
-from web3.providers.rpc import HTTPProvider
-
 from .chains import Chain
 
 log = logging.getLogger("qeth.chain")
+
+
+# The web3 / eth_abi / requests stack costs ~700 ms to import. The
+# UI doesn't need any of it until an RPC call actually happens (i.e.
+# in a worker thread, post-startup), so the imports live inside
+# ``_ensure_heavy_imports`` and are pulled in lazily on first
+# EthClient instantiation. After that, the symbols sit in this
+# module's globals and the rest of the file references them
+# unmodified — keeps the deferred path invisible to call sites.
+def _ensure_heavy_imports() -> None:
+    g = globals()
+    if "Web3" in g:
+        return
+    import requests
+    from eth_abi import decode as abi_decode
+    from eth_abi import encode as abi_encode
+    from web3 import Web3
+    from web3.exceptions import Web3RPCError
+    from web3.providers.rpc import HTTPProvider
+    g["requests"] = requests
+    g["abi_decode"] = abi_decode
+    g["abi_encode"] = abi_encode
+    g["Web3"] = Web3
+    g["Web3RPCError"] = Web3RPCError
+    g["HTTPProvider"] = HTTPProvider
 
 USER_AGENT = "qeth/0.1"
 
@@ -73,10 +91,11 @@ _SEL_SYMBOL = bytes.fromhex("95d89b41")
 _SEL_DECIMALS = bytes.fromhex("313ce567")
 
 
-def _build_session() -> requests.Session:
+def _build_session():
     """A requests.Session with our User-Agent. DRPC's Cloudflare front
     rejects the default ``python-requests/x.y`` UA (HTTP 403, "error
     code: 1010"), so every HTTP call out of EthClient needs this set."""
+    _ensure_heavy_imports()
     s = requests.Session()
     s.headers["User-Agent"] = USER_AGENT
     return s
@@ -96,6 +115,7 @@ class EthClient:
     """
 
     def __init__(self, chain: Chain, *, timeout: float = 15.0):
+        _ensure_heavy_imports()
         self.chain = chain
         self.timeout = timeout
         self._session = _build_session()
@@ -106,9 +126,10 @@ class EthClient:
         ))
 
     @property
-    def w3(self) -> Web3:
+    def w3(self):
         """Underlying ``Web3`` instance — for callers that need the full
-        web3.py surface (contracts, filters, account abstractions, etc.)."""
+        web3.py surface (contracts, filters, account abstractions, etc.).
+        Type hint omitted so this module can be imported without web3."""
         return self._w3
 
     # --- low-level ---------------------------------------------------------
