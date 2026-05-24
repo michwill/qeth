@@ -208,18 +208,21 @@ def _urllib_transport(url: str, timeout: float) -> bytes:
 
 def decode_call(abi: Optional[Abi], input_data: str,
                 address: Optional[str] = None) -> Optional[dict]:
-    """Decode ``input_data`` against ``abi``. Returns a dict like
+    """Decode ``input_data`` against ``abi``. Returns a tree like
 
-        {"function": "transfer",
+        {"function": "register",
          "args": [
-            {"name": "_to",    "type": "address", "value": "0x…"},
-            {"name": "_value", "type": "uint256", "value": "500000000"},
+            {"name": "registration", "type": "tuple", "children": [
+                {"name": "label",   "type": "string", "value": "qeth"},
+                {"name": "secret",  "type": "bytes32", "value": "0x99…"},
+                ...
+            ]},
          ]}
 
     or ``None`` when there's no ABI, the calldata is empty, or
-    decoding fails. The args list preserves declaration order and
-    carries Solidity type names so the UI can render annotations
-    (``_to: address = 0x…``) without a second ABI lookup."""
+    decoding fails. Leaf nodes have ``value`` (stringified); tuple
+    nodes have ``children``. The UI walks the tree to render
+    indented, type-annotated output."""
     if not abi or not input_data or input_data in ("0x", "0X"):
         return None
     try:
@@ -234,7 +237,6 @@ def decode_call(abi: Optional[Abi], input_data: str,
     args_list: list[dict] = []
     for inp in inputs:
         name = inp.get("name", "")
-        type_ = inp.get("type", "")
         # web3.py keys args by parameter name. Anonymous inputs are
         # rare but possible — fall back to positional index.
         if name in args:
@@ -244,25 +246,69 @@ def decode_call(abi: Optional[Abi], input_data: str,
                 value = list(args.values())[len(args_list)]
             except IndexError:
                 value = None
-        args_list.append({
-            "name": name,
-            "type": type_,
-            "value": _stringify(value),
-        })
+        args_list.append(_describe(value, inp))
     return {
         "function": getattr(func, "fn_name", None) or str(func),
         "args": args_list,
     }
 
 
-def _stringify(value) -> str:
-    """Coerce a decoded value to a string. web3.py hands back bytes
-    for bytesN/bytes, Python ints for uintN/intN, checksummed
-    strings for addresses, and tuples/lists for arrays."""
+def _describe(value, inp: dict) -> dict:
+    """Build one tree node pairing ``value`` with the ABI input
+    spec ``inp``. Recurses into struct components so each inner
+    field carries its Solidity type alongside its decoded value."""
+    type_ = inp.get("type", "")
+    name = inp.get("name", "")
+    components = inp.get("components") or []
+    if type_ == "tuple" and components:
+        children = []
+        for comp in components:
+            comp_name = comp.get("name", "")
+            child_value = None
+            if value is not None:
+                try:
+                    child_value = value[comp_name]
+                except (KeyError, TypeError):
+                    child_value = None
+            children.append(_describe(child_value, comp))
+        return {"name": name, "type": type_, "children": children}
+    # Everything else — primitives, simple arrays, arrays of tuples
+    # (rendered as a flat string for now) — becomes a leaf.
+    return {"name": name, "type": type_, "value": _stringify(value, type_)}
+
+
+def _stringify(value, type_hint: Optional[str] = None) -> str:
+    """Coerce a decoded value to a string. web3.py hands back:
+
+      - bytes / bytearray for bytesN and bytes      → 0x<hex>
+      - int for uintN/intN, bool for bool, str for  → str(value)
+        address and string
+      - tuple/list for arrays                       → [v, v, …]
+      - AttributeDict (a dict subclass) for structs → {k: v, k: v}
+
+    ``type_hint`` carries the Solidity type so we can format
+    type-distinctive forms — currently just quoting ``string``
+    values so they don't look like bare identifiers. Recursive
+    calls for array elements strip the ``[N]`` / ``[]`` suffix so
+    each element gets the element-type hint."""
     if value is None:
         return ""
     if isinstance(value, (bytes, bytearray)):
         return "0x" + bytes(value).hex()
     if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_stringify(v) for v in value) + "]"
+        # "string[]" → element hint "string"; "uint256[3]" → "uint256".
+        inner_hint = None
+        if type_hint and type_hint.endswith("]"):
+            i = type_hint.rfind("[")
+            if i > 0:
+                inner_hint = type_hint[:i]
+        return "[" + ", ".join(_stringify(v, inner_hint) for v in value) + "]"
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ", ".join(f"{k}: {_stringify(v)}" for k, v in value.items())
+            + "}"
+        )
+    if type_hint == "string" and isinstance(value, str):
+        return '"' + value + '"'
     return str(value)

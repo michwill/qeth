@@ -363,6 +363,66 @@ class TestTransactionsPlugin:
         assert weights_by_text.get("transfer", QFont.Normal) >= QFont.Bold
         assert weights_by_text.get("(", QFont.Bold) < QFont.Bold
 
+    def test_render_decoded_uses_fixed_pitch_font(self, qtbot, tmp_qeth):
+        """Regression: QFontDatabase.systemFont(FixedFont) returned
+        ``Ubuntu`` (not actually fixed-pitch) on the developer's
+        system, so columns didn't align. The renderer must pick a
+        font whose resolved info reports fixedPitch=True."""
+        from PySide6.QtGui import QFontInfo
+        from PySide6.QtWidgets import QTextEdit
+        from qeth.plugins.transactions import _render_decoded
+
+        edit = QTextEdit()
+        qtbot.addWidget(edit)
+        _render_decoded(edit, {
+            "function": "transfer",
+            "args": [{"name": "_to", "type": "address", "value": "0x…"}],
+        })
+        # Walk the first fragment and confirm its font resolves to
+        # something Qt's QFontInfo says is fixed-pitch.
+        doc = edit.document()
+        block = doc.firstBlock()
+        it = block.begin()
+        frag = it.fragment()
+        assert frag.isValid()
+        info = QFontInfo(frag.charFormat().font())
+        assert info.fixedPitch(), (
+            f"Decoded-call font {info.family()!r} is not fixed-pitch — "
+            "columns will misalign in the dialog"
+        )
+
+    def test_render_decoded_nests_struct_with_indent(self, qtbot, tmp_qeth):
+        """Tuple args expand into an indented Python-dict-style
+        block: child fields one level deeper, each with its own type
+        annotation, closing brace at the parent's indent level."""
+        from PySide6.QtWidgets import QTextEdit
+        from qeth.plugins.transactions import _render_decoded
+
+        edit = QTextEdit()
+        qtbot.addWidget(edit)
+        _render_decoded(edit, {
+            "function": "register",
+            "args": [{
+                "name": "data", "type": "tuple", "children": [
+                    # Renderer just emits the values verbatim — the
+                    # _stringify step is what adds quotes around
+                    # string types. We pass the already-quoted form.
+                    {"name": "label", "type": "string", "value": '"qeth"'},
+                    {"name": "secret", "type": "bytes32",
+                     "value": "0x99" + "ff" * 31},
+                ],
+            }],
+        })
+        text = edit.toPlainText()
+        lines = text.splitlines()
+        # Layout: register(\n  data: tuple = {\n    label: …\n    secret: …\n  },\n)
+        assert lines[0] == "register("
+        assert lines[1] == "    data: tuple = {"
+        assert lines[2].startswith('        label: string = "qeth"')
+        assert lines[3].startswith("        secret: bytes32 = 0x99")
+        assert lines[4] == "    },"
+        assert lines[5] == ")"
+
     def test_double_click_opens_details_dialog(self, qtbot, tmp_qeth):
         """Double-clicking a row should open TransactionDetailsDialog
         with the right tx and chain wired through. Plugin no-ops the

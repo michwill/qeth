@@ -236,3 +236,104 @@ class TestDecodeCall:
         assert decode_call(
             ERC20_ABI, "0xdeadbeef00000000000000000000000000000000",
         ) is None
+
+
+class TestDecodeCallTuples:
+    """Tuple/struct args turn into branch nodes with per-component
+    children so the dialog can render them indented with each inner
+    field's Solidity type alongside its value."""
+
+    REGISTER_ABI = [{
+        "type": "function",
+        "name": "register",
+        "stateMutability": "nonpayable",
+        "inputs": [{
+            "name": "data",
+            "type": "tuple",
+            "components": [
+                {"name": "label", "type": "string"},
+                {"name": "owner", "type": "address"},
+                {"name": "secret", "type": "bytes32"},
+            ],
+        }],
+        "outputs": [],
+    }]
+
+    def test_decodes_struct_into_children(self):
+        from eth_abi import encode
+        from eth_utils import function_signature_to_4byte_selector
+        selector = function_signature_to_4byte_selector(
+            "register((string,address,bytes32))"
+        )
+        encoded = encode(
+            ["(string,address,bytes32)"],
+            [("qeth",
+              "0x7a16ff8270133f063aab6c9977183d9e72835428",
+              b"\x99" * 32)],
+        )
+        calldata = "0x" + selector.hex() + encoded.hex()
+
+        out = decode_call(self.REGISTER_ABI, calldata)
+        assert out is not None
+        assert out["function"] == "register"
+        arg = out["args"][0]
+        assert arg["name"] == "data"
+        assert arg["type"] == "tuple"
+        # Branch node — children, not a flat value.
+        children = arg["children"]
+        assert len(children) == 3
+        names = [c["name"] for c in children]
+        types = [c["type"] for c in children]
+        assert names == ["label", "owner", "secret"]
+        assert types == ["string", "address", "bytes32"]
+        # Inner bytes32 stringifies to canonical 0x… hex.
+        assert children[2]["value"] == "0x" + "99" * 32
+
+
+class TestStringify:
+    """The decoded-value coercer is the only place where we control
+    how exotic Solidity types render in the dialog."""
+
+    def test_bytes_renders_as_hex(self):
+        from qeth.abi import _stringify
+        assert _stringify(b"\x99\x23\xeb\x94") == "0x9923eb94"
+
+    def test_dict_value_renders_nested_bytes_as_hex(self):
+        """Solidity tuple/struct args come back as dicts from web3.py.
+        The default str(d) would print inner bytes as Python's b'\\x…'
+        repr — we must walk the dict and stringify each entry."""
+        from qeth.abi import _stringify
+        out = _stringify({
+            "label": "qeth",
+            "secret": b"\x99\x23\xeb\x94",
+            "amount": 1000,
+        })
+        assert "0x9923eb94" in out
+        assert "b'" not in out  # no Python bytes-repr leaking through
+
+    def test_list_of_bytes(self):
+        from qeth.abi import _stringify
+        out = _stringify([b"\xaa", b"\xbb\xcc"])
+        assert out == "[0xaa, 0xbbcc]"
+
+    def test_none_value(self):
+        from qeth.abi import _stringify
+        assert _stringify(None) == ""
+
+    def test_string_type_gets_quoted(self):
+        """With a Solidity string type hint we quote the value so
+        the rendered ``label: string = "qeth"`` reads as a string
+        literal rather than a bare identifier."""
+        from qeth.abi import _stringify
+        assert _stringify("qeth", type_hint="string") == '"qeth"'
+
+    def test_string_array_quotes_each_element(self):
+        from qeth.abi import _stringify
+        assert _stringify(["a", "b"], type_hint="string[]") == '["a", "b"]'
+
+    def test_address_is_not_quoted(self):
+        """Hex addresses already self-identify as values; quoting
+        them would just add noise."""
+        from qeth.abi import _stringify
+        addr = "0x7a16fF8270133F063aAb6C9977183D9e72835428"
+        assert _stringify(addr, type_hint="address") == addr

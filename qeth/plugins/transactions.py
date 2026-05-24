@@ -23,7 +23,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontDatabase, QTextCharFormat,
+    QColor, QDesktopServices, QFont, QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout,
@@ -57,25 +57,38 @@ _VALUE_COLOR = "#22863a"    # green
 
 def _render_decoded(text_edit, decoded: dict) -> None:
     """Render a decoded call into ``text_edit`` as Python-style
-    annotated text, e.g.
+    annotated text. Top-level args render as
 
-        transfer(
-            _to: address = 0x…,
-            _value: uint256 = 500000000,
+        register(
+            registration: tuple = {
+                label: string = qeth,
+                secret: bytes32 = 0x99…,
+                …
+            },
         )
 
-    with the function name bold and types/values in distinct colours.
+    with the function name bold, types in blue and values in green.
+    Struct args expand recursively with deepening indentation; leaf
+    args go on one line.
 
     Uses QTextCursor + QTextCharFormat directly rather than HTML —
     Qt's HTML renderer silently drops ``<b>`` / ``font-weight`` when
-    the widget font is a generic alias like ``QFont("monospace")``,
-    because the font resolver can't find a bold-mapped variant. The
-    cursor path goes through QFontDatabase, which always returns a
-    family that has the weight variants we ask for."""
+    the widget font is a generic alias the font resolver can't map
+    to a bold variant. The cursor path lets us pin both family and
+    weight explicitly.
+
+    For the family we use ``QFont("monospace")`` with the Monospace
+    style hint — Qt resolves this through fontconfig to the system's
+    chosen monospace family (DejaVu Sans Mono / Droid Sans Mono / …).
+    ``QFontDatabase.systemFont(FixedFont)`` was tried first but on
+    Ubuntu it returns the ``Ubuntu`` family, which isn't actually
+    fixed-pitch — columns wouldn't align."""
     text_edit.clear()
     cursor = text_edit.textCursor()
 
-    mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+    mono = QFont("monospace")
+    mono.setStyleHint(QFont.Monospace)
+    mono.setFixedPitch(True)
     base = QTextCharFormat()
     base.setFont(mono)
 
@@ -88,16 +101,36 @@ def _render_decoded(text_edit, decoded: dict) -> None:
     value_fmt = QTextCharFormat(base)
     value_fmt.setForeground(QColor(_VALUE_COLOR))
 
+    formats = (base, type_fmt, value_fmt)
+
     cursor.insertText(decoded.get("function") or "?", bold)
     cursor.insertText("(\n", base)
     for arg in decoded.get("args") or []:
-        cursor.insertText(f"    {arg.get('name') or ''}: ", base)
-        cursor.insertText(arg.get("type") or "", type_fmt)
-        cursor.insertText(" = ", base)
+        _insert_arg(cursor, arg, indent=1, formats=formats)
+    cursor.insertText(")", base)
+
+
+def _insert_arg(cursor, arg: dict, *, indent: int, formats) -> None:
+    """Write one ``arg`` node (leaf or struct branch) into the
+    document at the current cursor, indented to ``indent`` levels."""
+    base, type_fmt, value_fmt = formats
+    pad = "    " * indent
+    cursor.insertText(pad + (arg.get("name") or "") + ": ", base)
+    cursor.insertText(arg.get("type") or "", type_fmt)
+    cursor.insertText(" = ", base)
+    children = arg.get("children")
+    if children is not None:
+        if children:
+            cursor.insertText("{\n", base)
+            for child in children:
+                _insert_arg(cursor, child, indent=indent + 1, formats=formats)
+            cursor.insertText(pad + "},\n", base)
+        else:
+            cursor.insertText("{},\n", base)
+    else:
         value = arg.get("value")
         cursor.insertText("" if value is None else str(value), value_fmt)
         cursor.insertText(",\n", base)
-    cursor.insertText(")", base)
 
 
 def _is_full_history(txs: list[Transaction]) -> bool:
