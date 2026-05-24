@@ -353,6 +353,47 @@ class TestTransactionsPlugin:
         assert plugin.widget().table.rowCount() == 2 * plugin.INITIAL_BATCH
         assert host.started_workers == []
 
+    def test_tab_reactivation_preserves_scrolled_in_rows(self, qtbot, tmp_qeth):
+        """Switching away to the Tokens tab and back must NOT throw
+        away the rows the user scrolled into view. The plugin sees
+        on_activated for the same (chain, addr) it already painted
+        and should leave the panel untouched — Qt then preserves the
+        scrollbar and the displayed list survives the tab switch
+        exactly like in a browser."""
+        from qeth.transactions_cache import TransactionCache
+        cache = [
+            Transaction(
+                chain_id=1, hash="0x" + format(i, "064x"),
+                block_number=i, timestamp=i, nonce=i,
+                from_addr=ADDR, to_addr="0xfeed",
+                value_wei=0, gas_used=0, gas_price_wei=0,
+                method_id="", input_data="0x", success=True,
+            )
+            for i in range(300, 0, -1)
+        ]
+        TransactionCache().save(ETH.chain_id, ADDR, cache)
+
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+
+        # Initial activation paints INITIAL_BATCH rows…
+        plugin.on_activated()
+        assert plugin.widget().table.rowCount() == plugin.INITIAL_BATCH
+
+        # …user scrolls a few times to reveal more.
+        plugin._on_scroll_bottom()
+        plugin._on_scroll_bottom()
+        plugin._on_scroll_bottom()
+        big = plugin.widget().table.rowCount()
+        assert big == 4 * plugin.INITIAL_BATCH   # 200
+
+        # Tab switch away then back — second on_activated for the
+        # same view should NOT shrink the table.
+        plugin.on_activated()
+        assert plugin.widget().table.rowCount() == big
+
     def test_overlapping_fetch_auto_advances_to_new_data(self, qtbot, tmp_qeth):
         """When a fetched page contains only entries we already have
         (typical after a partial backfill from a prior session), the
@@ -408,11 +449,18 @@ class TestTransactionsPlugin:
         host.start_worker = _start
 
         plugin.on_activated()   # force_fetch=True path
+        # Refresh-newest path: page 1 fetched but no auto-advance.
+        assert source.calls == [1]
 
-        # Walked all three pages without further user input.
+        # User scrolls past the cache → load-older path kicks in.
+        # The plugin auto-advances through page-2 overlap and lands
+        # on page 3, which carries genuinely new entries.
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._displayed_count[key] = len(plugin._cache[key])
+        plugin._on_scroll_bottom()
         assert source.calls == [1, 2, 3]
         # The newly-discovered nonces are now in the cache.
-        merged = plugin._cache[(ETH.chain_id, ADDR.lower())]
+        merged = plugin._cache[key]
         assert min(t.nonce for t in merged) == 50
 
     def test_scroll_bottom_advances_to_next_page(self, qtbot, tmp_qeth):

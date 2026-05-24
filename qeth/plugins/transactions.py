@@ -146,6 +146,11 @@ class TransactionsPlugin(Plugin):
         self._next_page: dict[tuple[int, str], int] = {}
         self._exhausted: set[tuple[int, str]] = set()
         self._displayed_count: dict[tuple[int, str], int] = {}
+        # Which (chain, addr) the panel's table currently shows. Used
+        # to skip the show_transactions rebuild when on_activated fires
+        # for the same view we already painted — Qt then preserves the
+        # scrollbar and the user's scrolled-in batches stay intact.
+        self._rendered_for: Optional[tuple[int, str]] = None
         # The widget is built lazily so the plugin can be instantiated
         # outside a Qt event loop (useful in pure-Python imports).
         self._panel = None
@@ -237,17 +242,27 @@ class TransactionsPlugin(Plugin):
                 disk = [t for t in disk if t.from_addr.lower() == addr_l]
                 self._cache[key] = disk
                 cached = disk
-        # Render only the first batch of the cache. Bounded rendering
-        # keeps the open snappy even when the cache holds thousands of
-        # entries (rebuilding a 17 000-row QTableWidget freezes the UI
-        # for tens of seconds).
-        if cached is not None:
-            count = min(self.INITIAL_BATCH, len(cached))
+        # Re-render only when the panel currently shows a *different*
+        # view. If it's the same (chain, addr) we already painted
+        # (e.g. user just toggled away to Tokens and back), leaving
+        # the table alone preserves both content AND the scroll
+        # position — exactly what tabs in a browser do.
+        view_changed = self._rendered_for != key
+        if view_changed and cached is not None:
+            # Preserve the previously-shown row count for this view
+            # if we have one; otherwise start from INITIAL_BATCH.
+            prev = self._displayed_count.get(key)
+            if not prev or prev <= 0:
+                count = min(self.INITIAL_BATCH, len(cached))
+            else:
+                count = min(prev, len(cached))
             self._displayed_count[key] = count
             self._panel.show_transactions(cached[:count])
-        elif force_fetch or self._is_active():
+            self._rendered_for = key
+        elif view_changed and (force_fetch or self._is_active()):
             self._displayed_count[key] = 0
             self._panel.show_loading()
+            self._rendered_for = key
 
         if not (force_fetch or self._is_active()):
             return
@@ -267,9 +282,21 @@ class TransactionsPlugin(Plugin):
         # since the last visit. Older pages come from scroll.
         self._fetch_page(key, address, page=1)
 
-    def _fetch_page(self, key, address: str, page: int) -> None:
+    def _fetch_page(self, key, address: str, page: int,
+                    walk_on_overlap: bool = False) -> None:
         """Kick a single-page fetch. No-op if a fetch for this key is
-        already in flight or if the history is known to be exhausted."""
+        already in flight or if the history is known to be exhausted.
+
+        ``walk_on_overlap`` distinguishes the two fetch reasons:
+          - False (default): "refresh newest" — fetch page 1 to pick up
+            anything new, but if the page returns only entries already
+            cached, stop. Used on _refresh (tab activation / account
+            select). Tab switching costs at most one HTTP call.
+          - True: "load older" — the user has scrolled past the cache
+            and wants more history. If the page returns only overlap
+            (typical when resuming an interrupted backfill), advance
+            to the next page until we find genuinely new older data.
+        """
         if self.host is None or self._panel is None:
             return
         if key in self._in_flight or key in self._exhausted:
@@ -279,7 +306,10 @@ class TransactionsPlugin(Plugin):
         worker = TransactionsWorker(
             self._source, chain, address, page=page,
         )
-        worker.fetched.connect(self._on_page_fetched)
+        worker.fetched.connect(
+            lambda c, a, p, t, m, w=walk_on_overlap:
+                self._on_page_fetched(c, a, p, t, m, walk_on_overlap=w)
+        )
         worker.failed.connect(
             lambda msg, k=key: self._on_failed(k, msg)
         )
@@ -307,16 +337,22 @@ class TransactionsPlugin(Plugin):
             self._panel.append_transactions(cache[shown:new_count])
             return
 
-        # Otherwise we need fresh data from older pages.
+        # Otherwise we need fresh data from older pages. Auto-advance
+        # is enabled so a deep cache that overlaps with the next
+        # Blockscout page still surfaces new entries promptly.
         next_page = self._next_page.get(key, 1)
-        self._fetch_page(key, addr, page=next_page)
+        self._fetch_page(key, addr, page=next_page, walk_on_overlap=True)
 
     def _on_page_fetched(self, chain_id: int, address_lower: str,
-                         page_idx: int, page: list, has_more: bool) -> None:
+                         page_idx: int, page: list, has_more: bool,
+                         walk_on_overlap: bool = False) -> None:
         """One page arrived. Merge it into the cache, persist, advance
         the paging cursor, and incrementally update the visible table
         — never rebuilding it from the full cache (which can be tens
-        of thousands of rows)."""
+        of thousands of rows). ``walk_on_overlap`` mirrors the flag
+        set by _fetch_page: True for scroll-driven calls (keep walking
+        through cached overlap until new data lands), False for the
+        cheap refresh-newest path."""
         key = (chain_id, address_lower)
         self._in_flight.discard(key)
         existing = self._cache.get(key) or []
@@ -332,12 +368,15 @@ class TransactionsPlugin(Plugin):
 
         if not has_more or _is_full_history(merged):
             self._exhausted.add(key)
-        elif not new_rows:
-            # Every entry in this page is already cached — typical when
-            # a previous session left the cache N pages deep and we're
-            # resuming. Auto-advance to the next page so the load-on-
-            # scroll UX doesn't dead-end silently on overlap.
-            self._fetch_page(key, address_lower, page=page_idx + 1)
+        elif walk_on_overlap and not new_rows:
+            # Scroll-driven fetch returned only entries we already
+            # have cached — walk forward until we hit genuinely new
+            # older data. (Refresh-newest fetches don't take this
+            # branch; they're one-shot.)
+            self._fetch_page(
+                key, address_lower, page=page_idx + 1,
+                walk_on_overlap=True,
+            )
 
         # Only touch the panel if the user is still on this view.
         if (self.host is None
