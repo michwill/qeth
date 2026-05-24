@@ -107,18 +107,18 @@ class TestMergeTxs:
         assert merge_txs([], []) == []
 
     def test_only_new(self):
-        a, b = _tx("aa", block_number=10), _tx("bb", block_number=9)
+        a, b = _tx("aa", nonce=11), _tx("bb", nonce=10)
         assert merge_txs([a, b], []) == [a, b]
 
     def test_only_old(self):
-        a, b = _tx("aa", block_number=10), _tx("bb", block_number=9)
+        a, b = _tx("aa", nonce=11), _tx("bb", nonce=10)
         assert merge_txs([], [a, b]) == [a, b]
 
     def test_dedupes_by_hash(self):
         """A tx returned by both lists appears once. The version from
         ``new`` wins (so post-reorg corrections propagate cleanly)."""
-        old_tx = _tx("aa", block_number=10, success=False)
-        new_tx = _tx("aa", block_number=10, success=True)
+        old_tx = _tx("aa", nonce=10, success=False)
+        new_tx = _tx("aa", nonce=10, success=True)
         merged = merge_txs([new_tx], [old_tx])
         assert len(merged) == 1
         assert merged[0].success is True
@@ -127,31 +127,26 @@ class TestMergeTxs:
         """The whole point of merging: new fetch + older cached →
         union, so historical entries survive even after they fall out
         of the recent-N fetch window."""
-        new = [_tx("a1", block_number=20),
-               _tx("a2", block_number=19)]
-        old = [_tx("o1", block_number=10),
-               _tx("o2", block_number=5)]
+        new = [_tx("a1", nonce=21), _tx("a2", nonce=20)]
+        old = [_tx("o1", nonce=10), _tx("o2", nonce=5)]
         merged = merge_txs(new, old)
         hashes = [t.hash for t in merged]
         assert hashes == ["0x" + "a1" * 32, "0x" + "a2" * 32,
                           "0x" + "o1" * 32, "0x" + "o2" * 32]
 
-    def test_interleaves_by_block(self):
+    def test_interleaves_by_nonce(self):
         """If the new fetch's window starts above the cached one but
-        they overlap on intermediate blocks, the result must still be
-        sorted by block desc."""
-        new = [_tx("n1", block_number=20),
-               _tx("n2", block_number=15)]
-        old = [_tx("o1", block_number=18),
-               _tx("o2", block_number=12)]
+        they overlap on intermediate nonces, the result must still be
+        sorted by nonce desc."""
+        new = [_tx("n1", nonce=21), _tx("n2", nonce=15)]
+        old = [_tx("o1", nonce=18), _tx("o2", nonce=12)]
         merged = merge_txs(new, old)
-        assert [t.block_number for t in merged] == [20, 18, 15, 12]
+        assert [t.nonce for t in merged] == [21, 18, 15, 12]
 
-    def test_intra_block_new_wins_via_stable_sort(self):
-        """Within the same block, new fetch entries sort ahead of old
-        cached entries (Python's stable sort preserves insertion order
-        for equal keys; merge_txs concatenates new then old)."""
-        n = _tx("nn", block_number=10)
-        o = _tx("oo", block_number=10)
+    def test_intra_nonce_new_wins_via_stable_sort(self):
+        """Within the same nonce (received-from-different-senders
+        edge case), new fetch entries sort ahead of cached entries."""
+        n = _tx("nn", nonce=10)
+        o = _tx("oo", nonce=10)
         merged = merge_txs([n], [o])
         assert merged == [n, o]

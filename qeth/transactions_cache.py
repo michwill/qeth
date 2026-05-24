@@ -28,22 +28,22 @@ def merge_txs(
 ) -> list[Transaction]:
     """Combine a fresh fetch with older cached entries.
 
-    Dedupes by ``hash``: a transaction the new fetch returned wins over
-    its cached counterpart (block, timestamp, status etc. should be
-    identical for confirmed txs, but if the cache has stale values
-    from before a reorg fix the new fetch's row is preferred).
+    Dedupes by ``hash``: a transaction the new fetch returned wins
+    over its cached counterpart (post-reorg corrections propagate).
 
-    The result is sorted by ``block_number`` descending. Python's
-    stable sort preserves intra-block insertion order, which means
-    transactions from the new fetch land in front of cached txs sharing
-    the same block — matching Blockscout's canonical order for that
-    block."""
+    Sorted by ``nonce`` descending. Block number isn't unique within a
+    block — multiple sent txs share it — but nonce is monotonic per
+    sender, so for the wallet's own outgoing history it gives a true
+    most-recent-first ordering. Python's stable sort preserves intra-
+    nonce insertion order; ties (e.g. received-from-different-senders
+    txs that happen to share a nonce value) follow Blockscout's
+    canonical order from the new fetch."""
     new_hashes = {t.hash for t in new}
     merged: list[Transaction] = list(new)
     for t in old:
         if t.hash not in new_hashes:
             merged.append(t)
-    merged.sort(key=lambda t: t.block_number, reverse=True)
+    merged.sort(key=lambda t: t.nonce, reverse=True)
     return merged
 
 

@@ -158,6 +158,14 @@ class TestTransactionListPanel:
         assert "No transactions" in panel.status_lbl.text()
         assert panel.table.rowCount() == 0
 
+    def test_nonce_column_shows_tx_nonce(self, qtbot, tmp_qeth):
+        panel = TransactionListPanel()
+        qtbot.addWidget(panel)
+        panel.set_context(ETH, ADDR)
+        panel.show_transactions([_tx(nonce=42, to_addr="0xbeef")])
+        # Column 0 is Nonce, holding the integer formatted as a string.
+        assert panel.table.item(0, 0).text() == "42"
+
     def test_sent_tx_shows_right_arrow(self, qtbot, tmp_qeth):
         panel = TransactionListPanel()
         qtbot.addWidget(panel)
@@ -167,13 +175,13 @@ class TestTransactionListPanel:
             value_wei=10**17, method_id="",
         )])
         assert panel.table.rowCount() == 1
-        cp = panel.table.item(0, 1).text()
+        # Columns after the Nonce-column insertion:
+        # 0=Nonce, 1=When, 2=Counterparty, 3=Value, 4=Method, 5=Status.
+        cp = panel.table.item(0, 2).text()
         assert cp.startswith("→ ")
         assert "0x5d6a" in cp
-        # 0.1 ETH formatted to 6 decimal places + symbol.
-        assert panel.table.item(0, 2).text() == "0.100000 ETH"
-        # Empty method id renders as "—" (the dash placeholder).
-        assert panel.table.item(0, 3).text() == "—"
+        assert panel.table.item(0, 3).text() == "0.100000 ETH"
+        assert panel.table.item(0, 4).text() == "—"
 
     def test_received_tx_shows_left_arrow(self, qtbot, tmp_qeth):
         panel = TransactionListPanel()
@@ -183,7 +191,7 @@ class TestTransactionListPanel:
             from_addr="0x5d6a4ba137d77df7c3cdd7131c430da5497c7ace",
             to_addr=ADDR, value_wei=10**18,
         )])
-        cp = panel.table.item(0, 1).text()
+        cp = panel.table.item(0, 2).text()
         assert cp.startswith("← ")
 
     def test_known_method_id_is_humanized(self, qtbot, tmp_qeth):
@@ -194,7 +202,7 @@ class TestTransactionListPanel:
             to_addr="0xdac17f958d2ee523a2206206994597c13d831ec7",
             method_id="0xa9059cbb",
         )])
-        assert panel.table.item(0, 3).text() == "transfer"
+        assert panel.table.item(0, 4).text() == "transfer"
 
     def test_failed_tx_marked_with_cross(self, qtbot, tmp_qeth):
         panel = TransactionListPanel()
@@ -204,8 +212,8 @@ class TestTransactionListPanel:
             _tx(to_addr="0xbeef00000000000000000000000000000000beef", success=True),
             _tx(to_addr="0xbeef00000000000000000000000000000000beef", success=False),
         ])
-        assert panel.table.item(0, 4).text() == "✓"
-        assert panel.table.item(1, 4).text() == "✗"
+        assert panel.table.item(0, 5).text() == "✓"
+        assert panel.table.item(1, 5).text() == "✗"
 
     def test_clear_resets_panel(self, qtbot, tmp_qeth):
         panel = TransactionListPanel()

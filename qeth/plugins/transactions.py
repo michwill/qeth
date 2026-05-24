@@ -256,9 +256,9 @@ class TransactionListPanel(QWidget):
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["When", "Counterparty", "Value", "Method", "Status"]
+            ["Nonce", "When", "Counterparty", "Value", "Method", "Status"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -284,11 +284,12 @@ class TransactionListPanel(QWidget):
         self.table.customContextMenuRequested.connect(self._on_context_menu)
         self.table.cellDoubleClicked.connect(self._open_in_explorer)
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(3, QHeaderView.Stretch)
-        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Nonce
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # When
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Counterparty
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Value
+        h.setSectionResizeMode(4, QHeaderView.Stretch)           # Method
+        h.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Status
         v.addWidget(self.table, 1)
 
         # The empty-state / loading / error label sits stacked under the
@@ -340,10 +341,21 @@ class TransactionListPanel(QWidget):
         for row, tx in enumerate(txs):
             direction = tx.direction(viewer) if viewer else TxDirection.UNRELATED
 
+            # Nonce column holds the row's hash on UserRole so the
+            # explorer-open / context-menu code (which reads column 0)
+            # finds it without depending on the column order.
+            nonce = QTableWidgetItem(str(tx.nonce))
+            nonce.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            nonce.setData(Qt.UserRole, tx.hash)
+            if direction != TxDirection.SENT:
+                # The nonce of a received tx is the *sender's* nonce,
+                # not ours — surface that in the tooltip so the column
+                # isn't misread.
+                nonce.setToolTip("sender's nonce")
+
             when = QTableWidgetItem(_format_relative_time(tx.timestamp, now))
             when.setToolTip(datetime.datetime.fromtimestamp(tx.timestamp)
                             .strftime("%Y-%m-%d %H:%M:%S"))
-            when.setData(Qt.UserRole, tx.hash)
 
             if direction == TxDirection.SENT:
                 arrow, counterparty = "→", tx.to_addr
@@ -377,11 +389,12 @@ class TransactionListPanel(QWidget):
             status.setTextAlignment(Qt.AlignCenter)
             status.setToolTip("Success" if tx.success else "Reverted")
 
-            self.table.setItem(row, 0, when)
-            self.table.setItem(row, 1, cp)
-            self.table.setItem(row, 2, val)
-            self.table.setItem(row, 3, method)
-            self.table.setItem(row, 4, status)
+            self.table.setItem(row, 0, nonce)
+            self.table.setItem(row, 1, when)
+            self.table.setItem(row, 2, cp)
+            self.table.setItem(row, 3, val)
+            self.table.setItem(row, 4, method)
+            self.table.setItem(row, 5, status)
 
     def _selected_hash(self) -> str | None:
         items = self.table.selectedItems()
@@ -403,8 +416,10 @@ class TransactionListPanel(QWidget):
         if item is None:
             return
         row = item.row()
+        # Nonce cell (col 0) carries the hash on UserRole; Counterparty
+        # cell (col 2) carries the full counterparty address.
         h = self.table.item(row, 0).data(Qt.UserRole)
-        cp = self.table.item(row, 1).data(Qt.UserRole)
+        cp = self.table.item(row, 2).data(Qt.UserRole)
         menu = QMenu(self)
         act_open = menu.addAction("Open in block explorer")
         act_open.setEnabled(bool(self._chain and self._chain.explorer and h))
@@ -418,7 +433,3 @@ class TransactionListPanel(QWidget):
             QApplication.clipboard().setText(h)
         elif chosen is act_copy_cp and cp:
             QApplication.clipboard().setText(cp)
-
-
-# --- Main window -------------------------------------------------------------
-
