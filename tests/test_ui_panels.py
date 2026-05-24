@@ -181,11 +181,13 @@ class TestTransactionListPanel:
         # Time cell is locale-formatted — just assert non-empty rather
         # than locking in a specific format string.
         assert panel.table.item(0, 2).text()
-        # Hash cell shows the short 0x1234…abcd form; the full hash
-        # is stored on UserRole and used by the explorer-open path.
+        # Hash cell stores the full hash as its text — Qt elides at
+        # paint time based on the column width, so widening the column
+        # reveals more of it. The cell text itself (which is what
+        # tests can observe) is the canonical 0x-prefixed 66-char form.
         hash_cell = panel.table.item(0, 3)
-        assert "…" in hash_cell.text()
-        assert hash_cell.text().startswith("0x")
+        assert hash_cell.text() == tx.hash
+        assert hash_cell.toolTip() == tx.hash
         assert hash_cell.data(Qt.UserRole) == tx.hash
 
     def test_failed_tx_marked_with_cross(self, qtbot, tmp_qeth):

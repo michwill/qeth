@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..formatting import format_datetime as _format_datetime
-from ..formatting import short_addr as _short_addr
 from ..plugin import Plugin
 from ..transactions import (
     BlockscoutTransactionSource, Transaction, TransactionSource, TxDirection,
@@ -277,6 +276,13 @@ class TransactionListPanel(QWidget):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
         self.table.cellDoubleClicked.connect(self._open_in_explorer)
+        # ElideMiddle on the view lets the Hash column adapt: the full
+        # hash is stored in the cell, and Qt truncates at paint time
+        # only as much as needed to fit the column width — so the
+        # rendered text grows as the user widens the column.
+        # Short-text cells (Status/Nonce/Time, all ResizeToContents)
+        # always fit, so this setting only ever takes effect on Hash.
+        self.table.setTextElideMode(Qt.ElideMiddle)
         h = self.table.horizontalHeader()
         # Status / Nonce / Time auto-fit content (no user-drag — there's
         # nothing meaningful to widen them to). Hash stretches to fill
@@ -370,10 +376,11 @@ class TransactionListPanel(QWidget):
 
             time_item = QTableWidgetItem(_format_datetime(tx.timestamp))
 
-            # Hash column carries the full hash on UserRole (used by
-            # explorer-open / context-menu) and renders the truncated
-            # 0x1234…abcd form for display.
-            hash_item = QTableWidgetItem(_short_addr(tx.hash))
+            # Full hash stored as the cell text; the view elides it
+            # in the middle at paint time based on the column's
+            # current width, so widening the column reveals more
+            # characters until the whole 0x… string fits.
+            hash_item = QTableWidgetItem(tx.hash)
             hash_item.setFont(QFont("monospace"))
             hash_item.setToolTip(tx.hash)
             hash_item.setData(Qt.UserRole, tx.hash)
