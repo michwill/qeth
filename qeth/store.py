@@ -149,6 +149,30 @@ class Store:
         if persist:
             self.save()
 
+    def reorder_accounts(self, ordered_addresses: list[str]) -> None:
+        """Rewrite ``self.accounts`` so its order matches the given
+        list of addresses (case-insensitive). Addresses not present
+        in the new order keep their existing relative position at
+        the end — so a partial reorder (e.g. only one scheme group)
+        leaves the rest alone. Persists on disk."""
+        with self._lock:
+            wanted = [a.lower() for a in ordered_addresses]
+            by_addr: dict[str, list[dict]] = {}
+            for a in self.accounts:
+                by_addr.setdefault(a["address"].lower(), []).append(a)
+            new_list: list[dict] = []
+            seen: set[str] = set()
+            for addr in wanted:
+                if addr in by_addr and addr not in seen:
+                    new_list.extend(by_addr[addr])
+                    seen.add(addr)
+            # Append any unreferenced accounts in their original order.
+            for a in self.accounts:
+                if a["address"].lower() not in seen:
+                    new_list.append(a)
+            self.accounts = new_list
+        self.save()
+
     def set_default_account(self, address: str) -> None:
         with self._lock:
             self.default_account = address

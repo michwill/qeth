@@ -43,6 +43,91 @@ from ..ledger import DiscoveredAccount, LedgerWorker, PATH_SCHEMES
 from ..plugin import Plugin
 
 
+class _ReorderTree(QTreeWidget):
+    """QTreeWidget that allows drag-and-drop reorder of address
+    leaves *within the same parent group*. Dropping into a different
+    scheme group is rejected so a Ledger Default account can't end
+    up under Legacy (or vice-versa) — the scheme is metadata of the
+    address, not just a display nest. After a successful drop the
+    widget emits ``reorder_committed`` so the plugin can rewrite
+    the on-disk account list to match."""
+
+    reorder_committed = Signal()
+
+    def dropEvent(self, event):  # noqa: N802 — Qt method name
+        source_items = self.selectedItems()
+        if not source_items:
+            return super().dropEvent(event)
+        # All selected items must share a parent — otherwise we can't
+        # honour "same parent only" cleanly.
+        source_parent = source_items[0].parent()
+        if any(it.parent() is not source_parent for it in source_items):
+            event.ignore()
+            return
+        # Compute the destination parent based on Qt's drop indicator.
+        target = self.itemAt(event.position().toPoint())
+        indicator = self.dropIndicatorPosition()
+        if indicator == QAbstractItemView.OnItem:
+            dest_parent = target
+        elif indicator in (
+            QAbstractItemView.AboveItem,
+            QAbstractItemView.BelowItem,
+        ):
+            dest_parent = target.parent() if target is not None else None
+        else:  # OnViewport — would drop at top level; refuse.
+            event.ignore()
+            return
+        if dest_parent is not source_parent:
+            event.ignore()
+            return
+        # Capture the dragged addresses BEFORE the drop. Qt's
+        # InternalMove may destroy + recreate the source items at the
+        # destination, so item pointers can dangle across the
+        # super().dropEvent call — but the address-string data they
+        # carry is reliable, and the new items will carry the same
+        # value in UserRole. We use it to re-select after the drop so
+        # the plugin slots see ``selected_address_changed(addr)`` and
+        # repopulate, instead of being left with the mid-drop
+        # ``None`` emission that empties the panels.
+        dragged_addrs = [
+            it.data(0, Qt.UserRole) for it in source_items
+        ]
+        dragged_addrs = [a for a in dragged_addrs if isinstance(a, str)]
+        super().dropEvent(event)
+        if dragged_addrs:
+            self.clearSelection()
+            first = None
+            for addr in dragged_addrs:
+                it = self._find_by_address(addr)
+                if it is not None:
+                    it.setSelected(True)
+                    if first is None:
+                        first = it
+            if first is not None:
+                self.setCurrentItem(first)
+        self.reorder_committed.emit()
+
+    def _find_by_address(self, addr: str):
+        """Depth-first search for the leaf carrying ``addr`` in
+        UserRole. Used after a drop to relocate items whose pointers
+        were invalidated by Qt's row remove/insert."""
+
+        def walk(item):
+            if item.data(0, Qt.UserRole) == addr:
+                return item
+            for i in range(item.childCount()):
+                r = walk(item.child(i))
+                if r is not None:
+                    return r
+            return None
+
+        for i in range(self.topLevelItemCount()):
+            r = walk(self.topLevelItem(i))
+            if r is not None:
+                return r
+        return None
+
+
 class WalletsPlugin(Plugin):
     name = "Wallets"
 
@@ -134,12 +219,23 @@ class WalletsPlugin(Plugin):
         # Middle: vertical splitter (tree on top, details on bottom).
         self._splitter = QSplitter(Qt.Vertical)
 
-        self._tree = QTreeWidget()
+        self._tree = _ReorderTree()
         self._tree.setHeaderLabels(["Accounts"])
         self._tree.setRootIsDecorated(True)
         self._tree.setTextElideMode(Qt.ElideMiddle)
         self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # Drag now reorders the address rows instead of accumulating a
+        # selection — multi-select is still available via Ctrl/Shift +
+        # click for the Remove button's bulk-remove path. InternalMove
+        # restricts dragging to within this widget; the subclass's
+        # dropEvent further restricts to within the same parent group.
+        self._tree.setDragEnabled(True)
+        self._tree.setAcceptDrops(True)
+        self._tree.setDropIndicatorShown(True)
+        self._tree.setDragDropMode(QAbstractItemView.InternalMove)
+        self._tree.setDefaultDropAction(Qt.MoveAction)
         self._tree.itemSelectionChanged.connect(self._on_tree_selection)
+        self._tree.reorder_committed.connect(self._on_tree_reordered)
         self._splitter.addWidget(self._tree)
 
         self._details = DetailsPanel()
@@ -206,6 +302,9 @@ class WalletsPlugin(Plugin):
         self._tree.clear()
         ledger_accts = [a for a in self._store.accounts if a.get("source") == "ledger"]
         ledger_root = QTreeWidgetItem([f"Ledger ({len(ledger_accts)})"])
+        # Group containers: not draggable, not drop targets (we only
+        # allow re-ordering inside scheme subgroups).
+        ledger_root.setFlags(Qt.ItemIsEnabled)
         self._tree.addTopLevelItem(ledger_root)
         groups: dict[str, QTreeWidgetItem] = {}
         default_item: Optional[QTreeWidgetItem] = None
@@ -214,6 +313,10 @@ class WalletsPlugin(Plugin):
             grp = groups.get(scheme)
             if grp is None:
                 grp = QTreeWidgetItem([scheme])
+                # Scheme group: drop-enabled so children can be
+                # reordered between siblings via the parent, but not
+                # draggable itself.
+                grp.setFlags(Qt.ItemIsEnabled | Qt.ItemIsDropEnabled)
                 ledger_root.addChild(grp)
                 groups[scheme] = grp
             addr = a["address"]
@@ -225,6 +328,13 @@ class WalletsPlugin(Plugin):
             it = QTreeWidgetItem([label])
             it.setData(0, Qt.UserRole, addr)
             it.setFont(0, QFont("monospace"))
+            # Address leaf: selectable + draggable, NOT a drop target
+            # (so an address can't be dropped onto another address —
+            # only into the gap between siblings, which Qt resolves at
+            # the parent group level).
+            it.setFlags(
+                Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsDragEnabled
+            )
             grp.addChild(it)
             if is_default:
                 default_item = it
@@ -233,13 +343,34 @@ class WalletsPlugin(Plugin):
             g.setExpanded(True)
 
         # Stubs for the future
-        self._tree.addTopLevelItem(QTreeWidgetItem(["Hot wallet (0)"]))
-        self._tree.addTopLevelItem(QTreeWidgetItem(["Watch only (0)"]))
+        hot = QTreeWidgetItem(["Hot wallet (0)"])
+        hot.setFlags(Qt.ItemIsEnabled)
+        self._tree.addTopLevelItem(hot)
+        watch = QTreeWidgetItem(["Watch only (0)"])
+        watch.setFlags(Qt.ItemIsEnabled)
+        self._tree.addTopLevelItem(watch)
 
         if default_item is not None:
             self._tree.setCurrentItem(default_item)
 
     # --- selection / action handlers ---------------------------------------
+
+    def _on_tree_reordered(self) -> None:
+        """Walk the tree top-to-bottom collecting addresses in their
+        current display order, then persist that order via the Store.
+        Triggered after _ReorderTree commits an internal move."""
+        ordered: list[str] = []
+
+        def walk(item: QTreeWidgetItem) -> None:
+            addr = item.data(0, Qt.UserRole)
+            if isinstance(addr, str) and addr:
+                ordered.append(addr)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self._tree.topLevelItemCount()):
+            walk(self._tree.topLevelItem(i))
+        self._store.reorder_accounts(ordered)
 
     def _on_tree_selection(self) -> None:
         addrs = self.selected_addresses()
