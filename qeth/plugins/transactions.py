@@ -28,7 +28,8 @@ def _escape_html(text: str) -> str:
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontDatabase, QTextCharFormat,
+    QColor, QDesktopServices, QFont, QFontDatabase, QPalette,
+    QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout,
@@ -989,6 +990,15 @@ class TransactionDetailsDialog(QDialog):
         self.setWindowTitle(f"Transaction {tx.hash[:10]}…")
         self.resize(720, 560)
 
+        # Use the regular text colour for links rather than
+        # QPalette.Link — that role inherits a low-contrast cyan in a
+        # lot of common themes (Breeze/Kvantum/qt6ct fallbacks pick
+        # ``#2adfff``-ish), so links end up nearly invisible on the
+        # dialog background. Black-on-white (or white-on-dark) plus
+        # the underline carries the "this is a link" signal without
+        # needing a colour that's guaranteed to contrast.
+        self._link_color = self.palette().color(QPalette.WindowText).name()
+
         # Outer layout: comfortable margins so the contents don't bump
         # against the window chrome.
         outer = QVBoxLayout(self)
@@ -1006,26 +1016,24 @@ class TransactionDetailsDialog(QDialog):
         outer.addLayout(form)
 
         mono = QFont("monospace")
-
-        def _value_label(text: str, *, monospace: bool = False) -> QLabel:
-            lbl = QLabel(text)
-            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            if monospace:
-                lbl.setFont(mono)
-            # Wrap long values (full hashes etc.) so they don't push
-            # the dialog width past the user's screen.
-            lbl.setWordWrap(True)
-            return lbl
+        self._mono_font = mono
 
         form.addRow("Status:",
-                    _value_label("✓ Success" if tx.success else "✗ Reverted"))
-        form.addRow("Nonce:", _value_label(str(tx.nonce)))
+                    self._value_label(
+                        "✓ Success" if tx.success else "✗ Reverted"))
+        form.addRow("Nonce:", self._value_label(str(tx.nonce)))
         dt = datetime.datetime.fromtimestamp(tx.timestamp)
-        form.addRow("Date:", _value_label(dt.strftime("%c")))
-        form.addRow("Timestamp:", _value_label(f"{tx.timestamp} (unix)"))
-        form.addRow("Block:", _value_label(str(tx.block_number)))
-        form.addRow("Hash:", _value_label(tx.hash, monospace=True))
-        form.addRow("From:", _value_label(tx.from_addr, monospace=True))
+        form.addRow("Date:", self._value_label(dt.strftime("%c")))
+        form.addRow("Timestamp:", self._value_label(f"{tx.timestamp} (unix)"))
+        form.addRow("Block:", self._value_label(str(tx.block_number)))
+        form.addRow("Hash:",
+                    self._link_label(tx.hash,
+                                     self._explorer_url("tx", tx.hash),
+                                     monospace=True))
+        form.addRow("From:",
+                    self._link_label(tx.from_addr,
+                                     self._explorer_url("address", tx.from_addr),
+                                     monospace=True))
         form.addRow("To:", self._build_to_row(tx, chain, mono))
         # Value rendered through wei_to_ether (Decimal) — never float.
         if tx.value_wei:
@@ -1033,10 +1041,11 @@ class TransactionDetailsDialog(QDialog):
             value_text = f"{ether} {chain.symbol}  ({tx.value_wei} wei)"
         else:
             value_text = "0"
-        form.addRow("Value:", _value_label(value_text))
+        form.addRow("Value:", self._value_label(value_text))
         form.addRow("Method ID:",
-                    _value_label(tx.method_id or "(none — plain transfer)",
-                                 monospace=True))
+                    self._value_label(
+                        tx.method_id or "(none — plain transfer)",
+                        monospace=True))
 
         # Decoded call sits below the form: label on its own line,
         # then the QTextEdit (read-only, syntax-highlighted via
@@ -1107,10 +1116,63 @@ class TransactionDetailsDialog(QDialog):
         _render_decoded(self.decoded_view, decoded, token_context)
 
     def _open_explorer(self) -> None:
-        if not self.chain.explorer:
-            return
-        url = f"{self.chain.explorer.rstrip('/')}/tx/{self.tx.hash}"
-        QDesktopServices.openUrl(QUrl(url))
+        url = self._explorer_url("tx", self.tx.hash)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _value_label(self, text: str, *, monospace: bool = False) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if monospace:
+            lbl.setFont(self._mono_font)
+        # Wrap long values (full hashes etc.) so they don't push the
+        # dialog width past the user's screen.
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _link_label(self, text: str, url: Optional[str], *,
+                    monospace: bool = False) -> QLabel:
+        """Address / hash label that's a hyperlink when an explorer
+        URL is available, plain selectable text when the chain has
+        no explorer configured."""
+        if not url:
+            return self._value_label(text, monospace=monospace)
+        style = f"color: {self._link_color}; text-decoration: underline;"
+        if monospace:
+            style += " font-family: monospace;"
+        html = (
+            f'<a href="{_escape_html(url)}" style="{style}">'
+            f"{_escape_html(text)}</a>"
+        )
+        lbl = QLabel(html)
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setOpenExternalLinks(True)
+        lbl.setTextInteractionFlags(
+            Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
+        )
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _explorer_url(self, kind: str, addr: str,
+                       *, ref_addr: Optional[str] = None) -> Optional[str]:
+        """Build an Etherscan-family URL: ``tx``/``address``/``token``.
+        ``token`` with ``ref_addr`` appends ``?a=<ref>`` — Etherscan's
+        convention for filtering the token page to a specific holder
+        (so clicking a token in the To row jumps straight to the
+        sender's transfer history for that token)."""
+        if not self.chain.explorer or not addr:
+            return None
+        base = self.chain.explorer.rstrip("/")
+        if kind == "tx":
+            return f"{base}/tx/{addr}"
+        if kind == "address":
+            return f"{base}/address/{addr}"
+        if kind == "token":
+            url = f"{base}/token/{addr}"
+            if ref_addr:
+                url += f"?a={ref_addr}"
+            return url
+        return None
 
     # --- "To:" row composition ------------------------------------------
 
@@ -1137,10 +1199,11 @@ class TransactionDetailsDialog(QDialog):
         if entry is not None:
             # Icon on the left, then "SYMBOL (0xaddr…)" rendered as
             # rich text in a single QLabel so symbol and address sit
-            # flush against the parentheses, with the address in a
-            # monospace face. Icon label is created even when the
-            # pixmap isn't cached yet so the async callback can fill
-            # it without a relayout.
+            # flush against the parentheses. The address is a link to
+            # the token's page filtered by the sender — Etherscan's
+            # /token/<token>?a=<holder> pattern — so the click lands
+            # on the user's transfer history for that token rather
+            # than the generic contract page.
             self._to_addr_lower = addr.lower()
             self._to_icon_label = QLabel()
             # Icon dims match what TokenListPanel uses for inline rows.
@@ -1148,13 +1211,30 @@ class TransactionDetailsDialog(QDialog):
             self._to_icon_label.setScaledContents(True)
             row.addWidget(self._to_icon_label)
 
+            token_url = self._explorer_url(
+                "token", addr, ref_addr=tx.from_addr,
+            )
+            if token_url:
+                addr_html = (
+                    f'<a href="{_escape_html(token_url)}" '
+                    f'style="color: {self._link_color}; '
+                    f'text-decoration: underline; '
+                    f'font-family: monospace;">'
+                    f"{_escape_html(addr)}</a>"
+                )
+            else:
+                addr_html = (
+                    f'<span style="font-family: monospace;">'
+                    f"{_escape_html(addr)}</span>"
+                )
             label = QLabel(
-                f"{_escape_html(entry.symbol)} "
-                f'(<span style="font-family: monospace;">'
-                f"{_escape_html(addr)}</span>)"
+                f"{_escape_html(entry.symbol)} ({addr_html})"
             )
             label.setTextFormat(Qt.RichText)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setOpenExternalLinks(True)
+            label.setTextInteractionFlags(
+                Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
+            )
             row.addWidget(label, 1)
 
             if self._icon_cache is not None:
@@ -1167,11 +1247,12 @@ class TransactionDetailsDialog(QDialog):
                         chain.chain_id, addr, entry.logo_uri,
                     )
         else:
-            addr_label = QLabel(addr)
-            addr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            addr_label.setFont(mono)
-            addr_label.setWordWrap(True)
-            row.addWidget(addr_label, 1)
+            row.addWidget(
+                self._link_label(addr,
+                                 self._explorer_url("address", addr),
+                                 monospace=True),
+                1,
+            )
 
         return container
 
