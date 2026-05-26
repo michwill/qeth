@@ -589,6 +589,19 @@ class DetailsPanel(QWidget):
         # address dapps will see via the local JSON-RPC server (Frame
         # interface), nothing about persistence or "default".
         self.set_default_btn = QPushButton("Connect to browser")
+        # Globe / browser icon for "make this address visible to the
+        # web". Same icon the Transactions list uses for "Open in
+        # block explorer" — reuse keeps the "exposed to the web"
+        # association consistent across the app.
+        _conn_icon = QIcon.fromTheme(
+            "applications-internet",
+            QIcon.fromTheme(
+                "internet-web-browser",
+                QApplication.style().standardIcon(QStyle.SP_DesktopIcon),
+            ),
+        )
+        if not _conn_icon.isNull() and _conn_icon.availableSizes():
+            self.set_default_btn.setIcon(_conn_icon)
         self.set_default_btn.setToolTip(
             "Make this the address dapps see (returned by eth_accounts "
             "over the local JSON-RPC server)"
@@ -683,9 +696,31 @@ class AddLedgerDialog(QDialog):
         layout.addWidget(self.progress)
 
         btns = QHBoxLayout()
+        style_proxy = QApplication.style()
         self.scan_btn = QPushButton("Scan")
+        # Magnifier icon reads as "look for accounts on the device".
+        _scan_icon = QIcon.fromTheme(
+            "system-search",
+            QIcon.fromTheme(
+                "edit-find",
+                style_proxy.standardIcon(QStyle.SP_FileDialogContentsView),
+            ),
+        )
+        if not _scan_icon.isNull() and _scan_icon.availableSizes():
+            self.scan_btn.setIcon(_scan_icon)
         self.add_btn = QPushButton("Add selected")
+        # Same "+" icon the toolbar Add buttons use across the app —
+        # keeps the meaning stable wherever the user sees it.
+        _add_icon = QIcon.fromTheme(
+            "list-add",
+            style_proxy.standardIcon(QStyle.SP_FileDialogNewFolder),
+        )
+        if not _add_icon.isNull() and _add_icon.availableSizes():
+            self.add_btn.setIcon(_add_icon)
         self.add_btn.setEnabled(False)
+        # Close stays text-only — Qt's QDialogButtonBox-derived
+        # dialogs across the app render Cancel/Close without
+        # icons, and adding one here would be inconsistent.
         self.close_btn = QPushButton("Close")
         btns.addWidget(self.scan_btn)
         btns.addStretch(1)

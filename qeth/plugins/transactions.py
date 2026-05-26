@@ -1434,6 +1434,15 @@ class TransactionDetailsDialog(QDialog):
         # Buttons row: Explorer + Close.
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         explorer_btn = QPushButton("Open in block explorer")
+        # Same browser icon as the Transactions list's external-
+        # link button so "go to the explorer" reads identically
+        # wherever the user encounters it.
+        _explorer_icon = QIcon.fromTheme(
+            "applications-internet",
+            QIcon.fromTheme("internet-web-browser"),
+        )
+        if not _explorer_icon.isNull() and _explorer_icon.availableSizes():
+            explorer_btn.setIcon(_explorer_icon)
         explorer_btn.setEnabled(bool(chain.explorer))
         explorer_btn.clicked.connect(self._open_explorer)
         buttons.addButton(explorer_btn, QDialogButtonBox.ActionRole)
@@ -1993,6 +2002,18 @@ class SignTransactionDialog(QDialog):
         self.confirm_btn = self.buttons.addButton(
             "Confirm and sign", QDialogButtonBox.AcceptRole,
         )
+        # Checkmark icon — universal "approve". Distinguishes the
+        # primary action visually from Cancel, which Qt themes
+        # generally render with an ×.
+        _ok_icon = QIcon.fromTheme(
+            "emblem-ok",
+            QIcon.fromTheme(
+                "dialog-ok-apply",
+                QApplication.style().standardIcon(QStyle.SP_DialogApplyButton),
+            ),
+        )
+        if not _ok_icon.isNull() and _ok_icon.availableSizes():
+            self.confirm_btn.setIcon(_ok_icon)
         self.confirm_btn.setEnabled(False)
         self.buttons.rejected.connect(self.reject)
         # Emit a request signal rather than accept()ing here. The
@@ -2496,6 +2517,18 @@ class SendTokenDialog(QDialog):
         self.confirm_btn = self.buttons.addButton(
             "Send", QDialogButtonBox.AcceptRole,
         )
+        # Same mail-send icon as the toolbar Send button on the
+        # tokens panel — same meaning across all the places the
+        # user can launch a send.
+        _send_icon = QIcon.fromTheme(
+            "mail-send",
+            QIcon.fromTheme(
+                "document-send",
+                QApplication.style().standardIcon(QStyle.SP_ArrowUp),
+            ),
+        )
+        if not _send_icon.isNull() and _send_icon.availableSizes():
+            self.confirm_btn.setIcon(_send_icon)
         self.confirm_btn.setEnabled(False)
         self.buttons.rejected.connect(self.reject)
         self.confirm_btn.clicked.connect(self.sign_requested.emit)
