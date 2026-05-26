@@ -1894,6 +1894,15 @@ class SignTransactionDialog(QDialog):
             return q
 
         from_cs = to_checksum_address(req.from_addr)
+        # "Requested by:" — the caller's Origin (typically the dapp
+        # URL). Only shown when the RPC layer captured one; local-
+        # send flows leave this None and the row is hidden so the
+        # user doesn't see "Requested by: None".
+        if req.origin:
+            header.addRow(
+                "Requested by:",
+                self._link_label(req.origin, req.origin),
+            )
         header.addRow("Network:", _lbl(f"{chain.name} ({chain.chain_id})"))
         header.addRow(
             "From:",

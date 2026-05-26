@@ -116,11 +116,25 @@ class RpcServer:
             return web.json_response(
                 {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
             )
+        # The HTTP Origin header on a browser-extension-mediated
+        # request is the extension's own (chrome-extension://…),
+        # not the dapp's. Frame ships the real dapp URL in a
+        # custom JSON-RPC body field (``__frameOrigin``); prefer
+        # that when present, fall back to the HTTP Origin header
+        # otherwise. _handle_one applies the same precedence.
+        origin = request.headers.get("Origin")
         if isinstance(body, list):
-            return web.json_response([await self._handle_one(r) for r in body])
-        return web.json_response(await self._handle_one(body))
+            return web.json_response(
+                [await self._handle_one(r, origin) for r in body],
+            )
+        return web.json_response(await self._handle_one(body, origin))
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
+        # The Origin header here is the extension's; the real dapp
+        # URL arrives per-message in ``__frameOrigin`` on the JSON-
+        # RPC body. _handle_one picks the body field over this
+        # fallback.
+        origin = request.headers.get("Origin")
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         async for msg in ws:
@@ -134,20 +148,29 @@ class RpcServer:
                     ))
                     continue
                 if isinstance(req, list):
-                    resp = [await self._handle_one(r) for r in req]
+                    resp = [await self._handle_one(r, origin) for r in req]
                 else:
-                    resp = await self._handle_one(req)
+                    resp = await self._handle_one(req, origin)
                 await ws.send_str(json.dumps(resp))
             elif msg.type == WSMsgType.ERROR:
                 break
         return ws
 
-    async def _handle_one(self, req: dict) -> dict:
+    async def _handle_one(self, req: dict,
+                           origin: Optional[str] = None) -> dict:
         method = req.get("method")
         params = req.get("params") or []
         rid = req.get("id")
+        # Frame attaches the real dapp URL as a top-level
+        # ``__frameOrigin`` field on each JSON-RPC message — the
+        # HTTP / WS Origin header is the extension's own. Other
+        # wallet-extension wire formats may add their own field;
+        # add them here as we learn the names.
+        frame_origin = req.get("__frameOrigin")
+        if isinstance(frame_origin, str) and frame_origin:
+            origin = frame_origin
         try:
-            result = await self._dispatch(method, params)
+            result = await self._dispatch(method, params, origin)
             return {"jsonrpc": "2.0", "id": rid, "result": result}
         except RpcError as e:
             return {"jsonrpc": "2.0", "id": rid,
@@ -157,7 +180,8 @@ class RpcServer:
             return {"jsonrpc": "2.0", "id": rid,
                     "error": {"code": -32603, "message": str(e)}}
 
-    async def _dispatch(self, method: str, params: list) -> Any:
+    async def _dispatch(self, method: str, params: list,
+                         origin: Optional[str] = None) -> Any:
         if method in ("eth_accounts", "eth_requestAccounts"):
             return [self.store.default_account] if self.store.default_account else []
 
@@ -193,6 +217,7 @@ class RpcServer:
             try:
                 req = parse_send_transaction_params(
                     params, self.store.current_chain().chain_id,
+                    origin=origin,
                 )
             except SignerError as e:
                 raise RpcError(-32602, str(e))

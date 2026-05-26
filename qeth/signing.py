@@ -62,6 +62,11 @@ class SigningRequest:
     max_priority_fee_per_gas: Optional[int] = None
     gas_price: Optional[int] = None
     nonce: Optional[int] = None
+    # HTTP Origin / WS Origin of the caller — typically the dapp's
+    # URL (https://app.uniswap.org), populated by the RPC handler
+    # from the incoming request headers. ``None`` for locally
+    # initiated requests (e.g. the user clicked Send in the UI).
+    origin: Optional[str] = None
 
 
 def _hex_to_int(v) -> Optional[int]:
@@ -73,9 +78,13 @@ def _hex_to_int(v) -> Optional[int]:
     return int(s, 16) if s.startswith("0x") else int(s)
 
 
-def parse_send_transaction_params(params: list, chain_id: int) -> SigningRequest:
+def parse_send_transaction_params(
+    params: list, chain_id: int, *, origin: Optional[str] = None,
+) -> SigningRequest:
     """Parse the dapp's ``eth_sendTransaction`` params list into a
-    typed ``SigningRequest``."""
+    typed ``SigningRequest``. ``origin`` is the caller's HTTP /WS
+    Origin header — set by the RPC handler, surfaced to the signing
+    dialog so the user sees which site is requesting the tx."""
     if not params or not isinstance(params[0], dict):
         raise SignerError("eth_sendTransaction expects a single object parameter")
     p = params[0]
@@ -99,6 +108,7 @@ def parse_send_transaction_params(params: list, chain_id: int) -> SigningRequest
         max_priority_fee_per_gas=_hex_to_int(p.get("maxPriorityFeePerGas")),
         gas_price=_hex_to_int(p.get("gasPrice")),
         nonce=_hex_to_int(p.get("nonce")),
+        origin=origin,
     )
 
 

@@ -104,6 +104,80 @@ class TestParseSendTransactionParams:
         with pytest.raises(SignerError):
             parse_send_transaction_params(["0xdeadbeef"], CHAIN_ID)
 
+    def test_origin_is_propagated(self):
+        """Origin (HTTP/WS header) flows through the parser onto
+        the typed request so the signing dialog can show
+        "Requested by: <site>". RPC handler is the only caller that
+        passes a non-None value; local-send flows leave it None."""
+        req = parse_send_transaction_params(
+            [{"from": ADDR_CHECKSUM, "to": TOKEN_CHECKSUM}],
+            CHAIN_ID,
+            origin="https://app.uniswap.org",
+        )
+        assert req.origin == "https://app.uniswap.org"
+
+    def test_origin_defaults_to_none(self):
+        req = parse_send_transaction_params(
+            [{"from": ADDR_CHECKSUM, "to": TOKEN_CHECKSUM}],
+            CHAIN_ID,
+        )
+        assert req.origin is None
+
+
+class TestRpcOriginExtraction:
+    """The RPC handler picks the real dapp URL out of Frame's
+    custom ``__frameOrigin`` body field; the HTTP/WS Origin
+    header (which on extension-mediated calls is the extension's
+    own) is only the fallback."""
+
+    def _server_with_bridge(self):
+        from unittest.mock import MagicMock
+        from qeth.rpc import RpcServer
+        from qeth.chains import DEFAULT_CHAINS
+        bridge = SignerBridge()
+        captured: list = []
+
+        def on_request(req, fut):
+            captured.append(req)
+            bridge.resolve(fut, "0xfeed")
+        bridge.request_received.connect(on_request)
+
+        store = MagicMock()
+        store.current_chain.return_value = DEFAULT_CHAINS[0]
+        return RpcServer(store, signer_bridge=bridge), captured
+
+    def test_frame_origin_overrides_http_origin(self, qtbot):
+        server, captured = self._server_with_bridge()
+
+        async def go():
+            return await server._handle_one(
+                {
+                    "method": "eth_sendTransaction",
+                    "params": [{"from": ADDR_LOWER, "to": TOKEN_LOWER}],
+                    "__frameOrigin": "https://www.curve.finance",
+                },
+                origin="chrome-extension://abc",
+            )
+
+        result = asyncio.run(go())
+        assert result["result"] == "0xfeed"
+        assert captured[0].origin == "https://www.curve.finance"
+
+    def test_falls_back_to_http_origin_when_no_frame_field(self, qtbot):
+        server, captured = self._server_with_bridge()
+
+        async def go():
+            return await server._handle_one(
+                {
+                    "method": "eth_sendTransaction",
+                    "params": [{"from": ADDR_LOWER, "to": TOKEN_LOWER}],
+                },
+                origin="https://app.uniswap.org",
+            )
+
+        asyncio.run(go())
+        assert captured[0].origin == "https://app.uniswap.org"
+
 
 # --- apply_gas_policy (pure) --------------------------------------------
 
