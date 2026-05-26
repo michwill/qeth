@@ -19,7 +19,7 @@ from .plugins.transactions import (
     SignTransactionDialog, TransactionsPlugin,
 )
 from .plugins.wallets import WalletsPlugin
-from .signing import SignerBridge, SignerError
+from .signing import SignAndBroadcastWorker, SignerBridge, SignerError
 
 
 class MainWindow(QMainWindow):
@@ -201,6 +201,12 @@ class MainWindow(QMainWindow):
     def current_chain(self):
         return self.store.current_chain()
 
+    def chain_by_id(self, chain_id: int):
+        for c in self.store.chains:
+            if c.chain_id == chain_id:
+                return c
+        return None
+
     def start_worker(self, worker: QThread) -> QThread:
         """Track a worker so Python doesn't GC it while running."""
         self._active_workers.add(worker)
@@ -267,11 +273,77 @@ class MainWindow(QMainWindow):
         if dialog.exec() != SignTransactionDialog.Accepted:
             self.signer_bridge.reject(fut, SignerError("User cancelled"))
             return
-        # Phase 1 placeholder — Phase 2 will plug in LedgerSigner
-        # here, call sign + broadcast, and resolve with the tx hash.
-        self.signer_bridge.reject(
-            fut, SignerError("Signing path WIP (Phase 2)"),
+        try:
+            finalised = dialog.finalised_request()
+        except SignerError as e:
+            self.signer_bridge.reject(fut, e)
+            return
+
+        # Phase 2: actual sign + broadcast via the Ledger backend.
+        # Future signers (hot wallet, watch-only) plug into the same
+        # Signer ABC; pick the right backend based on the source on
+        # the account record.
+        from .ledger import LedgerSigner
+        signer = LedgerSigner(self.store)
+        if not signer.can_sign(finalised.from_addr):
+            self.signer_bridge.reject(
+                fut,
+                SignerError(
+                    f"No known signer for {finalised.from_addr}"
+                ),
+            )
+            return
+
+        # Modal "waiting for device" — non-cancellable; the dapp on
+        # the other end of the RPC will time out on its own if the
+        # user walks away.
+        from PySide6.QtWidgets import QProgressDialog
+        progress = QProgressDialog(
+            "Confirm the transaction on your Ledger device…",
+            None,           # no cancel button
+            0, 0,           # indeterminate / spinner
+            self,
         )
+        progress.setWindowTitle("Signing transaction")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = SignAndBroadcastWorker(signer, finalised, chain)
+        worker.broadcast.connect(
+            lambda h, p=progress, f=fut, r=finalised, c=chain:
+                self._on_tx_broadcast(h, p, f, r, c)
+        )
+        worker.failed.connect(
+            lambda msg, p=progress, f=fut: self._on_tx_sign_failed(msg, p, f)
+        )
+        self.start_worker(worker)
+
+    def _on_tx_broadcast(self, tx_hash, progress, fut, req, chain) -> None:
+        progress.close()
+        self.signer_bridge.resolve(fut, tx_hash)
+        # Snapshot the just-sent tx into the transactions list as a
+        # pending row so the user sees it immediately — without
+        # waiting for Blockscout indexing (it lags mempool by tens of
+        # seconds). The plugin's PendingTxWatcher polls the receipt
+        # and flips the row to confirmed when the tx mines.
+        try:
+            self.transactions_plugin.add_pending(tx_hash, req, chain)
+        except Exception:
+            import logging
+            logging.getLogger("qeth.ui").exception("add_pending failed")
+        # Make the pending row visible: select the ``from`` account
+        # in the wallets tree (pending lives in that account's bucket)
+        # and flip the right slot to the Transactions tab. Both are
+        # idempotent if we're already in the right place.
+        self.wallets_plugin.select_address(req.from_addr)
+        self.right_slot.set_active(self.transactions_plugin)
+        self.status_message(f"Broadcast {tx_hash}", 6000)
+
+    def _on_tx_sign_failed(self, msg: str, progress, fut) -> None:
+        progress.close()
+        self.signer_bridge.reject(fut, SignerError(msg))
+        self.status_message(f"Signing failed: {msg}", 6000)
 
     # --- transitional aliases (kept so existing tests / external code
     # that pokes at the panels directly keeps working).

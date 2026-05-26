@@ -56,6 +56,13 @@ class Transaction:
     method_id: str
     input_data: str           # full calldata hex incl. "0x" prefix
     success: bool
+    # Local-only: True while the tx is sitting in the mempool after a
+    # qeth-driven broadcast and the receipt hasn't landed yet. Always
+    # False on entries that come from a TransactionSource (Blockscout
+    # never returns mempool entries). Flipped to False by
+    # PendingTxWatcher once the receipt arrives, alongside filling in
+    # block_number / gas_used / gas_price_wei / success.
+    pending: bool = False
 
     def direction(self, viewer: str) -> TxDirection:
         v = viewer.lower()

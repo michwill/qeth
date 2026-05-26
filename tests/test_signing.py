@@ -332,6 +332,339 @@ class TestSignerBridge:
 
 # --- RpcServer dispatch surface -----------------------------------------
 
+class TestLedgerSignerLookup:
+    """The path-lookup half of LedgerSigner is testable hermetically —
+    the actual ``sign`` call hits a device and isn't covered here."""
+
+    def _store(self, accounts):
+        class _S:
+            pass
+        s = _S()
+        s.accounts = accounts
+        return s
+
+    def test_can_sign_for_known_ledger_account(self):
+        from qeth.ledger import LedgerSigner
+        signer = LedgerSigner(self._store([
+            {"address": ADDR_CHECKSUM, "source": "ledger",
+             "path": "44'/60'/0'/0/0"},
+        ]))
+        assert signer.can_sign(ADDR_CHECKSUM)
+        # case insensitive
+        assert signer.can_sign(ADDR_LOWER)
+
+    def test_can_sign_false_for_unknown_address(self):
+        from qeth.ledger import LedgerSigner
+        signer = LedgerSigner(self._store([
+            {"address": ADDR_CHECKSUM, "source": "ledger",
+             "path": "44'/60'/0'/0/0"},
+        ]))
+        assert not signer.can_sign("0x" + "ff" * 20)
+
+    def test_can_sign_false_for_non_ledger_source(self):
+        """Same address on a different source (hot wallet, watch-only)
+        doesn't satisfy LedgerSigner."""
+        from qeth.ledger import LedgerSigner
+        signer = LedgerSigner(self._store([
+            {"address": ADDR_CHECKSUM, "source": "hot",
+             "path": "44'/60'/0'/0/0"},
+        ]))
+        assert not signer.can_sign(ADDR_CHECKSUM)
+
+    def test_sign_without_path_raises(self):
+        from qeth.ledger import LedgerSigner
+        signer = LedgerSigner(self._store([
+            {"address": ADDR_CHECKSUM, "source": "ledger"},  # no path
+        ]))
+        from qeth.chains import DEFAULT_CHAINS
+        req = SigningRequest(
+            chain_id=1, from_addr=ADDR_CHECKSUM, to_addr=TOKEN_CHECKSUM,
+            gas=21000, nonce=0,
+            max_fee_per_gas=10**9, max_priority_fee_per_gas=10**8,
+        )
+        with pytest.raises(SignerError, match="derivation path"):
+            signer.sign(req, DEFAULT_CHAINS[0])
+
+    def test_sign_for_unknown_address_raises(self):
+        from qeth.ledger import LedgerSigner
+        from qeth.chains import DEFAULT_CHAINS
+        signer = LedgerSigner(self._store([]))
+        req = SigningRequest(
+            chain_id=1, from_addr=ADDR_CHECKSUM, to_addr=TOKEN_CHECKSUM,
+            gas=21000, nonce=0,
+            max_fee_per_gas=10**9, max_priority_fee_per_gas=10**8,
+        )
+        with pytest.raises(SignerError, match="No Ledger account"):
+            signer.sign(req, DEFAULT_CHAINS[0])
+
+    def test_sign_without_gas_or_nonce_raises(self):
+        from qeth.ledger import LedgerSigner
+        from qeth.chains import DEFAULT_CHAINS
+        signer = LedgerSigner(self._store([
+            {"address": ADDR_CHECKSUM, "source": "ledger",
+             "path": "44'/60'/0'/0/0"},
+        ]))
+        # Missing gas
+        req = SigningRequest(
+            chain_id=1, from_addr=ADDR_CHECKSUM, to_addr=TOKEN_CHECKSUM,
+            nonce=0,
+            max_fee_per_gas=10**9, max_priority_fee_per_gas=10**8,
+        )
+        with pytest.raises(SignerError, match="gas and nonce"):
+            signer.sign(req, DEFAULT_CHAINS[0])
+
+    def test_sign_eip1559_without_fees_raises(self):
+        from qeth.ledger import LedgerSigner
+        from qeth.chains import DEFAULT_CHAINS
+        signer = LedgerSigner(self._store([
+            {"address": ADDR_CHECKSUM, "source": "ledger",
+             "path": "44'/60'/0'/0/0"},
+        ]))
+        req = SigningRequest(
+            chain_id=1, from_addr=ADDR_CHECKSUM, to_addr=TOKEN_CHECKSUM,
+            gas=21000, nonce=0,
+            # no EIP-1559 fees
+        )
+        with pytest.raises(SignerError, match="EIP-1559 fees"):
+            signer.sign(req, DEFAULT_CHAINS[0])
+
+
+class TestSignAndBroadcastWorker:
+    """The worker's failure-path branches are testable by passing a
+    mock signer / monkeypatching EthClient. Successful run hits a
+    real chain and isn't covered here."""
+
+    def _req(self):
+        return SigningRequest(
+            chain_id=1, from_addr=ADDR_CHECKSUM, to_addr=TOKEN_CHECKSUM,
+            gas=21000, nonce=0,
+            max_fee_per_gas=10**9, max_priority_fee_per_gas=10**8,
+        )
+
+    def test_signer_failure_emits_failed_not_broadcast(self, qtbot, monkeypatch):
+        """Worker.run runs synchronously when invoked directly, so we
+        can call it without spinning a thread up — keeps the test
+        deterministic."""
+        from qeth.signing import SignAndBroadcastWorker
+        from qeth.chains import DEFAULT_CHAINS
+
+        class _BadSigner:
+            def can_sign(self, addr): return True
+            def sign(self, req, chain):
+                raise SignerError("user rejected on device")
+
+        worker = SignAndBroadcastWorker(_BadSigner(), self._req(), DEFAULT_CHAINS[0])
+        captured: dict = {}
+        worker.broadcast.connect(lambda h: captured.setdefault("hash", h))
+        worker.failed.connect(lambda msg: captured.setdefault("msg", msg))
+        worker.run()    # synchronous; no thread / event loop needed
+        assert "hash" not in captured
+        assert "user rejected" in captured["msg"]
+
+    def test_broadcast_failure_surfaces(self, qtbot, monkeypatch):
+        """Signer succeeds but eth_sendRawTransaction errors — worker
+        should report broadcast failure, not signing failure."""
+        from qeth import signing
+        from qeth.signing import SignAndBroadcastWorker
+        from qeth.chains import DEFAULT_CHAINS
+
+        class _OkSigner:
+            def can_sign(self, addr): return True
+            def sign(self, req, chain): return b"\x01" * 64
+
+        class _BadClient:
+            def __init__(self, chain): pass
+            def send_raw_transaction(self, raw):
+                raise RuntimeError("nonce too low")
+
+        # The worker imports EthClient lazily from qeth.chain inside
+        # run(); patch the source-of-truth.
+        import qeth.chain
+        monkeypatch.setattr(qeth.chain, "EthClient", _BadClient)
+
+        worker = SignAndBroadcastWorker(_OkSigner(), self._req(), DEFAULT_CHAINS[0])
+        captured: dict = {}
+        worker.broadcast.connect(lambda h: captured.setdefault("hash", h))
+        worker.failed.connect(lambda msg: captured.setdefault("msg", msg))
+        worker.run()
+        assert "hash" not in captured
+        assert "Broadcast failed" in captured["msg"]
+        assert "nonce too low" in captured["msg"]
+
+    def test_happy_path_emits_broadcast_with_hash(self, qtbot, monkeypatch):
+        from qeth.signing import SignAndBroadcastWorker
+        from qeth.chains import DEFAULT_CHAINS
+
+        class _OkSigner:
+            def can_sign(self, addr): return True
+            def sign(self, req, chain): return b"\xab\xcd"
+
+        class _OkClient:
+            def __init__(self, chain): pass
+            def send_raw_transaction(self, raw):
+                return "0xfeed1234"
+
+        import qeth.chain
+        monkeypatch.setattr(qeth.chain, "EthClient", _OkClient)
+
+        worker = SignAndBroadcastWorker(_OkSigner(), self._req(), DEFAULT_CHAINS[0])
+        captured: dict = {}
+        worker.broadcast.connect(lambda h: captured.setdefault("hash", h))
+        worker.failed.connect(lambda msg: captured.setdefault("msg", msg))
+        worker.run()
+        assert captured.get("hash") == "0xfeed1234"
+        assert "msg" not in captured
+
+
+class TestConfirmedFromReceipt:
+    """The pure function that merges an eth_getTransactionReceipt
+    payload into a pending Transaction → confirmed Transaction."""
+
+    def _pending(self):
+        from qeth.transactions import Transaction
+        return Transaction(
+            chain_id=1, hash="0x" + "ab" * 32, block_number=0, timestamp=1700,
+            nonce=5, from_addr=ADDR_LOWER, to_addr=TOKEN_LOWER,
+            value_wei=0, gas_used=0, gas_price_wei=2 * 10**9,
+            method_id="0xa9059cbb", input_data="0xa9059cbb",
+            success=True, pending=True,
+        )
+
+    def test_success_receipt(self):
+        from qeth.plugins.transactions import _confirmed_from_receipt
+        out = _confirmed_from_receipt(self._pending(), {
+            "blockNumber": "0x1234",
+            "gasUsed": "0xc350",
+            "status": "0x1",
+            "effectiveGasPrice": "0x77359400",   # 2 gwei
+        })
+        assert out.pending is False
+        assert out.success is True
+        assert out.block_number == 0x1234
+        assert out.gas_used == 0xc350
+        assert out.gas_price_wei == 2 * 10**9
+        # Other fields preserved
+        assert out.nonce == 5
+        assert out.hash == self._pending().hash
+
+    def test_revert_receipt(self):
+        from qeth.plugins.transactions import _confirmed_from_receipt
+        out = _confirmed_from_receipt(self._pending(), {
+            "blockNumber": "0x1234",
+            "gasUsed": "0xc350",
+            "status": "0x0",
+            "effectiveGasPrice": "0x77359400",
+        })
+        assert out.pending is False
+        assert out.success is False
+
+    def test_missing_status_defaults_to_success(self):
+        """Pre-Byzantium receipts (pre-block 4_370_000 on Ethereum)
+        had no ``status`` field. Treat absence as success since the
+        tx was mined — Blockscout has the same convention."""
+        from qeth.plugins.transactions import _confirmed_from_receipt
+        out = _confirmed_from_receipt(self._pending(), {
+            "blockNumber": "0x1234",
+            "gasUsed": "0xc350",
+            "effectiveGasPrice": "0x77359400",
+        })
+        assert out.success is True
+        assert out.pending is False
+
+    def test_missing_effective_gas_price_keeps_old_value(self):
+        """Some upstream providers omit effectiveGasPrice on legacy
+        txs. Fall back to the cached value the user signed with so
+        the row isn't suddenly showing 0 wei."""
+        from qeth.plugins.transactions import _confirmed_from_receipt
+        out = _confirmed_from_receipt(self._pending(), {
+            "blockNumber": "0x1234",
+            "gasUsed": "0xc350",
+            "status": "0x1",
+        })
+        assert out.gas_price_wei == 2 * 10**9
+
+
+class TestAddPending:
+    """The plugin's add_pending injects a Transaction(pending=True)
+    into cache + disk, prepended to the (chain, from_addr) bucket."""
+
+    def _plugin(self, tmp_qeth):
+        from qeth.plugins.transactions import TransactionsPlugin
+        return TransactionsPlugin()
+
+    def _req(self):
+        return SigningRequest(
+            chain_id=1, from_addr=ADDR_CHECKSUM, to_addr=TOKEN_CHECKSUM,
+            value_wei=0, data="0xa9059cbb" + "00" * 64,
+            gas=100_000, nonce=7,
+            max_fee_per_gas=2 * 10**9, max_priority_fee_per_gas=10**8,
+        )
+
+    def test_pending_entry_appears_in_cache(self, tmp_qeth):
+        from qeth.chains import DEFAULT_CHAINS
+        plugin = self._plugin(tmp_qeth)
+        plugin.add_pending("0xfeed", self._req(), DEFAULT_CHAINS[0])
+        key = (1, ADDR_LOWER)
+        assert key in plugin._cache
+        assert len(plugin._cache[key]) == 1
+        tx = plugin._cache[key][0]
+        assert tx.pending is True
+        assert tx.hash == "0xfeed"
+        assert tx.nonce == 7
+        assert tx.from_addr == ADDR_LOWER
+        assert tx.to_addr == TOKEN_LOWER
+        assert tx.block_number == 0
+        # method_id is the first 10 chars of data (selector)
+        assert tx.method_id == "0xa9059cbb"
+
+    def test_pending_eip1559_gas_price_uses_max_fee(self, tmp_qeth):
+        """Until the receipt lands we don't know the effective rate
+        yet, so the displayed gas_price_wei is the ceiling the user
+        signed with (max fee). Receipt arrival overwrites it with
+        effectiveGasPrice."""
+        from qeth.chains import DEFAULT_CHAINS
+        plugin = self._plugin(tmp_qeth)
+        plugin.add_pending("0xfeed", self._req(), DEFAULT_CHAINS[0])
+        tx = plugin._cache[(1, ADDR_LOWER)][0]
+        assert tx.gas_price_wei == 2 * 10**9
+
+    def test_pending_persists_to_disk(self, tmp_qeth):
+        """Disk-cache round-trip — pending entries must survive
+        restart so the watcher picks them up on next launch."""
+        from qeth.chains import DEFAULT_CHAINS
+        from qeth.transactions_cache import TransactionCache
+        plugin = self._plugin(tmp_qeth)
+        plugin.add_pending("0xfeed", self._req(), DEFAULT_CHAINS[0])
+        disk = TransactionCache().load(1, ADDR_LOWER)
+        assert disk is not None
+        assert len(disk) == 1
+        assert disk[0].pending is True
+        assert disk[0].hash == "0xfeed"
+
+    def test_pending_prepended_to_existing_cache(self, tmp_qeth):
+        """When the user already has historical txs cached, the
+        pending row should land on top (it has the highest nonce
+        per the user's just-signed broadcast)."""
+        from qeth.chains import DEFAULT_CHAINS
+        from qeth.transactions import Transaction
+        plugin = self._plugin(tmp_qeth)
+        key = (1, ADDR_LOWER)
+        plugin._cache[key] = [
+            Transaction(
+                chain_id=1, hash="0x" + "11" * 32, block_number=100,
+                timestamp=1000, nonce=6, from_addr=ADDR_LOWER,
+                to_addr=TOKEN_LOWER, value_wei=0, gas_used=21000,
+                gas_price_wei=10**9, method_id="", input_data="0x",
+                success=True,
+            ),
+        ]
+        plugin.add_pending("0xfeed", self._req(), DEFAULT_CHAINS[0])
+        # merge_txs sorts by nonce desc; pending has nonce 7 > 6
+        # so it ends up first.
+        assert plugin._cache[key][0].hash == "0xfeed"
+        assert plugin._cache[key][0].pending is True
+
+
 class TestRpcDispatchSendTransaction:
     """The eth_sendTransaction dispatch should route through the
     bridge when present, error cleanly when absent."""

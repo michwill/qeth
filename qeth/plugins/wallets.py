@@ -187,6 +187,35 @@ class WalletsPlugin(Plugin):
                 out.append(addr)
         return out
 
+    def select_address(self, address: str) -> bool:
+        """Programmatically focus the tree on the leaf carrying
+        ``address`` (case-insensitive). Returns True if the address
+        was found and selected, False otherwise. Used by MainWindow
+        after a broadcast to make sure the user is looking at the
+        ``from`` account when the pending row appears."""
+        if self._tree is None or not address:
+            return False
+        wanted = address.lower()
+
+        def walk(item):
+            addr = item.data(0, Qt.UserRole)
+            if isinstance(addr, str) and addr.lower() == wanted:
+                return item
+            for i in range(item.childCount()):
+                hit = walk(item.child(i))
+                if hit is not None:
+                    return hit
+            return None
+
+        for i in range(self._tree.topLevelItemCount()):
+            hit = walk(self._tree.topLevelItem(i))
+            if hit is not None:
+                self._tree.clearSelection()
+                self._tree.setCurrentItem(hit)
+                hit.setSelected(True)
+                return True
+        return False
+
     def splitter_state(self) -> str:
         if self._splitter is None:
             return ""

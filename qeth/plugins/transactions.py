@@ -28,7 +28,7 @@ from eth_utils import to_checksum_address
 def _escape_html(text: str) -> str:
     return _html.escape(text, quote=False)
 
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QDesktopServices, QFont, QFontDatabase, QIcon, QPalette, QTextOption,
 )
@@ -49,6 +49,136 @@ from ..transactions import (
     BlockscoutTransactionSource, Transaction, TransactionSource,
 )
 from ..transactions_cache import TransactionCache, merge_txs
+
+
+def _confirmed_from_receipt(old: Transaction, receipt: dict) -> Transaction:
+    """Build a confirmed Transaction by merging an
+    ``eth_getTransactionReceipt`` payload into the prior pending
+    record. Hex fields parsed; ``effectiveGasPrice`` becomes the
+    canonical gas_price (Geth fills it from the EIP-1559 base+tip
+    math, so the cached number reflects what the wallet actually
+    paid)."""
+    from dataclasses import replace
+
+    def _hex(v, default=0):
+        if v is None:
+            return default
+        if isinstance(v, int):
+            return v
+        return int(v, 16)
+
+    status_v = receipt.get("status")
+    success = (_hex(status_v) == 1) if status_v is not None else True
+    return replace(
+        old,
+        block_number=_hex(receipt.get("blockNumber")),
+        gas_used=_hex(receipt.get("gasUsed")),
+        gas_price_wei=_hex(
+            receipt.get("effectiveGasPrice"), default=old.gas_price_wei,
+        ),
+        success=success,
+        pending=False,
+    )
+
+
+# ---- pending-tx polling -------------------------------------------------
+
+
+class ReceiptWorker(QThread):
+    """Poll ``eth_getTransactionReceipt`` for one (chain, hash). The
+    receipt comes back ``null`` while the tx is still in the
+    mempool, so we report three outcomes: confirmed (receipt
+    present), still_pending (receipt absent, retry later), failed
+    (transient RPC error — also retried)."""
+
+    confirmed = Signal(object, str, object)   # (chain, hash, receipt dict)
+    still_pending = Signal(object, str)
+    failed = Signal(object, str, str)
+
+    def __init__(self, chain, tx_hash: str, parent=None):
+        super().__init__(parent)
+        self._chain = chain
+        self._tx_hash = tx_hash
+
+    def run(self) -> None:
+        try:
+            client = EthClient(self._chain)
+            receipt = client.rpc(
+                "eth_getTransactionReceipt", [self._tx_hash],
+            )
+        except Exception as e:
+            self.failed.emit(self._chain, self._tx_hash, str(e))
+            return
+        if receipt is None:
+            self.still_pending.emit(self._chain, self._tx_hash)
+            return
+        self.confirmed.emit(self._chain, self._tx_hash, receipt)
+
+
+class PendingTxWatcher(QObject):
+    """Periodic sweep of the plugin's cache for ``tx.pending=True``
+    entries. For each, spawns a ``ReceiptWorker``; on confirmation
+    the plugin updates the cached Transaction in place. Restarts
+    are safe — pending entries survive in the disk cache, so the
+    next launch picks them up on the first tick."""
+
+    POLL_INTERVAL_MS = 10_000
+
+    def __init__(self, plugin, parent=None):
+        super().__init__(parent)
+        self._plugin = plugin
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        # Avoid double-polling the same hash inside a tick or across
+        # overlapping ticks — receipt fetches can take longer than
+        # the interval on a slow RPC endpoint.
+        self._in_flight_hashes: set[str] = set()
+
+    def start(self) -> None:
+        if self._timer.isActive():
+            return
+        self._timer.start(self.POLL_INTERVAL_MS)
+        # One immediate tick so app-restart pending txs get checked
+        # right away rather than after a full interval.
+        self._tick()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _tick(self) -> None:
+        host = self._plugin.host
+        if host is None:
+            return
+        chain_lookup = getattr(host, "chain_by_id", None)
+        if not callable(chain_lookup):
+            return
+        for (chain_id, _addr_lower), txs in list(self._plugin._cache.items()):
+            chain = chain_lookup(chain_id)
+            if chain is None:
+                continue
+            for tx in txs:
+                if not tx.pending or tx.hash in self._in_flight_hashes:
+                    continue
+                self._spawn_worker(chain, tx.hash)
+
+    def _spawn_worker(self, chain, tx_hash: str) -> None:
+        worker = ReceiptWorker(chain, tx_hash)
+        self._in_flight_hashes.add(tx_hash)
+        worker.confirmed.connect(self._on_confirmed)
+        worker.still_pending.connect(self._on_still_pending)
+        worker.failed.connect(self._on_failed)
+        self._plugin.host.start_worker(worker)
+
+    def _on_confirmed(self, chain, tx_hash: str, receipt) -> None:
+        self._in_flight_hashes.discard(tx_hash)
+        self._plugin._on_receipt_confirmed(chain, tx_hash, receipt)
+
+    def _on_still_pending(self, _chain, tx_hash: str) -> None:
+        self._in_flight_hashes.discard(tx_hash)
+
+    def _on_failed(self, _chain, tx_hash: str, msg: str) -> None:
+        self._in_flight_hashes.discard(tx_hash)
+        log.warning("ReceiptWorker for %s failed: %s", tx_hash, msg)
 
 
 log = logging.getLogger("qeth.plugin.transactions")
@@ -392,8 +522,16 @@ class TransactionsPlugin(Plugin):
         # The widget is built lazily so the plugin can be instantiated
         # outside a Qt event loop (useful in pure-Python imports).
         self._panel = None
+        # Wired in attach(); polls for receipts of broadcast txs whose
+        # hashes are sitting in cache with pending=True.
+        self._pending_watcher: Optional[PendingTxWatcher] = None
 
     # --- Plugin contract ----------------------------------------------------
+
+    def attach(self, host) -> None:
+        super().attach(host)
+        self._pending_watcher = PendingTxWatcher(self, parent=self)
+        self._pending_watcher.start()
 
     def widget(self) -> QWidget:
         if self._panel is None:
@@ -425,6 +563,78 @@ class TransactionsPlugin(Plugin):
 
     def action_widgets(self):
         return self._panel.action_widgets() if self._panel is not None else []
+
+    # --- pending-tx integration ---------------------------------------------
+
+    def add_pending(self, tx_hash: str, req: SigningRequest, chain) -> None:
+        """Called by MainWindow right after a successful broadcast.
+        Synthesises a ``Transaction(pending=True)`` from the finalised
+        request + broadcast hash, prepends it to the cache for
+        (chain, from_addr), persists, and re-renders if the panel is
+        currently showing that view. The pending entry's confirmed
+        fields (block_number, gas_used, success, gas_price_wei) get
+        filled in by ``PendingTxWatcher`` when the receipt lands."""
+        import time
+        addr_lower = req.from_addr.lower()
+        key = (chain.chain_id, addr_lower)
+        gas_price_wei = (req.max_fee_per_gas
+                          if chain.eip1559 else req.gas_price) or 0
+        method_id = req.data[:10] if (req.data and len(req.data) >= 10) else ""
+        pending = Transaction(
+            chain_id=chain.chain_id,
+            hash=tx_hash,
+            block_number=0,
+            timestamp=int(time.time()),
+            nonce=req.nonce or 0,
+            from_addr=addr_lower,
+            to_addr=(req.to_addr.lower() if req.to_addr else None),
+            value_wei=req.value_wei,
+            gas_used=0,
+            gas_price_wei=gas_price_wei,
+            method_id=method_id,
+            input_data=req.data or "0x",
+            success=True,            # placeholder until the receipt lands
+            pending=True,
+        )
+        # Hydrate the in-memory cache from disk if this is the first
+        # time we touch this view this session — otherwise we'd
+        # overwrite the file with just the pending entry on save.
+        if key not in self._cache:
+            disk = self._disk_cache.load(chain.chain_id, addr_lower)
+            self._cache[key] = list(disk) if disk else []
+        self._cache[key] = merge_txs([pending], self._cache[key])
+        self._disk_cache.save(chain.chain_id, addr_lower, self._cache[key])
+        # If the panel is currently showing this view, re-render so
+        # the pending row appears immediately. Otherwise the next
+        # navigation to this account picks it up from cache.
+        if self._panel is not None and self._rendered_for == key:
+            self._displayed_count[key] = len(self._cache[key])
+            self._panel.show_transactions(self._cache[key])
+        # Make sure the watcher is running — it's idempotent if
+        # already started.
+        if self._pending_watcher is not None:
+            self._pending_watcher.start()
+
+    def _on_receipt_confirmed(self, chain, tx_hash: str, receipt) -> None:
+        """ReceiptWorker → PendingTxWatcher → here. Find the pending
+        cached entry for this (chain, hash) and replace it with the
+        confirmed form built from the receipt. No-op if the entry
+        isn't in cache (e.g. already overwritten by a Blockscout
+        refresh — the new entry wins)."""
+        chain_id = chain.chain_id
+        for key, txs in list(self._cache.items()):
+            if key[0] != chain_id:
+                continue
+            for i, t in enumerate(txs):
+                if t.hash != tx_hash:
+                    continue
+                if not t.pending:
+                    return    # already confirmed (race with Blockscout)
+                txs[i] = _confirmed_from_receipt(t, receipt)
+                self._disk_cache.save(chain_id, key[1], txs)
+                if self._panel is not None and self._rendered_for == key:
+                    self._panel.show_transactions(txs)
+                return
 
     # --- persistence shim ---------------------------------------------------
 
@@ -913,10 +1123,23 @@ class TransactionListPanel(QWidget):
             self.show_empty()
             return
         self.status_lbl.setVisible(False)
-        # Suspend repaints + sort + scrollbar updates while we
-        # populate. For tables with a few thousand rows this drops
-        # render time from ~1-2 s to sub-200ms by avoiding O(N)
-        # per-item recalculations.
+        h = self.table.horizontalHeader()
+        col_count = self.table.columnCount()
+        # ResizeToContents columns re-measure all rows of that column
+        # on every setItem when an item is being REPLACED (not on the
+        # initial add to an empty table). With 2000+ rows that's
+        # O(N²) — ~35 s for a single bulk repopulate triggered by a
+        # pending-tx confirmation. Switch to Fixed during populate
+        # and restore the user's resize modes after, so the per-item
+        # cost stays O(1).
+        prior_modes = [h.sectionResizeMode(i) for i in range(col_count)]
+        for i in range(col_count):
+            h.setSectionResizeMode(i, QHeaderView.Fixed)
+        # Same idea for signals: itemSelectionChanged fires on every
+        # setItem at the selected row, and the slot walks the model
+        # to read selected_tx — death by a thousand cuts on a big
+        # bulk update. Block + flush once at the end.
+        self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         try:
             self.table.setRowCount(len(txs))
@@ -924,6 +1147,9 @@ class TransactionListPanel(QWidget):
                 self._populate_row(row, tx)
         finally:
             self.table.setUpdatesEnabled(True)
+            self.table.blockSignals(False)
+            for i, mode in enumerate(prior_modes):
+                h.setSectionResizeMode(i, mode)
 
     def append_transactions(self, txs: list[Transaction]) -> None:
         """Add rows at the bottom of the existing list (older entries
@@ -954,18 +1180,21 @@ class TransactionListPanel(QWidget):
         prepend so the cell shape stays consistent across paths.
         The full Transaction is stored on the Hash cell's UserRole
         so handlers (explorer, details dialog) can recover it."""
-        status = QTableWidgetItem("✓" if tx.success else "✗")
+        if tx.pending:
+            status_glyph, status_tip = "⏳", "Pending"
+        elif tx.success:
+            status_glyph, status_tip = "✓", "Success"
+        else:
+            status_glyph, status_tip = "✗", "Reverted"
+        status = QTableWidgetItem(status_glyph)
         status.setTextAlignment(Qt.AlignCenter)
-        status.setToolTip("Success" if tx.success else "Reverted")
+        status.setToolTip(status_tip)
 
         nonce = QTableWidgetItem(str(tx.nonce))
         nonce.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         time_item = QTableWidgetItem(_format_datetime(tx.timestamp))
 
-        # Full hash as the cell text; the view elides it in the middle
-        # at paint time based on the column width, so widening the
-        # column reveals more characters until the whole 0x… fits.
         hash_item = QTableWidgetItem(tx.hash)
         hash_item.setFont(QFont("monospace"))
         hash_item.setToolTip(tx.hash)
@@ -1115,9 +1344,13 @@ class TransactionDetailsDialog(QDialog):
         mono = QFont("monospace")
         self._mono_font = mono
 
-        form.addRow("Status:",
-                    self._value_label(
-                        "✓ Success" if tx.success else "✗ Reverted"))
+        if tx.pending:
+            status_text = "⏳ Pending"
+        elif tx.success:
+            status_text = "✓ Success"
+        else:
+            status_text = "✗ Reverted"
+        form.addRow("Status:", self._value_label(status_text))
         form.addRow("Nonce:", self._value_label(str(tx.nonce)))
         dt = datetime.datetime.fromtimestamp(tx.timestamp)
         form.addRow("Date:", self._value_label(dt.strftime("%c")))

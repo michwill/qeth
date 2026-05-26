@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
 from .chain import EthClient
 from .chains import Chain
+from .signing import Signer, SignerError, SigningRequest
 
 
 LEDGER_LIVE = "44'/60'/{i}'/0/0"
@@ -96,3 +98,100 @@ class LedgerWorker(QThread):
             return self.client.get_balance(address)
         except Exception:
             return 0
+
+
+class LedgerSigner(Signer):
+    """``Signer`` implementation backed by a Ledger hardware wallet.
+
+    Looks up the right derivation path for ``req.from_addr`` in the
+    store's account list (where each Ledger-discovered account is
+    recorded with its ``path``) and asks the dongle to sign — the
+    user has to confirm on the device, so signing takes a few
+    seconds and must be done off the Qt main thread."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def can_sign(self, address: str) -> bool:
+        return self._lookup(address) is not None
+
+    def _lookup(self, address: str) -> Optional[dict]:
+        addr = address.lower()
+        for a in self._store.accounts:
+            if (a.get("source") == "ledger"
+                    and a["address"].lower() == addr):
+                return a
+        return None
+
+    def sign(self, req: SigningRequest, chain: Chain) -> bytes:
+        acct = self._lookup(req.from_addr)
+        if acct is None:
+            raise SignerError(
+                f"No Ledger account known for {req.from_addr}"
+            )
+        path = acct.get("path")
+        if not path:
+            raise SignerError(
+                f"Account {req.from_addr} has no derivation path on file"
+            )
+        try:
+            # ledgereth.transactions does its own dongle init when
+            # no Dongle is passed; we don't reuse a handle here
+            # because USB connects are cheap and signing isn't a
+            # hot path.
+            from ledgereth.transactions import create_transaction
+        except ImportError as e:
+            raise SignerError(f"ledgereth not installed: {e}") from e
+
+        if req.gas is None or req.nonce is None:
+            raise SignerError("gas and nonce must be set before signing")
+
+        kwargs: dict = {
+            "destination": req.to_addr or "",
+            "amount": req.value_wei,
+            "gas": req.gas,
+            "nonce": req.nonce,
+            "data": req.data or "0x",
+            "chain_id": chain.chain_id,
+            "sender_path": path,
+        }
+        if chain.eip1559:
+            if (req.max_fee_per_gas is None
+                    or req.max_priority_fee_per_gas is None):
+                raise SignerError(
+                    "EIP-1559 fees missing — finalise gas suggestion first"
+                )
+            kwargs["max_fee_per_gas"] = req.max_fee_per_gas
+            kwargs["max_priority_fee_per_gas"] = req.max_priority_fee_per_gas
+        else:
+            if req.gas_price is None:
+                raise SignerError(
+                    "Legacy gas_price missing — finalise gas suggestion first"
+                )
+            kwargs["gas_price"] = req.gas_price
+
+        try:
+            signed = create_transaction(**kwargs)
+        except Exception as e:
+            # Anything from a user rejecting on the device to USB
+            # comms hiccups lands here — surface as SignerError so
+            # the RPC handler sees a uniform shape.
+            raise SignerError(f"Ledger signing failed: {e}") from e
+        # ledgereth exposes the encoded signed tx in two shapes that
+        # both have the name ``raw_transaction``-ish: an attribute
+        # (``rawTransaction`` — a hex-string property) and a method
+        # (``raw_transaction()``) on different versions. Don't grab
+        # the method object as if it were the payload (web3 chokes
+        # on the bound-method as transaction data with a generic
+        # "expected … bytes" TypeError).
+        raw = getattr(signed, "rawTransaction", None)
+        if raw is None:
+            method = getattr(signed, "raw_transaction", None)
+            if callable(method):
+                raw = method()
+        if raw is None:
+            raise SignerError("Signed transaction has no raw payload")
+        if isinstance(raw, str):
+            raw = bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+        return raw
+

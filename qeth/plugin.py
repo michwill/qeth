@@ -39,6 +39,12 @@ class Host(Protocol):
     def current_chain(self):
         """Return the qeth.chains.Chain currently selected by the user."""
 
+    def chain_by_id(self, chain_id: int):
+        """Return the configured ``qeth.chains.Chain`` whose id matches,
+        or None if no such chain is configured. Used by the pending-tx
+        watcher which polls receipts on whatever chain a tx was sent
+        on, not necessarily the user's current view."""
+
     def start_worker(self, worker) -> None:
         """Register a QThread so the host keeps it alive while running."""
 

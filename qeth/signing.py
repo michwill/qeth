@@ -32,7 +32,7 @@ from typing import Optional
 
 from eth_utils import to_checksum_address
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 
 
 log = logging.getLogger("qeth.signing")
@@ -153,3 +153,43 @@ class SignerBridge(QObject):
     def reject(self, fut: Future, error: Exception) -> None:
         if not fut.done():
             fut.set_exception(error)
+
+
+class SignAndBroadcastWorker(QThread):
+    """Off-main-thread orchestrator: ``signer.sign(req, chain)`` ->
+    ``EthClient(chain).send_raw_transaction(...)`` -> emit the tx
+    hash. Signing on a Ledger blocks for several seconds while the
+    user confirms on the device; the worker keeps the UI responsive
+    in the meantime."""
+
+    broadcast = Signal(str)   # tx hash, 0x-prefixed
+    failed = Signal(str)      # human-readable reason
+
+    def __init__(self, signer: Signer, req: SigningRequest, chain,
+                 parent=None):
+        super().__init__(parent)
+        self._signer = signer
+        self._req = req
+        self._chain = chain
+
+    def run(self) -> None:
+        try:
+            raw = self._signer.sign(self._req, self._chain)
+        except SignerError as e:
+            self.failed.emit(str(e))
+            return
+        except Exception as e:
+            log.exception("signer raised unexpectedly")
+            self.failed.emit(f"Signing failed: {e}")
+            return
+        try:
+            # Import lazily so the test suite can patch EthClient at
+            # module level without the cross-import dance.
+            from .chain import EthClient
+            client = EthClient(self._chain)
+            tx_hash = client.send_raw_transaction(raw)
+        except Exception as e:
+            log.exception("broadcast failed")
+            self.failed.emit(f"Broadcast failed: {e}")
+            return
+        self.broadcast.emit(tx_hash)
