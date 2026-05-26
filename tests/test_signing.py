@@ -742,6 +742,31 @@ class TestSignAndBroadcastWorker:
         assert "msg" not in captured
 
 
+class TestErc20TransferCalldata:
+    """Pure ABI encoding for the Send-token flow."""
+
+    def test_selector_and_args(self):
+        from qeth.plugins.transactions import _erc20_transfer_calldata
+        recipient = "0xB325c1AC788f02fF7997cF53C6FF40Dd762897B3"
+        amount = 5000 * 10**18
+        calldata = _erc20_transfer_calldata(recipient, amount)
+        # Selector for transfer(address,uint256)
+        assert calldata.startswith("0xa9059cbb")
+        # Address right-padded into 32 bytes, then amount as 32-byte
+        # big-endian.
+        assert calldata[10:74].lower() == "0" * 24 + recipient[2:].lower()
+        assert int(calldata[74:138], 16) == amount
+
+    def test_zero_amount(self):
+        from qeth.plugins.transactions import _erc20_transfer_calldata
+        calldata = _erc20_transfer_calldata(
+            "0x" + "ab" * 20, 0,
+        )
+        assert calldata.startswith("0xa9059cbb")
+        # Amount last 32 bytes = all zeros.
+        assert int(calldata[74:138], 16) == 0
+
+
 class TestConfirmedFromReceipt:
     """The pure function that merges an eth_getTransactionReceipt
     payload into a pending Transaction → confirmed Transaction."""

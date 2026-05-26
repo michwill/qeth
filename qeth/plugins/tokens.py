@@ -263,7 +263,56 @@ class TokensPlugin(Plugin):
             self._panel.add_custom_requested.connect(self._on_add_custom_token)
             self._panel.show_all_toggled.connect(self._on_show_all_toggled)
             self._panel.transfers_requested.connect(self._on_transfers_requested)
+            self._panel.send_requested.connect(self._on_send_requested)
         return self._panel
+
+    def _on_send_requested(self, chain_id: int, contract: str) -> None:
+        """Send button click. Look up the user's balance + decimals
+        for the selected asset (ERC-20 from the wallet cache, or
+        the native row), then ask the host to open the unified
+        send-transaction dialog. The dialog handles the rest of
+        the flow (sign + broadcast) through the same path the RPC
+        signing requests use."""
+        if self.host is None:
+            return
+        chain = self.host.current_chain()
+        addr = self.host.selected_address
+        if addr is None or chain.chain_id != chain_id:
+            return
+        cached = self._wallet_cache.load(chain_id, addr)
+        is_native = (contract == TokenListPanel.NATIVE_CONTRACT)
+        if is_native:
+            asset = {
+                "is_native": True,
+                "contract": None,
+                "symbol": chain.symbol,
+                "decimals": 18,
+                "balance_raw": cached.native_balance_wei if cached else 0,
+                "logo_uri": None,
+            }
+        else:
+            entry = None
+            if cached is not None:
+                for b in cached.tokens:
+                    if b.contract.lower() == contract.lower():
+                        entry = b
+                        break
+            if entry is None:
+                # Nothing cached — shouldn't happen for a selected
+                # row, but bail rather than ship a 0-balance Send.
+                return
+            tl = self._token_lists.get(chain.chain_id, contract)
+            asset = {
+                "is_native": False,
+                "contract": entry.contract,
+                "symbol": entry.symbol,
+                "decimals": entry.decimals,
+                "balance_raw": entry.balance_raw,
+                "logo_uri": tl.logo_uri if tl is not None else None,
+            }
+        opener = getattr(self.host, "open_send_dialog", None)
+        if callable(opener):
+            opener(asset, chain, addr)
 
     def _on_transfers_requested(self, chain_id: int, contract: str) -> None:
         """Double-click on a token row opens the explorer's
@@ -836,6 +885,10 @@ class TokenListPanel(QWidget):
     # User double-clicked a token row; carries (chain_id, contract).
     # Native rows don't emit (no token-transfers page for native).
     transfers_requested = Signal(int, str)
+    # User clicked the Send button with a token row selected; carries
+    # (chain_id, contract_or_empty_for_native). Plugin pops a Send
+    # dialog with the user's recipient + amount + gas controls.
+    send_requested = Signal(int, str)
 
     NATIVE_CONTRACT = ""  # sentinel for the native row
 
@@ -909,6 +962,30 @@ class TokenListPanel(QWidget):
         # action row alongside the chain selector, so we don't waste two
         # rows on what fits in one. ``action_widgets()`` exposes them.
         style = self.style()
+
+        # Send button — labelled (icon + "Send") so it stands out
+        # from the icon-only utility buttons to its right. Disabled
+        # until a row is selected. Sends either the selected ERC-20
+        # or the native asset (when the native row is selected).
+        self.btn_send = QPushButton("Send")
+        _send_icon = QIcon.fromTheme(
+            "mail-send",
+            QIcon.fromTheme(
+                "document-send",
+                style.standardIcon(QStyle.SP_ArrowUp),
+            ),
+        )
+        if _send_icon.isNull() or not _send_icon.availableSizes():
+            # Fall back to a unicode paper-plane in environments
+            # whose icon theme lacks the freedesktop send glyphs.
+            self.btn_send.setText("➤ Send")
+        else:
+            self.btn_send.setIcon(_send_icon)
+        self.btn_send.setToolTip(
+            "Send the selected token (or native asset) to a recipient"
+        )
+        self.btn_send.setEnabled(False)
+
         self.btn_add = QPushButton()
         self.btn_add.setIcon(QIcon.fromTheme("list-add",
                                              style.standardIcon(QStyle.SP_FileDialogNewFolder)))
@@ -962,7 +1039,14 @@ class TokenListPanel(QWidget):
             b.setMaximumSize(28, 28)
             b.setIconSize(QSize(16, 16))
             b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        # Send is intentionally NOT flat-and-square — it carries a
+        # text label and gets default button sizing so it reads as
+        # a primary action vs the icon-only utility row.
+        self.btn_send.setIconSize(QSize(16, 16))
 
+        self.btn_send.clicked.connect(
+            lambda: self._emit_for_selected(self.send_requested)
+        )
         self.btn_add.clicked.connect(self.add_custom_requested.emit)
         self.btn_copy.clicked.connect(self._copy_selected_contract)
         self.btn_hide.clicked.connect(
@@ -986,9 +1070,11 @@ class TokenListPanel(QWidget):
 
     def action_widgets(self) -> list[QWidget]:
         """The button strip, in display order. MainWindow mounts them
-        on the shared bottom-right row beside the chain selector."""
-        return [self.btn_add, self.btn_copy, self.btn_hide, self.btn_pin,
-                self.btn_show_all]
+        on the shared bottom-right row beside the chain selector.
+        Send is leftmost (labelled, primary action); the icon-only
+        utility buttons follow."""
+        return [self.btn_send, self.btn_add, self.btn_copy, self.btn_hide,
+                self.btn_pin, self.btn_show_all]
 
     def header_state(self) -> str:
         """Hex-encoded QHeaderView.saveState() — captures column widths,
@@ -1351,16 +1437,40 @@ class TokenListPanel(QWidget):
             return None
         return key
 
+    def _selected_any(self) -> tuple[int, str] | None:
+        """Like ``_selected_token`` but doesn't filter the native
+        row out — used by Send, which is meaningful for both
+        ERC-20s and the native asset. Returns
+        ``(chain_id, NATIVE_CONTRACT)`` for the native row."""
+        items = self.table.selectedItems()
+        if not items:
+            return None
+        sym = self.table.item(items[0].row(), 0)
+        if sym is None:
+            return None
+        key = sym.data(Qt.UserRole)
+        return key or None
+
     def _emit_for_selected(self, sig) -> None:
-        sel = self._selected_token()
+        # ``send_requested`` uses _selected_any (native + ERC-20);
+        # every other connected signal sticks to _selected_token
+        # (ERC-20 only).
+        if sig is self.send_requested:
+            sel = self._selected_any()
+        else:
+            sel = self._selected_token()
         if sel:
             sig.emit(sel[0], sel[1])
 
     def _update_action_buttons(self) -> None:
         enabled = self._selected_token() is not None
+        any_selected = self._selected_any() is not None
         self.btn_copy.setEnabled(enabled)
         self.btn_hide.setEnabled(enabled)
         self.btn_pin.setEnabled(enabled)
+        # Send works on both ERC-20 and the native row, so it's
+        # enabled whenever ANY row is selected.
+        self.btn_send.setEnabled(any_selected)
 
     def _copy_selected_contract(self) -> None:
         sel = self._selected_token()

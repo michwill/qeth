@@ -269,24 +269,70 @@ class MainWindow(QMainWindow):
             native_price_usd=native_price_usd,
             parent=self,
         )
-        dialog.setWindowModality(Qt.WindowModal)
+        self._launch_sign_flow(
+            dialog, chain,
+            on_broadcast=lambda h: self.signer_bridge.resolve(fut, h),
+            on_cancel=lambda: self.signer_bridge.reject(
+                fut, SignerError("User cancelled"),
+            ),
+            on_fail=lambda msg: self.signer_bridge.reject(
+                fut, SignerError(msg),
+            ),
+        )
 
-        # Confirm: kick the worker, dialog stays visible.
+    def _launch_sign_flow(self, dialog, chain, *,
+                          on_broadcast, on_cancel, on_fail) -> None:
+        """Wire a sign-style dialog (SignTransactionDialog or
+        SendTokenDialog — both expose ``sign_requested`` /
+        ``finalised_request`` / ``set_signing_in_progress`` /
+        ``accept``) to the worker pipeline. Callbacks fire on
+        broadcast success / dialog cancel / signing failure so the
+        same code path serves both the RPC-driven and the locally
+        UI-driven signing flows."""
+        dialog.setWindowModality(Qt.WindowModal)
         dialog.sign_requested.connect(
-            lambda d=dialog, f=fut, c=chain: self._begin_sign(d, f, c)
+            lambda d=dialog, c=chain, ob=on_broadcast, of=on_fail:
+                self._begin_sign(d, c, ob, of)
         )
-        # Cancel / close: reject the future, dialog closes.
-        dialog.rejected.connect(
-            lambda f=fut: self.signer_bridge.reject(
-                f, SignerError("User cancelled"),
-            )
-        )
+        dialog.rejected.connect(on_cancel)
         dialog.show()
 
-    def _begin_sign(self, dialog, fut, chain) -> None:
+    def open_send_dialog(self, asset: dict, chain, from_addr: str) -> None:
+        """Host-facing entry point used by TokensPlugin's Send
+        button. Opens SendTokenDialog and runs the same worker
+        pipeline as the RPC flow; success / cancel / failure
+        produce status-bar messages (no bridge future)."""
+        from .plugins.transactions import SendTokenDialog
+        dialog = SendTokenDialog(
+            asset, chain, from_addr,
+            abi_source=self.transactions_plugin._abi_source,
+            abi_cache=self.transactions_plugin._abi_cache,
+            start_worker=self.start_worker,
+            token_info=self.token_info,
+            icon_cache=self.icon_cache(),
+            native_price_usd=self.native_price_usd(
+                chain.chain_id, from_addr,
+            ),
+            parent=self,
+        )
+        self._launch_sign_flow(
+            dialog, chain,
+            on_broadcast=lambda h: self.status_message(
+                f"Broadcast {h}", 6000,
+            ),
+            on_cancel=lambda: None,
+            on_fail=lambda msg: self.status_message(
+                f"Send failed: {msg}", 6000,
+            ),
+        )
+
+    def _begin_sign(self, dialog, chain, on_broadcast, on_fail) -> None:
         """Start one sign-and-broadcast attempt. Called every time
         the user clicks Confirm — including retries after a
-        previous attempt failed."""
+        previous attempt failed. ``on_broadcast(tx_hash)`` /
+        ``on_fail(msg)`` let the caller hook in (the RPC path
+        resolves / rejects the bridge future; the local Send path
+        emits status messages)."""
         try:
             finalised = dialog.finalised_request()
         except SignerError as e:
@@ -320,19 +366,20 @@ class MainWindow(QMainWindow):
 
         worker = SignAndBroadcastWorker(signer, finalised, chain)
         worker.broadcast.connect(
-            lambda h, d=dialog, p=progress, f=fut, r=finalised, c=chain:
-                self._on_tx_broadcast(h, d, p, f, r, c)
+            lambda h, d=dialog, p=progress, r=finalised, c=chain,
+                   ob=on_broadcast:
+                self._on_tx_broadcast(h, d, p, r, c, ob)
         )
         worker.failed.connect(
-            lambda msg, d=dialog, p=progress:
-                self._on_tx_sign_failed(msg, d, p)
+            lambda msg, d=dialog, p=progress, of=on_fail:
+                self._on_tx_sign_failed(msg, d, p, of)
         )
         self.start_worker(worker)
 
-    def _on_tx_broadcast(self, tx_hash, dialog, progress, fut, req, chain) -> None:
+    def _on_tx_broadcast(self, tx_hash, dialog, progress, req, chain,
+                          on_broadcast) -> None:
         progress.close()
         dialog.accept()
-        self.signer_bridge.resolve(fut, tx_hash)
         # Snapshot the just-sent tx into the transactions list as a
         # pending row so the user sees it immediately — without
         # waiting for Blockscout indexing (it lags mempool by tens of
@@ -349,9 +396,10 @@ class MainWindow(QMainWindow):
         # idempotent if we're already in the right place.
         self.wallets_plugin.select_address(req.from_addr)
         self.right_slot.set_active(self.transactions_plugin)
-        self.status_message(f"Broadcast {tx_hash}", 6000)
+        on_broadcast(tx_hash)
 
-    def _on_tx_sign_failed(self, msg: str, dialog, progress) -> None:
+    def _on_tx_sign_failed(self, msg: str, dialog, progress,
+                            on_fail) -> None:
         """Signing failed (Ledger unavailable, user cancelled on
         device, broadcast rejected, …). Don't close the sign
         dialog — show the message on top of it and re-enable
@@ -361,6 +409,7 @@ class MainWindow(QMainWindow):
         dialog.set_signing_in_progress(False)
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(dialog, "Ledger error", msg)
+        on_fail(msg)
 
     # --- transitional aliases (kept so existing tests / external code
     # that pokes at the panels directly keeps working).
