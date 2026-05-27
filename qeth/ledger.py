@@ -371,20 +371,29 @@ class LedgerSigner(Signer):
         except ImportError as e:
             raise SignerError(f"ledgereth not installed: {e}") from e
         # ledgereth's draft signer expects the pre-computed domain
-        # separator + message hash. Compute via eth_account so the
-        # hashing matches what the dapp expects.
+        # separator + message hash. eth_account's encode_typed_data
+        # returns a SignableMessage where ``header`` is the 32-byte
+        # domain separator and ``body`` is the 32-byte struct hash
+        # (the two values the EIP-191 v0x01 prefix wraps). Earlier
+        # versions of this code sliced ``body`` as if it carried
+        # both halves — sending the struct hash AS the domain and
+        # empty bytes AS the message — which the Ledger Ethereum
+        # app rejected with an "invalid data" status word.
         try:
-            from eth_account.messages import _hash_eip191_message, encode_typed_data
+            from eth_account.messages import encode_typed_data
         except ImportError as e:
             raise SignerError(f"eth_account missing: {e}") from e
         try:
             signable = encode_typed_data(full_message=req.typed_data)
-            # signable.body is the 64-byte (domain_hash || message_hash)
-            # blob that the EIP-191 v0x01 prefix wraps. Split into
-            # the two 32-byte halves for ledgereth.
-            body = signable.body
-            domain_hash = body[:32]
-            message_hash = body[32:64]
+            domain_hash = signable.header
+            message_hash = signable.body
+            if len(domain_hash) != 32 or len(message_hash) != 32:
+                raise SignerError(
+                    "encode_typed_data produced unexpected shape: "
+                    f"header={len(domain_hash)} body={len(message_hash)}"
+                )
+        except SignerError:
+            raise
         except Exception as e:
             raise SignerError(f"failed to hash typed data: {e}") from e
         try:
