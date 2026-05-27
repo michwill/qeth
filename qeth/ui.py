@@ -6,8 +6,8 @@ and ``.plugins.wallets``. This module just orchestrates: instantiates
 the plugins, mounts them in two slots, wires cross-plugin signals,
 and handles geometry persistence."""
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QThread
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QByteArray, QEvent, QObject, QSize, Qt, QThread
+from PySide6.QtGui import QIcon, QKeyEvent
 from PySide6.QtWidgets import (
     QComboBox, QLabel, QMainWindow, QSplitter, QStatusBar,
 )
@@ -173,6 +173,69 @@ class MainWindow(QMainWindow):
         outer.setSizes([480, 580])
 
         self.setCentralWidget(outer)
+        self._restrict_tab_focus_to_lists()
+
+    def _restrict_tab_focus_to_lists(self) -> None:
+        """Tab-stops in the main window are exactly the three
+        primary lists — wallet tree, tokens table, transactions
+        table. Everything else (toolbar buttons, combos, label
+        edit, tab bar) keeps mouse focus but is skipped by the
+        Tab key.
+
+        Tokens and Transactions live in the same right-slot tab
+        widget, so only ONE of their tables is visible at any
+        moment. Qt's native Tab walks the visible-widget chain,
+        which collapses to two stops (wallet + whichever right
+        table is active). We want three logical stops, so we
+        install an event filter on each list to handle Tab /
+        Shift+Tab manually: jumping into Transactions activates
+        its tab in the right slot first, then focuses its table
+        (and vice versa).
+
+        Dialogs are unaffected — they're independent top-level
+        windows with their own tab orders. Idempotent: we call
+        this once at the end of ``_build_central``."""
+        from PySide6.QtWidgets import QWidget
+        tab_stops = self._collect_tab_stops()
+        if not tab_stops:
+            return
+        central = self.centralWidget()
+        if central is not None:
+            for w in central.findChildren(QWidget):
+                if w in tab_stops:
+                    w.setFocusPolicy(Qt.StrongFocus)
+                else:
+                    w.setFocusPolicy(Qt.ClickFocus)
+        # Native tab-order chain (useful if focus arrives via
+        # Qt-internal navigation, not just our filter).
+        for prev, nxt in zip(tab_stops, tab_stops[1:]):
+            QWidget.setTabOrder(prev, nxt)
+        # Event filter intercepts Tab / Shift+Tab on each list to
+        # cycle between panels — including activating the right-
+        # slot tab so a hidden table becomes visible before
+        # receiving focus.
+        self._tab_cycle_filter = _TabCycleFilter(self, tab_stops)
+        for w in tab_stops:
+            w.installEventFilter(self._tab_cycle_filter)
+        # Initial focus on the wallet tree so arrow keys work
+        # immediately.
+        tab_stops[0].setFocus(Qt.OtherFocusReason)
+
+    def _collect_tab_stops(self) -> list:
+        """Resolve the three list widgets safely (each may be None
+        in tests where the plugins were stubbed). Returns the list
+        in tab-cycle order."""
+        out = []
+        tree = getattr(self.wallets_plugin, "_tree", None)
+        if tree is not None:
+            out.append(tree)
+        tpanel = getattr(self.tokens_plugin, "_panel", None)
+        if tpanel is not None and hasattr(tpanel, "table"):
+            out.append(tpanel.table)
+        xpanel = getattr(self.transactions_plugin, "_panel", None)
+        if xpanel is not None and hasattr(xpanel, "table"):
+            out.append(xpanel.table)
+        return out
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar()
@@ -696,3 +759,98 @@ class MainWindow(QMainWindow):
             return
         accounts = [self.store.default_account] if self.store.default_account else []
         self.rpc.broadcast_accounts_changed(accounts)
+
+
+class _TabCycleFilter(QObject):
+    """Keyboard navigation across the main window.
+
+    Two responsibilities:
+
+    1. **Tab / Shift+Tab** cycle between the wallet tree and the
+       currently-visible right-slot table — two stops. The user
+       sees one logical "other panel" at a time, so Tab swapping
+       to a hidden table would be jarring; tab-switching is a
+       separate gesture (see #2).
+
+    2. **Left / Right** when focus is on the right-slot table
+       switch the right slot's active tab (Tokens ↔ Transactions)
+       and move focus to the newly-active table. Up/down still
+       does its native selection-navigation thing.
+
+    Behaves like a 2D grid: Tab is the left/right axis between
+    panels; arrow keys are the up/down axis within a panel; left/
+    right is the lateral switch between right-slot tabs."""
+
+    def __init__(self, main_window, lists):
+        super().__init__(main_window)
+        self._mw = main_window
+        self._lists = lists
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.KeyPress:
+            return False
+        if not isinstance(event, QKeyEvent):
+            return False
+        key = event.key()
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            return self._handle_tab(obj)
+        if key in (Qt.Key_Left, Qt.Key_Right):
+            return self._handle_left_right(obj, key == Qt.Key_Right)
+        return False
+
+    # --- Tab between wallet ↔ right-slot table ---------------------------
+
+    def _handle_tab(self, obj) -> bool:
+        wallet_tree = self._wallet_tree()
+        right_table = self._active_right_table()
+        if wallet_tree is None or right_table is None:
+            return False
+        if obj is wallet_tree:
+            right_table.setFocus(Qt.TabFocusReason)
+        else:
+            wallet_tree.setFocus(Qt.TabFocusReason)
+        return True
+
+    # --- Left / Right switch the right-slot tab --------------------------
+
+    def _handle_left_right(self, obj, go_right: bool) -> bool:
+        if obj not in self._right_tables():
+            return False
+        plugins = [
+            self._mw.tokens_plugin, self._mw.transactions_plugin,
+        ]
+        current = self._mw.right_slot.active()
+        try:
+            idx = plugins.index(current)
+        except ValueError:
+            return False
+        nxt = plugins[(idx + (1 if go_right else -1)) % len(plugins)]
+        if nxt is current:
+            return True   # only one tab; swallow event
+        self._mw.right_slot.set_active(nxt)
+        new_table = self._table_for_plugin(nxt)
+        if new_table is not None:
+            new_table.setFocus(Qt.OtherFocusReason)
+        return True
+
+    # --- helpers ---------------------------------------------------------
+
+    def _wallet_tree(self):
+        return getattr(self._mw.wallets_plugin, "_tree", None)
+
+    def _right_tables(self) -> list:
+        out = []
+        for plugin in (self._mw.tokens_plugin,
+                        self._mw.transactions_plugin):
+            t = self._table_for_plugin(plugin)
+            if t is not None:
+                out.append(t)
+        return out
+
+    def _table_for_plugin(self, plugin):
+        panel = getattr(plugin, "_panel", None)
+        return getattr(panel, "table", None) if panel is not None else None
+
+    def _active_right_table(self):
+        active = self._mw.right_slot.active()
+        return self._table_for_plugin(active) if active is not None else None
