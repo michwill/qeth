@@ -115,13 +115,19 @@ class EtherscanV2Source(TokenSource):
         key = self._get_api_key()
         if not key:
             raise UnsupportedChain("No Etherscan API key configured")
+        # offset=10000 is Etherscan v2's per-page cap. Anything
+        # smaller silently truncates wallets with long-tail
+        # holdings — the wallet held a curated, priced, ~$9k YB
+        # position that sat at index >100 and was invisible until
+        # we asked for the full page. Pagination beyond 10k would
+        # need a loop, but no real holding pattern hits that.
         params = [
             ("chainid", str(chain.chain_id)),
             ("module", "account"),
             ("action", "addresstokenbalance"),
             ("address", address),
             ("page", "1"),
-            ("offset", "100"),
+            ("offset", "10000"),
             ("apikey", key),
         ]
         url = f"{ETHERSCAN_V2_BASE}?" + urllib.parse.urlencode(params)
