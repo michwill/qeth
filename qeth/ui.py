@@ -773,10 +773,16 @@ class MainWindow(QMainWindow):
         except Exception:
             import logging
             logging.getLogger("qeth.ui").exception("add_pending failed")
-        # Make the pending row visible: select the from account in
-        # the wallets tree (pending lives in that account's bucket)
-        # and flip the right slot to the Transactions tab. Both are
-        # idempotent if we're already in the right place.
+        # Make the pending row visible: switch the UI chain to the
+        # one we just broadcast on, select the from account in the
+        # wallets tree (pending lives in that account's bucket),
+        # and flip the right slot to the Transactions tab. Chain
+        # first so the wallets-tree / right-slot replays happen
+        # against the new chain context. All three are idempotent
+        # if we're already in the right place.
+        chain_idx = self.chain_combo.findData(chain.chain_id)
+        if chain_idx >= 0 and chain_idx != self.chain_combo.currentIndex():
+            self.chain_combo.setCurrentIndex(chain_idx)
         self.wallets_plugin.select_address(req.from_addr)
         self.right_slot.set_active(self.transactions_plugin)
         on_broadcast(tx_hash)
