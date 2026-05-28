@@ -4,6 +4,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from .branding import app_icon_for
 from .rpc import RpcServer
 from .store import Store
 from .ui import MainWindow
@@ -27,6 +28,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("qeth")
     app.setOrganizationName("qeth")
+    # Pick the light- or dark-bg variant of the window icon based
+    # on the current palette. Theme swaps mid-session don't update
+    # it — restart picks up the new one.
+    app.setWindowIcon(app_icon_for(app.palette()))
 
     # Pull the web3/eth_abi/requests stack now, while no window
     # exists yet. They're deferred at import time (qeth.chain only
