@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTreeWidget,
 )
 
-from .icons import bundled_chain_icon
+from .icons import ChainIconCache, bundled_chain_icon
 from .plugin import Slot
 from .plugins.tokens import TokensPlugin
 from .plugins.transactions import (
@@ -143,18 +143,33 @@ class MainWindow(QMainWindow):
     def _build_chain_combo(self) -> QComboBox:
         combo = QComboBox()
         combo.setIconSize(QSize(18, 18))
+        # ChainIconCache resolves bundled → disk → upstream
+        # (Curve curve-assets, then TrustWallet). Misses kick a
+        # background download; we swap the icon in when it lands.
+        self._chain_icon_cache = ChainIconCache(self)
+        self._chain_icon_cache.icon_ready.connect(self._on_chain_icon_ready)
         for c in self.store.chains:
             label = f"{c.name} ({c.chain_id})"
-            pix = bundled_chain_icon(c.chain_id)
+            pix = self._chain_icon_cache.get(c.chain_id)
             if pix is not None:
                 combo.addItem(QIcon(pix), label, c.chain_id)
             else:
                 combo.addItem(label, c.chain_id)
+                self._chain_icon_cache.request(c.chain_id)
         idx = combo.findData(self.store.current_chain_id)
         if idx >= 0:
             combo.setCurrentIndex(idx)
         combo.currentIndexChanged.connect(self._on_chain_changed)
         return combo
+
+    def _on_chain_icon_ready(self, chain_id: int) -> None:
+        pix = self._chain_icon_cache.get(chain_id)
+        if pix is None:
+            return
+        for i in range(self.chain_combo.count()):
+            if self.chain_combo.itemData(i) == chain_id:
+                self.chain_combo.setItemIcon(i, QIcon(pix))
+                break
 
     def _build_chain_rpc_button(self):
         """Little ⋯ button next to the chain combo: opens the

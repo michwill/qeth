@@ -21,9 +21,48 @@ from . import USER_AGENT
 log = logging.getLogger("qeth.icons")
 
 ICONS_DIR = Path.home() / ".qeth" / "icons"
+CHAIN_ICONS_DIR = ICONS_DIR / "chains"
 BUNDLED_NATIVE_DIR = Path(__file__).parent / "assets" / "native"
 BUNDLED_CHAIN_DIR = Path(__file__).parent / "assets" / "chains"
 FETCH_TIMEOUT = 10.0
+
+
+# Chain-id → slug in each upstream icon source. Slug conventions
+# differ between sources (Curve uses "xdai" for Gnosis,
+# TrustWallet uses "smartchain" for BSC, …) so we keep one map
+# per source rather than try to derive. When a chain is missing
+# from every source ChainIconCache silently keeps the combo
+# textual; the user can drop a bundled PNG into
+# qeth/assets/chains/<chain_id>.png to override.
+_CURVE_CHAIN_SLUGS: dict[int, str] = {
+    1: "ethereum", 10: "optimism", 56: "bsc", 100: "xdai",
+    137: "polygon", 239: "tac", 8453: "base", 42161: "arbitrum",
+}
+_TRUSTWALLET_CHAIN_SLUGS: dict[int, str] = {
+    1: "ethereum", 10: "optimism", 56: "smartchain", 100: "xdai",
+    137: "polygon", 8453: "base", 42161: "arbitrum",
+}
+
+
+def _chain_icon_urls(chain_id: int) -> list[str]:
+    """Ordered list of upstream URLs to try for a chain logo.
+    Curve first — their set covers TAC and matches the wallet's
+    visual style (Curve also supplies our token-list source).
+    TrustWallet second as a long-established backup."""
+    urls: list[str] = []
+    slug = _CURVE_CHAIN_SLUGS.get(int(chain_id))
+    if slug:
+        urls.append(
+            "https://raw.githubusercontent.com/curvefi/curve-assets/main/"
+            f"chains/{slug}.png"
+        )
+    slug = _TRUSTWALLET_CHAIN_SLUGS.get(int(chain_id))
+    if slug:
+        urls.append(
+            "https://raw.githubusercontent.com/trustwallet/assets/master/"
+            f"blockchains/{slug}/info/logo.png"
+        )
+    return urls
 
 
 CIRCULAR_RENDER_SIZE = 64   # Rendered once, scaled down by Qt for display.
@@ -79,6 +118,111 @@ def bundled_chain_icon(chain_id: int) -> QPixmap | None:
         return None
     pix = QPixmap(str(p))
     return to_circular(pix) if not pix.isNull() else None
+
+
+class _ChainIconFetchWorker(QThread):
+    """Walk a list of upstream URLs and return the first usable
+    image. Failures (404, network error, file too small) skip
+    quietly to the next URL; only when all sources miss do we
+    emit ``None`` so the caller can drop the row entirely."""
+
+    fetched = Signal(int, object)  # (chain_id, bytes | None)
+
+    def __init__(self, chain_id: int, urls: list[str], parent=None):
+        super().__init__(parent)
+        self.chain_id = chain_id
+        self.urls = urls
+
+    def run(self) -> None:
+        for url in self.urls:
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": USER_AGENT},
+                )
+                with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+                    data = r.read()
+                if len(data) < 32:
+                    continue
+                self.fetched.emit(self.chain_id, data)
+                return
+            except Exception as e:
+                log.debug("chain icon fetch failed: %s — %s", url, e)
+                continue
+        self.fetched.emit(self.chain_id, None)
+
+
+class ChainIconCache(QObject):
+    """Three-tier resolver for chain logos: in-memory QPixmap →
+    bundled asset → on-disk download cache. Misses kick a
+    background fetch from Curve curve-assets / TrustWallet
+    assets; subscribers refresh the affected widget when
+    ``icon_ready`` fires.
+
+    Disk layout: ``~/.qeth/icons/chains/<chain_id>.png``."""
+
+    icon_ready = Signal(int)  # chain_id
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mem: dict[int, QPixmap] = {}
+        self._inflight: set[int] = set()
+        self._lock = threading.Lock()
+        self._workers: list[_ChainIconFetchWorker] = []
+        CHAIN_ICONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def get(self, chain_id: int) -> QPixmap | None:
+        cid = int(chain_id)
+        pix = self._mem.get(cid)
+        if pix is not None:
+            return pix
+        # Bundled wins — ships with the wheel, no network.
+        pix = bundled_chain_icon(cid)
+        if pix is not None:
+            self._mem[cid] = pix
+            return pix
+        p = CHAIN_ICONS_DIR / f"{cid}.png"
+        if p.exists():
+            raw = QPixmap(str(p))
+            if not raw.isNull():
+                pix = to_circular(raw)
+                self._mem[cid] = pix
+                return pix
+        return None
+
+    def request(self, chain_id: int) -> None:
+        cid = int(chain_id)
+        if cid in self._mem:
+            return
+        urls = _chain_icon_urls(cid)
+        if not urls:
+            return
+        with self._lock:
+            if cid in self._inflight:
+                return
+            self._inflight.add(cid)
+        worker = _ChainIconFetchWorker(cid, urls, self)
+        worker.fetched.connect(self._on_fetched)
+        worker.finished.connect(
+            lambda w=worker:
+                self._workers.remove(w) if w in self._workers else None
+        )
+        self._workers.append(worker)
+        worker.start()
+
+    def _on_fetched(self, chain_id: int, data) -> None:
+        with self._lock:
+            self._inflight.discard(int(chain_id))
+        if data is None:
+            return
+        raw = QPixmap()
+        if not raw.loadFromData(bytes(data)):
+            return
+        self._mem[int(chain_id)] = to_circular(raw)
+        try:
+            (CHAIN_ICONS_DIR / f"{int(chain_id)}.png").write_bytes(bytes(data))
+        except Exception as e:
+            log.debug("chain icon save failed: %s", e)
+        self.icon_ready.emit(int(chain_id))
 
 
 class _IconFetchWorker(QThread):
