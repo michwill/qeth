@@ -9,9 +9,10 @@ and handles geometry persistence."""
 from PySide6.QtCore import (
     QByteArray, QEvent, QObject, QSize, Qt, QThread,
 )
-from PySide6.QtGui import QIcon, QKeyEvent
+from PySide6.QtGui import QIcon, QKeyEvent, QPalette, QPen
 from PySide6.QtWidgets import (
     QComboBox, QLabel, QMainWindow, QSplitter, QStatusBar,
+    QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QTableWidget, QTreeWidget,
 )
 
@@ -229,6 +230,16 @@ class MainWindow(QMainWindow):
         self._tab_cycle_filter = _TabCycleFilter(self, tab_stops)
         for w in tab_stops:
             w.installEventFilter(self._tab_cycle_filter)
+        # Mouse-click focus changes don't go through the Tab
+        # filter, so wire QApplication.focusChanged for the
+        # universal cursor-style refresh: whenever focus moves
+        # between any two of the three tab_stop lists, repaint
+        # both so the solid/outline swap is immediate.
+        self._focus_tab_stops = set(tab_stops)
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().focusChanged.connect(
+            self._on_app_focus_changed,
+        )
         # Norton-Commander cursor style: focused list paints
         # solid selection (default), unfocused list paints
         # outline-only. Delegate handles the cell-by-cell paint;
@@ -239,6 +250,17 @@ class MainWindow(QMainWindow):
         # Initial focus on the wallet tree so arrow keys work
         # immediately.
         tab_stops[0].setFocus(Qt.OtherFocusReason)
+
+    def _on_app_focus_changed(self, old, new) -> None:
+        """QApplication.focusChanged → if either side of the
+        transition is one of our tab-stop lists, force a paint
+        so the focus-aware cursor swap is visible immediately.
+        Handles the mouse-click path; the keyboard path is
+        already covered by the explicit repaints in
+        ``_TabCycleFilter``."""
+        for w in (old, new):
+            if w in self._focus_tab_stops:
+                _repaint_view(w)
 
     def _collect_tab_stops(self) -> list:
         """Resolve the three list widgets safely (each may be None
@@ -825,9 +847,18 @@ class _TabCycleFilter(QObject):
         if wallet_tree is None or right_table is None:
             return False
         if obj is wallet_tree:
-            right_table.setFocus(Qt.TabFocusReason)
+            old, new = wallet_tree, right_table
         else:
-            wallet_tree.setFocus(Qt.TabFocusReason)
+            old, new = obj, wallet_tree
+        new.setFocus(Qt.TabFocusReason)
+        # Ensure the newly-focused list has a selected row (the
+        # delegate paints solid only on selected rows; an empty
+        # selection makes the focused panel look identical to
+        # the unfocused one).
+        _FocusRepainter._ensure_selection(new)
+        # Synchronous repaint of both sides.
+        _repaint_view(old)
+        _repaint_view(new)
         return True
 
     # --- Left / Right switch the right-slot tab --------------------------
@@ -850,6 +881,14 @@ class _TabCycleFilter(QObject):
         new_table = self._table_for_plugin(nxt)
         if new_table is not None:
             new_table.setFocus(Qt.OtherFocusReason)
+            # Same belt-and-braces as Tab: tab-switching between
+            # Tokens and Transactions can skip the FocusIn delivery
+            # that ``_FocusRepainter`` would otherwise use to
+            # ensure a row is selected. Call it directly here so
+            # the newly-active table always shows the solid
+            # cursor immediately.
+            _FocusRepainter._ensure_selection(new_table)
+            _repaint_view(new_table)
         return True
 
     # --- helpers ---------------------------------------------------------
@@ -875,6 +914,19 @@ class _TabCycleFilter(QObject):
         return self._table_for_plugin(active) if active is not None else None
 
 
+def _repaint_view(view) -> None:
+    """Synchronous viewport repaint. ``view.viewport().repaint()``
+    forces an immediate paint pass through the delegate, so the
+    new focus state is on screen before this call returns —
+    unlike ``update()`` which only schedules."""
+    if view is None:
+        return
+    if hasattr(view, "viewport"):
+        view.viewport().repaint()
+    else:
+        view.repaint()
+
+
 def _is_descendant(child, ancestor) -> bool:
     """True if ``child`` is the ``ancestor`` or any of its
     descendants in the QObject tree. Used to skip widgets nested
@@ -890,70 +942,183 @@ def _is_descendant(child, ancestor) -> bool:
 
 
 def _apply_focus_aware_selection(widget) -> None:
-    """Norton-Commander-style cursor: swaps the widget's
-    stylesheet between a "focused" variant (solid filled
-    selection) and an "unfocused" variant (outlined selection)
-    on every FocusIn / FocusOut event. The base widget classes
-    have to be the actual concrete classes (QTreeView,
-    QTableView, etc.) — QSS doesn't match ``QAbstractItemView``
-    in practice."""
-    selectors = {
-        QTreeWidget: "QTreeView",
-        QTableWidget: "QTableView",
-    }
-    # Pick the most specific selector among the widget's MRO.
-    selector = "QAbstractItemView"
-    for cls, sel in selectors.items():
-        if isinstance(widget, cls):
-            selector = sel
-            break
-    filt = _SelectionStyleFilter(widget, selector)
-    widget.installEventFilter(filt)
-    widget._selection_style_filter = filt
-    # Apply the initial state.
-    filt.apply(widget.hasFocus())
+    """Norton-Commander-style cursor: hand-paint the selection
+    via an item delegate. Qt's stylesheet engine on the user's
+    theme (qt6ct + system Qt) defers style refreshes after
+    setStyleSheet / setProperty in ways that make the first
+    FocusIn on a panel paint with the stale (unfocused) rule
+    until the user nudges the cursor. The delegate path queries
+    view.hasFocus() at paint time, so a viewport().repaint() on
+    FocusIn IS enough to get the new state on screen."""
+    delegate = _FocusAwareSelectionDelegate(widget)
+    widget.setItemDelegate(delegate)
+    widget._focus_aware_delegate = delegate
+    repainter = _FocusRepainter(widget)
+    widget.installEventFilter(repainter)
+    widget._focus_repainter = repainter
 
 
-class _SelectionStyleFilter(QObject):
-    """Per-widget event filter that rewrites the widget's
-    stylesheet on FocusIn / FocusOut, swapping between a solid-
-    fill selection (focused) and an outlined selection
-    (unfocused). The widget's existing stylesheet is preserved
-    as a prefix; only the selection rules are added/replaced."""
+class _FocusAwareSelectionDelegate(QStyledItemDelegate):
+    """Hand-paints selected rows with focus awareness:
 
-    def __init__(self, widget, selector):
-        super().__init__(widget)
-        self._widget = widget
-        self._selector = selector
-        # Snapshot any stylesheet the panel set up at
-        # construction (padding, hover, headers, …) — we
-        # concatenate the selection rules onto this base.
-        self._base_qss = widget.styleSheet() or ""
+    - selected + focused: fill cell with ``palette(highlight)``
+      and paint text in ``palette(highlightedText)``.
+    - selected + unfocused: paint cell as if not selected, then
+      overlay a 1-px row outline (top + bottom on every cell,
+      left only on the first column, right only on the last —
+      joins into a single rectangle around the row).
+    - otherwise: default delegate paint.
 
-    def apply(self, focused: bool) -> None:
-        if focused:
-            sel_qss = (
-                f"{self._selector}::item:selected,"
-                f"{self._selector}::item:selected:hover {{"
-                f"  background: palette(highlight);"
-                f"  color: palette(highlighted-text);"
-                f"}}"
+    The cell stylesheets on TokenListPanel / TransactionListPanel
+    must NOT contain a ``::item:selected`` rule — that would
+    over-paint our hand-drawn fill regardless of option.state.
+    """
+
+    def paint(self, painter, option, index):
+        view = self.parent()
+        is_selected = bool(option.state & QStyle.State_Selected)
+        is_focused = view is not None and view.hasFocus()
+
+        if is_selected and is_focused:
+            # Fill the cell with the highlight colour first.
+            highlight = option.palette.color(QPalette.Highlight)
+            painter.fillRect(option.rect, highlight)
+            # Now paint the cell contents (icon + text) on top,
+            # without letting the style re-fill the background.
+            # Stripping ``State_Selected`` keeps the default style
+            # from drawing its own selection bar (which would
+            # double-paint or look subtle on the user's theme);
+            # palette swap drives the text colour to the
+            # highlighted-text role so it reads on the highlight
+            # background.
+            opt = QStyleOptionViewItem(option)
+            opt.state &= ~QStyle.State_Selected
+            opt.state &= ~QStyle.State_HasFocus
+            opt.palette.setColor(
+                QPalette.Text,
+                option.palette.color(QPalette.HighlightedText),
             )
-        else:
-            sel_qss = (
-                f"{self._selector}::item:selected,"
-                f"{self._selector}::item:selected:hover {{"
-                f"  background: transparent;"
-                f"  color: palette(text);"
-                f"  border-top: 1px solid palette(highlight);"
-                f"  border-bottom: 1px solid palette(highlight);"
-                f"}}"
+            opt.palette.setColor(
+                QPalette.WindowText,
+                option.palette.color(QPalette.HighlightedText),
             )
-        self._widget.setStyleSheet(self._base_qss + sel_qss)
+            # The default platform paint will fill the cell with
+            # palette.Base; suppress by setting Base to highlight
+            # too, so our underlying fillRect isn't overwritten.
+            opt.palette.setColor(QPalette.Base, highlight)
+            opt.palette.setColor(QPalette.AlternateBase, highlight)
+            super().paint(painter, opt, index)
+            return
+
+        if is_selected and not is_focused:
+            opt = QStyleOptionViewItem(option)
+            opt.state &= ~QStyle.State_Selected
+            opt.state &= ~QStyle.State_HasFocus
+            super().paint(painter, opt, index)
+            painter.save()
+            try:
+                color = option.palette.color(QPalette.Highlight)
+                pen = QPen(color)
+                pen.setWidth(1)
+                painter.setPen(pen)
+                rect = option.rect
+                painter.drawLine(rect.topLeft(), rect.topRight())
+                painter.drawLine(
+                    rect.bottomLeft() - _PT_UP,
+                    rect.bottomRight() - _PT_UP,
+                )
+                model = index.model()
+                if index.column() == 0:
+                    painter.drawLine(
+                        rect.topLeft(), rect.bottomLeft() - _PT_UP,
+                    )
+                if (model is not None
+                        and index.column()
+                        == model.columnCount(index.parent()) - 1):
+                    painter.drawLine(
+                        rect.topRight() - _PT_LEFT,
+                        rect.bottomRight() - _PT_UP - _PT_LEFT,
+                    )
+            finally:
+                painter.restore()
+            return
+
+        super().paint(painter, option, index)
+
+
+from PySide6.QtCore import QPoint as _QPoint   # noqa: E402
+_PT_UP = _QPoint(0, 1)
+_PT_LEFT = _QPoint(1, 0)
+
+
+class _FocusRepainter(QObject):
+    """Force a synchronous viewport repaint when keyboard focus
+    enters or leaves the host widget — AND make sure a row is
+    actually selected so the focus-aware delegate has something
+    to paint. Without a selection, Qt draws only its native
+    focus indicator (a thin dashed rect around the current
+    cell), which looks identical to our "unfocused outline"
+    cursor — the user reads it as "still outline" because they
+    never see the solid version."""
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.FocusIn:
-            self.apply(True)
-        elif event.type() == QEvent.FocusOut:
-            self.apply(False)
+            self._ensure_selection(obj)
+        if event.type() in (QEvent.FocusIn, QEvent.FocusOut):
+            if hasattr(obj, "viewport"):
+                obj.viewport().repaint()
+            else:
+                obj.repaint()
         return False
+
+    @staticmethod
+    def _ensure_selection(view) -> None:
+        """If the view has no rows in its selection model, select
+        the current item (or the first row if no current). Called
+        only on FocusIn so a user who has explicitly cleared
+        selection by clicking empty space stays cleared until
+        they refocus."""
+        sm = view.selectionModel() if hasattr(view, "selectionModel") else None
+        if sm is None or sm.hasSelection():
+            return
+        # Pick the row to focus on. Prefer current; otherwise
+        # walk the model for the first selectable index.
+        idx = view.currentIndex() if hasattr(view, "currentIndex") else None
+        if idx is None or not idx.isValid():
+            model = view.model()
+            if model is None or model.rowCount() == 0:
+                return
+            # First top-level row, column 0. For trees, skip
+            # group-only rows (no UserRole) by walking depth-first.
+            idx = _first_selectable_index(view, model)
+            if idx is None or not idx.isValid():
+                return
+            view.setCurrentIndex(idx)
+        # Select the row (or item) that's now current.
+        from PySide6.QtCore import QItemSelectionModel
+        sm.select(
+            idx,
+            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+        )
+
+
+def _first_selectable_index(view, model):
+    """Depth-first walk for the first item with a non-empty
+    UserRole (used by the tree to mark address leaves), or the
+    very first index for non-tree models."""
+    # Try top-level rows first; for trees, descend into children
+    # of any group-only row.
+    def walk(parent_index):
+        for r in range(model.rowCount(parent_index)):
+            child = model.index(r, 0, parent_index)
+            from PySide6.QtCore import Qt as _Qt
+            data = model.data(child, _Qt.UserRole)
+            if data:
+                return child
+            grand = walk(child)
+            if grand is not None:
+                return grand
+        return None
+
+    from PySide6.QtCore import QModelIndex
+    return walk(QModelIndex())
