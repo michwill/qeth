@@ -58,6 +58,10 @@ class MainWindow(QMainWindow):
             self._on_signing_request,
             type=Qt.QueuedConnection,
         )
+        self.signer_bridge.chain_added.connect(
+            self._on_chain_added,
+            type=Qt.QueuedConnection,
+        )
         if self.rpc is not None:
             self.rpc.signer_bridge = self.signer_bridge
 
@@ -170,6 +174,27 @@ class MainWindow(QMainWindow):
             if self.chain_combo.itemData(i) == chain_id:
                 self.chain_combo.setItemIcon(i, QIcon(pix))
                 break
+
+    def _on_chain_added(self, chain_id: int) -> None:
+        """A dapp called ``wallet_addEthereumChain``. Append the
+        new entry to the chain combo and kick icon discovery so it
+        gets a logo if Curve / TrustWallet ship one. No-op if the
+        combo already has it (race with a parallel add)."""
+        if self.chain_combo.findData(chain_id) >= 0:
+            return
+        chain = next(
+            (c for c in self.store.chains if c.chain_id == chain_id),
+            None,
+        )
+        if chain is None:
+            return
+        label = f"{chain.name} ({chain.chain_id})"
+        pix = self._chain_icon_cache.get(chain.chain_id)
+        if pix is not None:
+            self.chain_combo.addItem(QIcon(pix), label, chain.chain_id)
+        else:
+            self.chain_combo.addItem(label, chain.chain_id)
+            self._chain_icon_cache.request(chain.chain_id)
 
     def _build_chain_rpc_button(self):
         """Little ⋯ button next to the chain combo: opens the

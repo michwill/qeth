@@ -36,11 +36,13 @@ FETCH_TIMEOUT = 10.0
 # qeth/assets/chains/<chain_id>.png to override.
 _CURVE_CHAIN_SLUGS: dict[int, str] = {
     1: "ethereum", 10: "optimism", 56: "bsc", 100: "xdai",
-    137: "polygon", 239: "tac", 8453: "base", 42161: "arbitrum",
+    137: "polygon", 239: "tac", 324: "zksync",
+    8453: "base", 42161: "arbitrum",
 }
 _TRUSTWALLET_CHAIN_SLUGS: dict[int, str] = {
     1: "ethereum", 10: "optimism", 56: "smartchain", 100: "xdai",
-    137: "polygon", 8453: "base", 42161: "arbitrum",
+    137: "polygon", 324: "zksync",
+    8453: "base", 42161: "arbitrum",
 }
 
 

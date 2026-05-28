@@ -483,6 +483,13 @@ class RpcServer:
                 symbol=(p.get("nativeCurrency") or {}).get("symbol", "ETH"),
                 explorer=(p.get("blockExplorerUrls") or [""])[0],
             ))
+            # Notify the UI so the new chain appears in the
+            # toolbar combo (with icon discovery kicked off) and
+            # the user isn't stuck restarting just to switch to it.
+            # Cross-thread emit — Signal delivery is auto-queued
+            # since the bridge lives on the Qt main thread.
+            if self.signer_bridge is not None:
+                self.signer_bridge.chain_added.emit(cid)
             return None
 
         if method == "eth_sendTransaction":

@@ -265,6 +265,11 @@ class SignerBridge(QObject):
     # bridge.reject(future, exc) on cancel/error, otherwise the
     # awaiting RPC coroutine never resumes.
     request_received = Signal(object, object)
+    # Fired from the RPC thread when a dapp adds a chain via
+    # ``wallet_addEthereumChain``. The UI uses this to append the
+    # new chain to the toolbar combo (and kick icon discovery)
+    # without waiting for the user to restart.
+    chain_added = Signal(int)
 
     async def submit_async(self, req) -> str:
         """Called from the aiohttp event loop. Emits the signal
