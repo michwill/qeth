@@ -374,20 +374,49 @@ class WalletsPlugin(Plugin):
         # Sub-actions used by both the toolbar dropdown and the
         # tree's right-click menu so the two entry points agree on
         # which dialogs they open.
+        # Per-source icons so the picker menu isn't a flat list of text:
+        # a hardware device for Ledger, a key for the local hot wallet,
+        # an eye for watch-only, and an import glyph for the two
+        # external-wallet importers. Each falls back to a QStyle
+        # standard icon when the theme lacks the named one.
+        def _icon(*names_then_fallback):
+            *names, fb = names_then_fallback
+            ic = QIcon()
+            for n in names:
+                ic = QIcon.fromTheme(n)
+                if not ic.isNull():
+                    return ic
+            return style_proxy.standardIcon(fb)
+
         self.act_add_ledger = QAction("&Ledger Account…", self)
+        self.act_add_ledger.setIcon(_icon(
+            "drive-removable-media-usb", "media-flash", "drive-harddisk",
+            QStyle.SP_DriveFDIcon,
+        ))
         self.act_add_ledger.triggered.connect(self._add_ledger)
         self.act_add_hot = QAction("&Hot Wallet…", self)
+        self.act_add_hot.setIcon(_icon(
+            "dialog-password", "security-high", QStyle.SP_FileIcon,
+        ))
         self.act_add_hot.triggered.connect(self._add_hot_wallet)
         self.act_add_watch = QAction("&Watch-only Address…", self)
+        self.act_add_watch.setIcon(_icon(
+            "view-visible", "eye", QStyle.SP_FileDialogContentsView,
+        ))
         self.act_add_watch.triggered.connect(self._add_watch_only)
         # Import-from-other-wallet actions live below a separator
         # so the primary "add a new account" actions stay grouped
         # at the top. Each external source is its own entry +
         # dialog so the per-source UX (passphrase fields, paths)
         # isn't muddled with tab switching.
+        _import_icon = _icon(
+            "document-import", "document-open", QStyle.SP_DialogOpenButton,
+        )
         self.act_import_brownie = QAction("Import from &Brownie…", self)
+        self.act_import_brownie.setIcon(_import_icon)
         self.act_import_brownie.triggered.connect(self._import_from_brownie)
         self.act_import_frame = QAction("Import from &Frame…", self)
+        self.act_import_frame.setIcon(_import_icon)
         self.act_import_frame.triggered.connect(self._import_from_frame)
         # Triggering act_add itself shows the picker menu — invoked
         # via the right-click "Add account" item in the tree.
