@@ -11,6 +11,8 @@ multicall3 balanceOf), Alchemy ``alchemy_getTokenBalances``, Covalent.
 
 import json
 import logging
+import threading
+import time
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
@@ -40,6 +42,11 @@ class TokenBalance:
 
 class TokenSourceError(Exception):
     pass
+
+
+class RateLimited(TokenSourceError):
+    """The source rejected the call with a rate-limit response. A router
+    can catch this and immediately try a backup source for this call."""
 
 
 class UnsupportedChain(TokenSourceError):
@@ -152,8 +159,19 @@ class EtherscanV2Source(TokenSource):
 
         if data.get("status") != "1":
             msg = (data.get("message") or "").lower()
+            res = data.get("result")
+            # Etherscan puts the rate-limit text in `result` ("Max calls
+            # per sec rate limit reached"), with message just "NOTOK" —
+            # so check both before classifying.
+            res_text = res.lower() if isinstance(res, str) else ""
             if "no token" in msg or "not found" in msg:
                 return []
+            blob = f"{msg} {res_text}"
+            if "rate limit" in blob or "max calls" in blob or "max rate" in blob:
+                raise RateLimited(
+                    res if isinstance(res, str)
+                    else (data.get("message") or "etherscan rate limit")
+                )
             raise TokenSourceError(data.get("message") or "etherscan error")
 
         result = data.get("result") or []
@@ -186,23 +204,67 @@ class EtherscanV2Source(TokenSource):
         return out
 
 
+# Within this window after a primary (Etherscan) call, route to the
+# secondary (Blockscout) instead — when it can serve the chain. Fast
+# keyboard navigation through wallets fires a discovery per selection;
+# without this, a burst hammers Etherscan's ~5 req/s free tier and trips
+# its rate limit. The source only supplies the *contract list* (balances
+# and metadata come from on-chain multicall, see TokensPlugin), so
+# Blockscout's list is a fine stand-in during a burst; the settled
+# wallet's periodic 60 s refresh lands outside the window and uses
+# Etherscan again.
+_PRIMARY_COOLDOWN_S = 2.0
+
+
 class RoutedTokenSource(TokenSource):
     """Prefer ``primary`` when it supports the chain, fall back to
     ``secondary`` otherwise. Lets the wallet wire Etherscan-when-
-    key-is-set in front of Blockscout without either source
-    knowing about the other."""
+    key-is-set in front of Blockscout without either source knowing
+    about the other.
 
-    def __init__(self, primary: TokenSource, secondary: TokenSource):
+    Adds burst protection for the rate-limited primary: within
+    ``cooldown`` seconds of a primary call, route to the secondary when
+    it supports the chain; and if the primary still returns a rate-limit
+    response, fall back to the secondary for that call."""
+
+    def __init__(self, primary: TokenSource, secondary: TokenSource, *,
+                 cooldown: float = _PRIMARY_COOLDOWN_S, clock=time.monotonic):
         self._primary = primary
         self._secondary = secondary
+        self._cooldown = cooldown
+        self._clock = clock
+        self._last_primary: float | None = None
+        self._lock = threading.Lock()
 
     def supports(self, chain: Chain) -> bool:
         return self._primary.supports(chain) or self._secondary.supports(chain)
 
+    def _in_cooldown(self) -> bool:
+        with self._lock:
+            return (self._last_primary is not None
+                    and (self._clock() - self._last_primary) < self._cooldown)
+
+    def _mark_primary(self) -> None:
+        with self._lock:
+            self._last_primary = self._clock()
+
     def list_balances(self, chain: Chain, address: str) -> list[TokenBalance]:
-        if self._primary.supports(chain):
-            return self._primary.list_balances(chain, address)
-        if self._secondary.supports(chain):
+        primary_ok = self._primary.supports(chain)
+        secondary_ok = self._secondary.supports(chain)
+        # Burst: spread off the rate-limited primary onto the secondary
+        # (only when the secondary can actually serve this chain — for
+        # chains it can't, e.g. BNB, we still use the primary).
+        if primary_ok and secondary_ok and self._in_cooldown():
+            return self._secondary.list_balances(chain, address)
+        if primary_ok:
+            self._mark_primary()
+            try:
+                return self._primary.list_balances(chain, address)
+            except RateLimited:
+                if secondary_ok:
+                    return self._secondary.list_balances(chain, address)
+                raise
+        if secondary_ok:
             return self._secondary.list_balances(chain, address)
         raise UnsupportedChain(
             f"No token source supports chain {chain.chain_id}"

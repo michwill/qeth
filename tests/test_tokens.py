@@ -126,3 +126,82 @@ class TestEtherscanSupportAndKey:
         )
         out = EtherscanV2Source(lambda: "KEY").list_balances(ETH, ADDR)
         assert out == []
+
+
+class _FakeSource:
+    """Records calls and returns a sentinel list, or raises."""
+    def __init__(self, supported, *, raises=None, tag="x"):
+        self._supported = set(supported)
+        self._raises = raises
+        self.calls = 0
+        self.tag = tag
+    def supports(self, chain):
+        return chain.chain_id in self._supported
+    def list_balances(self, chain, address):
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return [self.tag]
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+    def __call__(self):
+        return self.t
+
+
+class TestRoutedTokenSourceCooldown:
+    def test_first_call_uses_primary(self):
+        from qeth.tokens import RoutedTokenSource
+        clk = _Clock()
+        primary = _FakeSource({1}, tag="ether")
+        secondary = _FakeSource({1}, tag="blockscout")
+        r = RoutedTokenSource(primary, secondary, cooldown=2.0, clock=clk)
+        assert r.list_balances(ETH, ADDR) == ["ether"]
+        assert primary.calls == 1 and secondary.calls == 0
+
+    def test_burst_within_cooldown_diverts_to_secondary(self):
+        from qeth.tokens import RoutedTokenSource
+        clk = _Clock()
+        primary = _FakeSource({1}, tag="ether")
+        secondary = _FakeSource({1}, tag="blockscout")
+        r = RoutedTokenSource(primary, secondary, cooldown=2.0, clock=clk)
+        r.list_balances(ETH, ADDR)          # primary, stamps clock
+        clk.t += 0.5                         # still inside the window
+        assert r.list_balances(ETH, ADDR) == ["blockscout"]
+        assert primary.calls == 1 and secondary.calls == 1
+
+    def test_primary_resumes_after_cooldown(self):
+        from qeth.tokens import RoutedTokenSource
+        clk = _Clock()
+        primary = _FakeSource({1}, tag="ether")
+        secondary = _FakeSource({1}, tag="blockscout")
+        r = RoutedTokenSource(primary, secondary, cooldown=2.0, clock=clk)
+        r.list_balances(ETH, ADDR)
+        clk.t += 3.0                         # window elapsed
+        assert r.list_balances(ETH, ADDR) == ["ether"]
+        assert primary.calls == 2
+
+    def test_cooldown_ignored_when_secondary_cant_serve_chain(self):
+        # BNB-style: secondary doesn't support the chain, so even inside
+        # the window we must keep using the primary (no alternative).
+        from qeth.tokens import RoutedTokenSource
+        BNB = next(c for c in DEFAULT_CHAINS if c.chain_id == 56)
+        clk = _Clock()
+        primary = _FakeSource({56}, tag="ether")
+        secondary = _FakeSource(set(), tag="blockscout")
+        r = RoutedTokenSource(primary, secondary, cooldown=2.0, clock=clk)
+        r.list_balances(BNB, ADDR)
+        clk.t += 0.1
+        assert r.list_balances(BNB, ADDR) == ["ether"]
+        assert primary.calls == 2 and secondary.calls == 0
+
+    def test_rate_limited_primary_falls_back_to_secondary(self):
+        from qeth.tokens import RoutedTokenSource, RateLimited
+        clk = _Clock()
+        primary = _FakeSource({1}, raises=RateLimited("slow down"), tag="ether")
+        secondary = _FakeSource({1}, tag="blockscout")
+        r = RoutedTokenSource(primary, secondary, cooldown=2.0, clock=clk)
+        assert r.list_balances(ETH, ADDR) == ["blockscout"]
+        assert primary.calls == 1 and secondary.calls == 1
