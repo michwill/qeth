@@ -37,6 +37,21 @@ def test_account_actions_present_at_top_of_left_pane(mainwindow):
     assert {"Add Account", "Copy Address", "Remove Account"} <= button_texts
 
 
+def test_accounts_tree_has_copy_and_delete_shortcuts(mainwindow):
+    """Ctrl+C copies / Del removes the selected address, scoped to the
+    accounts tree so they don't shadow copy/delete in other panels."""
+    from PySide6.QtGui import QKeySequence
+    wp = mainwindow.wallets_plugin
+    assert wp.act_copy.shortcut() == QKeySequence(QKeySequence.Copy)
+    assert wp.act_remove.shortcut() == QKeySequence(QKeySequence.Delete)
+    # Scoped to the tree (not application-global).
+    assert wp.act_copy.shortcutContext() == Qt.WidgetWithChildrenShortcut
+    assert wp.act_remove.shortcutContext() == Qt.WidgetWithChildrenShortcut
+    tree_actions = set(wp._tree.actions())
+    assert wp.act_copy in tree_actions
+    assert wp.act_remove in tree_actions
+
+
 def test_copy_and_remove_disabled_until_account_selected(mainwindow):
     """No tree selection (default for an empty store) → Copy and Remove
     actions are disabled; Add is always available."""

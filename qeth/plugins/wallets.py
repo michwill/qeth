@@ -33,7 +33,9 @@ import segno
 log = logging.getLogger("qeth.plugin.wallets")
 
 from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtGui import (
+    QAction, QFont, QIcon, QKeySequence, QPalette, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -337,6 +339,10 @@ class WalletsPlugin(Plugin):
         self._tree.customContextMenuRequested.connect(
             self._on_tree_context_menu
         )
+        # Make Ctrl+C / Del work while the accounts tree has focus
+        # (the actions carry the shortcuts; the tree is their context).
+        self._tree.addAction(self.act_copy)
+        self._tree.addAction(self.act_remove)
         self._splitter.addWidget(self._tree)
 
         self._details = DetailsPanel()
@@ -393,6 +399,7 @@ class WalletsPlugin(Plugin):
             "&Copy Address",
         )
         self.act_copy.setEnabled(False)
+        self.act_copy.setShortcut(QKeySequence.Copy)
         self.act_copy.triggered.connect(self._copy_selected_address)
 
         self.act_remove = QAction(
@@ -401,7 +408,15 @@ class WalletsPlugin(Plugin):
             "&Remove Account",
         )
         self.act_remove.setEnabled(False)
+        self.act_remove.setShortcut(QKeySequence.Delete)
         self.act_remove.triggered.connect(self._remove_selected_account)
+
+        # Scope the shortcuts to the accounts tree: Ctrl+C / Del act on
+        # the selected address only when that panel has focus, so they
+        # don't shadow copy/delete in the token or transaction tables.
+        # (The tree is added to these actions in _build, once it exists.)
+        for act in (self.act_copy, self.act_remove):
+            act.setShortcutContext(Qt.WidgetWithChildrenShortcut)
 
         row = QHBoxLayout()
         row.setContentsMargins(4, 2, 4, 4)
