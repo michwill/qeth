@@ -173,9 +173,21 @@ always tolerated — one bad source never takes the feature down.
   paste works without re-instantiation. `supports()` is True only when the key
   is set *and* the chain is enumerated. **`offset=10000`** is the per-page cap —
   smaller values silently truncate long-tail holdings (this is what once hid a
-  ~$9k position past index 100).
+  ~$9k position past index 100); a full page logs a truncation warning. A
+  rate-limit reply (Etherscan puts that text in `result`, not `message`) raises
+  **`RateLimited`**.
 - **`RoutedTokenSource(EtherscanV2, Blockscout)`** is the default wiring:
-  Etherscan when a key is present, else Blockscout.
+  Etherscan when a key is present, else Blockscout — with **burst protection**
+  for the rate-limited primary. Fast keyboard navigation fires a discovery per
+  wallet selection (no debounce); without throttling a burst trips Etherscan's
+  ~5 req/s free tier. So within a **2 s cooldown** after an Etherscan call the
+  router diverts to Blockscout *when it can serve the chain* (chains it can't,
+  e.g. BNB/Gnosis, keep using Etherscan), and a residual `RateLimited` from the
+  primary falls back to Blockscout for that call. Safe because the source only
+  supplies the **contract list** (balances + metadata come from multicall,
+  §9.1), so Blockscout's list is a fine stand-in during a burst; the settled
+  wallet's 60 s refresh (§9.2) lands outside the window and uses Etherscan
+  again.
 
 ### 4.2 Curated token lists — `tokenlists.py`
 
