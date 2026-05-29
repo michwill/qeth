@@ -327,6 +327,40 @@ first render.** Two rules enforce this:
 - Heavy libraries (web3, eth_abi) are **lazy-imported** at first `EthClient`
   use, not at module import (§3), keeping import-time cost off startup.
 
+### 5.8 Dialog conventions (GNOME HIG)
+
+The dialogs follow the GNOME 2 HIG, applied through the system Qt style (never
+overriding it — the theme stays in charge, §5.4):
+
+- **Two-tier alerts & confirmations — `alerts.py`.** `warn`/`error`/`info`
+  build a `QMessageBox` with the plain-language problem as the bold primary
+  line (`setText`) and the technical detail as secondary text
+  (`setInformativeText`), rather than cramming both onto one line or leaning on
+  the title bar. `confirm(...)` is the same shape with a **verb button**
+  (e.g. "Remove", not Yes/No), **Cancel as the default + Escape target** (so an
+  accidental Enter/Esc is non-destructive), and a Warning icon for destructive
+  actions. The only confirmation in the app guards account removal (an
+  irreversible keystore delete for hot wallets); nothing reversible prompts.
+- **Access-key mnemonics.** Buttons, menu items, and editable-field labels
+  carry `&`-mnemonics (Alt+letter), unique within each window. Underlines reveal
+  on Alt per the style; buttons built via `setDefaultAction` drop the `&` from
+  `text()` but still trigger.
+- **Header capitalization** on buttons, menu items, and window titles
+  ("Confirm and Sign", "Open in Block Explorer"); articles/short
+  prepositions/conjunctions stay lowercase.
+- **Default button + Esc.** Esc dismisses every `QDialog` (built-in `reject()`);
+  `QDialogButtonBox` promotes the affirmative to the default on show so Enter
+  confirms. Explicit defaults are set only where the auto-default is wrong (the
+  signature result dialog pins Close so Enter dismisses rather than copies).
+- **Progressive disclosure — `_CollapsibleSection`** (transactions.py). A flat
+  `QToolButton` + rotating arrow that shows/hides a content area; used to tuck
+  the gas controls behind a collapsed "Gas settings" header (§10.3).
+- **Working copy menus.** Address/hash hyperlinks (rich-text `QLabel`s) get a
+  custom context menu via `_install_copy_menu` — "Copy Address/Hash/Link" (the
+  noun auto-detected from the value) + "Open in Browser" — replacing Qt's
+  default menu where "Copy" is for selected text (always disabled). Every
+  context menu reuses its toolbar buttons' icons so menu and toolbar match.
+
 ---
 
 ## 6. The Frame-compatible JSON-RPC server — `rpc.py`
@@ -454,6 +488,13 @@ The **default account** (browser-facing, returned by `eth_accounts`) is set via
 double-click or "Connect to browser" and is disabled for watch-only accounts.
 Labels are editable inline and persisted; a post-import ENS reverse lookup fills
 blank labels without ever clobbering a user edit.
+
+**Keyboard:** `Ctrl+C` copies / `Del` removes the selected address — shortcuts
+carried on the copy/remove actions but scoped to the tree
+(`WidgetWithChildrenShortcut`), so they act only when the accounts panel has
+focus and don't shadow copy/delete in the token/transaction tables. The
+add-account picker is a menu with per-source icons (hardware device for Ledger,
+key for hot wallet, eye for watch-only, import glyph for Brownie/Frame).
 
 ### 8.2 Signers
 
@@ -643,7 +684,26 @@ traditional "match the dapp" approach:
 - **Legacy (non-1559)**: `gasPrice = current × 1.35` (≥ the dapp's).
 
 Expected fee shown in the dialog is `base + tip` (not max), with a USD estimate;
-the value being sent is shown separately, never folded into the fee.
+the value being sent is shown separately, never folded into the fee. The
+editable gas controls (limit, max fee, priority/gas price, network base fee)
+live behind a **collapsed "Gas settings" expander** (§5.8) since the auto policy
+is sensible; only the **Expected fee** (and, for native sends, **Total to send**)
+stays visible as the always-on summary.
+
+### 10.4 Send dialog recipient affordances — `SendTokenDialog`
+
+The user-driven send dialog (counterpart to the dapp `SignTransactionDialog`)
+tints the recipient field as you type, set as a self-consistent (bg, fg) colour
+pair so it reads in any palette:
+
+- **Red** — the recipient is a **token contract** (the asset's own contract, or
+  any address on the curated lists, held or not). Sending tokens/ETH to a token
+  contract usually burns the funds; this **outranks** the green hint. Detection
+  is local (no network).
+- **Green** — the recipient is **one of the user's own wallets** (matched
+  case-insensitively against the account list passed in as `known_addresses`).
+- Cleared otherwise. The hint only restyles on an actual state transition (not
+  every keystroke).
 
 ---
 
