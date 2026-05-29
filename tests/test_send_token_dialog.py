@@ -425,3 +425,22 @@ def _is_descendant(widget, ancestor) -> bool:
             return True
         w = w.parentWidget()
     return False
+
+
+class TestAddressLinkCopyMenu:
+    """Link labels (address/hash) get a working Copy item instead of
+    Qt's default rich-text menu where "Copy" is for selected text and
+    sits disabled."""
+
+    def test_copy_noun_classifies_value(self):
+        from qeth.plugins.transactions import _copy_noun
+        assert _copy_noun("0x" + "ab" * 20) == "Address"   # 42 chars
+        assert _copy_noun("0x" + "cd" * 32) == "Hash"      # 66 chars
+        assert _copy_noun("https://app.uniswap.org") == "Link"
+
+    def test_link_label_uses_a_custom_context_menu(self, qtbot, monkeypatch):
+        from PySide6.QtCore import Qt
+        dlg = _make_dialog(qtbot, monkeypatch, balance_raw=10_000_000)
+        # The From row is built via _link_label with an explorer URL.
+        lbl = dlg._link_label("0x" + "11" * 20, "https://etherscan.io/address/x")
+        assert lbl.contextMenuPolicy() == Qt.CustomContextMenu

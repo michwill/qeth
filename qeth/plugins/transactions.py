@@ -54,6 +54,46 @@ from ..transactions import (
 from ..transactions_cache import TransactionCache, merge_txs
 
 
+def _copy_noun(value: str) -> str:
+    """Name the thing a link label holds, for its "Copy …" menu item.
+    0x-addresses → Address, 32-byte hashes → Hash, anything else (e.g. a
+    dapp origin URL) → Link."""
+    v = value.strip()
+    if v.startswith(("0x", "0X")):
+        if len(v) == 42:
+            return "Address"
+        if len(v) == 66:
+            return "Hash"
+    return "Link"
+
+
+def _install_copy_menu(label: "QLabel", value: str, url: "Optional[str]") -> None:
+    """Give a hyperlink QLabel a useful right-click menu.
+
+    Qt's default rich-text menu offers "Copy" (for *selected text*, so
+    it sits disabled) and "Copy Link Location" (the explorer URL) — but
+    not the one thing the user wants: the address/hash itself. Replace
+    it with a working "Copy Address/Hash/Link" that copies ``value``
+    verbatim, plus "Open in Browser" when there's a ``url``."""
+    from PySide6.QtWidgets import QMenu
+
+    label.setContextMenuPolicy(Qt.CustomContextMenu)
+    noun = _copy_noun(value)
+
+    def _show(pos):
+        menu = QMenu(label)
+        menu.addAction(f"Copy {noun}").triggered.connect(
+            lambda: QApplication.clipboard().setText(value)
+        )
+        if url:
+            menu.addAction("Open in Browser").triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl(url))
+            )
+        menu.exec(label.mapToGlobal(pos))
+
+    label.customContextMenuRequested.connect(_show)
+
+
 def _confirmed_from_receipt(old: Transaction, receipt: dict) -> Transaction:
     """Build a confirmed Transaction by merging an
     ``eth_getTransactionReceipt`` payload into the prior pending
@@ -1638,6 +1678,7 @@ class TransactionDetailsDialog(QDialog):
             Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
         )
         lbl.setWordWrap(True)
+        _install_copy_menu(lbl, text, url)
         return lbl
 
     def _explorer_url(self, kind: str, addr: str,
@@ -1735,6 +1776,7 @@ class TransactionDetailsDialog(QDialog):
             label.setTextInteractionFlags(
                 Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
             )
+            _install_copy_menu(label, addr, token_url)
             row.addWidget(label, 1)
 
             if self._icon_cache is not None:
@@ -2381,6 +2423,7 @@ class SignTransactionDialog(QDialog):
             Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
         )
         lbl.setWordWrap(True)
+        _install_copy_menu(lbl, text, url)
         return lbl
 
     def _explorer_url(self, kind: str, addr: str,
@@ -2450,6 +2493,7 @@ class SignTransactionDialog(QDialog):
             label.setTextInteractionFlags(
                 Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
             )
+            _install_copy_menu(label, addr, token_url)
             row.addWidget(label, 1)
 
             if self._icon_cache is not None:
@@ -2813,6 +2857,7 @@ class SendTokenDialog(QDialog):
         label.setTextInteractionFlags(
             Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
         )
+        _install_copy_menu(label, addr, token_url)
         row.addWidget(label, 1)
 
         if self._icon_cache is not None:
@@ -2865,6 +2910,7 @@ class SendTokenDialog(QDialog):
             Qt.LinksAccessibleByMouse | Qt.TextSelectableByMouse
         )
         lbl.setWordWrap(True)
+        _install_copy_menu(lbl, text, url)
         return lbl
 
     def _explorer_url(self, kind: str, addr: str,
