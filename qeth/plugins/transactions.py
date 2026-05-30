@@ -395,7 +395,8 @@ def _format_token_amount(raw: int, decimals: int, symbol: str) -> str:
 
 
 def _render_decoded(text_edit, decoded: dict,
-                    token_context: Optional[dict] = None) -> None:
+                    token_context: Optional[dict] = None,
+                    known_addresses=None) -> None:
     """Render a decoded call into ``text_edit`` as Python-style
     annotated text. Top-level args render as
 
@@ -452,13 +453,15 @@ def _render_decoded(text_edit, decoded: dict,
             arg, indent=1,
             last=(i == len(args) - 1),
             token_context=token_context if use_amounts else None,
+            known_addresses=known_addresses,
         ))
     parts.append(")</div>")
     text_edit.setHtml("".join(parts))
 
 
 def _arg_html(arg: dict, *, indent: int, last: bool,
-              token_context: Optional[dict] = None) -> str:
+              token_context: Optional[dict] = None,
+              known_addresses=None) -> str:
     """Serialise one ``arg`` node (leaf, struct branch, or array
     branch) to an HTML fragment. ``last`` controls the trailing
     punctuation: non-final entries get a comma, the last in any
@@ -490,16 +493,24 @@ def _arg_html(arg: dict, *, indent: int, last: bool,
             return head + open_b + close_b + tail
         inner = "".join(
             _arg_html(child, indent=indent + 1,
-                       last=(j == len(children) - 1))
+                       last=(j == len(children) - 1),
+                       known_addresses=known_addresses)
             for j, child in enumerate(children)
         )
         return head + open_b + "\n" + inner + f"{pad}{close_b}{tail}"
 
     value = arg.get("value")
     value_text = "" if value is None else str(value)
+    inner = _escape_html(value_text)
+    # Bold + underline an address argument that belongs to one of the
+    # user's own wallets — so a self-send / approval-to-self stands out
+    # in the decoded call.
+    if (type_ == "address" and known_addresses
+            and value_text.lower() in known_addresses):
+        inner = f"<b><u>{inner}</u></b>"
     value_span = (
         f'<span style="color:{_VALUE_COLOR};">'
-        f"{_escape_html(value_text)}</span>"
+        f"{inner}</span>"
     )
     # Trailing "  # X SYMBOL" comment for ERC-20 amounts. Only uintN
     # leaves on a function the caller marked as amount-carrying —
@@ -704,6 +715,8 @@ class TransactionsPlugin(Plugin):
             price_lookup(chain.chain_id, self.host.selected_address)
             if callable(price_lookup) else None
         )
+        addrs_fn = getattr(self.host, "account_addresses", None)
+        known_addresses = addrs_fn() if callable(addrs_fn) else []
         dialog = TransactionDetailsDialog(
             tx, chain,
             abi_source=self._abi_source,
@@ -712,6 +725,7 @@ class TransactionsPlugin(Plugin):
             token_info=token_info,
             icon_cache=icon_cache,
             native_price_usd=native_price_usd,
+            known_addresses=known_addresses,
             parent=self._panel,
         )
         dialog.show()
@@ -1598,6 +1612,7 @@ class TransactionDetailsDialog(QDialog):
                  token_info=None,
                  icon_cache=None,
                  native_price_usd=None,
+                 known_addresses=None,
                  parent=None):
         super().__init__(parent)
         self.tx = tx
@@ -1605,6 +1620,7 @@ class TransactionDetailsDialog(QDialog):
         self._abi_source = abi_source
         self._abi_cache = abi_cache
         self._start_worker = start_worker
+        self._known_addresses = {a.lower() for a in (known_addresses or ())}
         # Optional dependencies for ERC-20 annotation on the "To:" row.
         # Plugin passes both when available; tests can leave them None
         # and the dialog falls back to a plain address line.
@@ -1787,7 +1803,10 @@ class TransactionDetailsDialog(QDialog):
                     "symbol": entry.symbol,
                     "decimals": entry.decimals,
                 }
-        _render_decoded(self.decoded_view, decoded, token_context)
+        _render_decoded(
+            self.decoded_view, decoded, token_context,
+            known_addresses=self._known_addresses,
+        )
 
     def _open_explorer(self) -> None:
         url = self._explorer_url("tx", self.tx.hash)
@@ -2195,6 +2214,7 @@ class SignTransactionDialog(QDialog):
                  token_info=None,
                  icon_cache=None,
                  native_price_usd=None,
+                 known_addresses=None,
                  parent=None):
         super().__init__(parent)
         self.req = req
@@ -2203,6 +2223,7 @@ class SignTransactionDialog(QDialog):
         self._abi_cache = abi_cache
         self._start_worker = start_worker
         self._token_info = token_info
+        self._known_addresses = {a.lower() for a in (known_addresses or ())}
         # Same shape as in TransactionDetailsDialog: when the
         # recipient is a known ERC-20, _build_to_row renders an
         # icon + symbol + linked-address. Async icon updates land
@@ -2452,7 +2473,10 @@ class SignTransactionDialog(QDialog):
                     "symbol": entry.symbol,
                     "decimals": entry.decimals,
                 }
-        _render_decoded(self.decoded_view, decoded, token_context)
+        _render_decoded(
+            self.decoded_view, decoded, token_context,
+            known_addresses=self._known_addresses,
+        )
 
     def _on_gas_suggested(self, info: dict) -> None:
         self._base_fee_wei = int(info.get("base_fee") or 0)
@@ -3248,7 +3272,10 @@ class SendTokenDialog(QDialog):
                 "symbol": self._asset["symbol"],
                 "decimals": self._asset["decimals"],
             }
-        _render_decoded(self.decoded_view, decoded, token_context)
+        _render_decoded(
+            self.decoded_view, decoded, token_context,
+            known_addresses=self._known_addresses,
+        )
 
     def _on_gas_suggested(self, info: dict) -> None:
         self._base_fee_wei = int(info.get("base_fee") or 0)

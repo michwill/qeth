@@ -441,6 +441,11 @@ class MainWindow(QMainWindow):
     def token_info(self, chain_id: int, address: str):
         return self.tokens_plugin.token_lists.get(chain_id, address)
 
+    def account_addresses(self) -> list[str]:
+        """Every address the user owns — used to highlight self-sends in
+        decoded calldata and to tint the send-dialog recipient field."""
+        return [a["address"] for a in self.store.accounts]
+
     def icon_cache(self):
         return self.tokens_plugin.icon_cache
 
@@ -497,6 +502,7 @@ class MainWindow(QMainWindow):
             token_info=self.token_info,
             icon_cache=self.icon_cache(),
             native_price_usd=native_price_usd,
+            known_addresses=self.account_addresses(),
             parent=self,
         )
         self._launch_sign_flow(
@@ -543,7 +549,7 @@ class MainWindow(QMainWindow):
             native_price_usd=self.native_price_usd(
                 chain.chain_id, from_addr,
             ),
-            known_addresses=[a["address"] for a in self.store.accounts],
+            known_addresses=self.account_addresses(),
             parent=self,
         )
         self._launch_sign_flow(
