@@ -74,3 +74,85 @@ def test_simulation_error_returns_none():
         def __init__(self, fork_url=None): pass
         def message_call(self, **kw): raise RuntimeError("revm exploded")
     assert simulate_logs(CHAIN, FROM, USDC, "0x", 0, evm_cls=_Boom) is None
+
+
+# --- revert-reason decoding (pyrevm raises RuntimeError with output bytes) ---
+
+from qeth.simulate import _decode_revert
+
+
+def test_decode_revert_error_string():
+    # Error(string) "ERC20: transfer amount exceeds balance"
+    out = ("0x08c379a0"
+           "0000000000000000000000000000000000000000000000000000000000000020"
+           "0000000000000000000000000000000000000000000000000000000000000026"
+           "45524332303a207472616e7366657220616d6f756e7420657863656564732062"
+           "616c616e63650000000000000000000000000000000000000000000000000000")
+    msg = f"Revert {{ gas_used: 36085, output: {out} }}"
+    assert _decode_revert(msg) == "ERC20: transfer amount exceeds balance"
+
+
+def test_decode_revert_panic():
+    msg = ("Revert { output: 0x4e487b71"
+           "0000000000000000000000000000000000000000000000000000000000000011 }")
+    assert _decode_revert(msg) == "panic 0x11"
+
+
+def test_decode_revert_no_reason_and_unknown():
+    assert _decode_revert("Revert { output: 0x }") == \
+        "reverted without a reason string"
+    assert "selector 0xdeadbeef" in _decode_revert(
+        "Revert { output: 0xdeadbeef }")
+
+
+def test_rate_limited_retries_then_succeeds():
+    # message_call raises a rate-limit twice, then succeeds; the helper
+    # should back off (injected no-op sleep) and return the logs.
+    class _Flaky:
+        attempts = 0
+        def __init__(self, fork_url=None): pass
+        def message_call(self, **kw):
+            _Flaky.attempts += 1
+            if _Flaky.attempts < 3:
+                raise RuntimeError(
+                    'JsonRpcError { code: 15, message: "Too many request" }')
+            self.result = SimpleNamespace(logs=[
+                _FakeLog(USDC, [TRANSFER], b"\x01")])
+    delays = []
+    logs = simulate_logs(CHAIN, FROM, USDC, "0x", 0, evm_cls=_Flaky,
+                         sleep=delays.append)
+    assert _Flaky.attempts == 3        # two failures + one success
+    assert len(delays) == 2            # backed off before each retry
+    assert logs and len(logs) == 1
+
+
+def test_rate_limited_gives_up_after_retries():
+    class _AlwaysLimited:
+        def __init__(self, fork_url=None): pass
+        def message_call(self, **kw):
+            raise RuntimeError('code: 15, message: "Too many request"')
+    logs = simulate_logs(CHAIN, FROM, USDC, "0x", 0, evm_cls=_AlwaysLimited,
+                         retries=3, sleep=lambda d: None)
+    assert logs is None
+
+
+def test_revert_is_not_retried():
+    # A genuine revert must fail fast — no backoff, single attempt.
+    class _Reverter:
+        attempts = 0
+        def __init__(self, fork_url=None): pass
+        def message_call(self, **kw):
+            _Reverter.attempts += 1
+            raise RuntimeError("Revert { output: 0x }")
+    delays = []
+    assert simulate_logs(CHAIN, FROM, USDC, "0x", 0, evm_cls=_Reverter,
+                         sleep=delays.append) is None
+    assert _Reverter.attempts == 1 and delays == []
+
+
+def test_injected_evm_skips_networked_block_env():
+    # With evm_cls injected the helper must not touch the network for a
+    # block env — _FakeEVM has no set_block_env and a fork_url to nowhere.
+    _FakeEVM.seen = {}
+    logs = simulate_logs(CHAIN, FROM, USDC, "0xa9059cbb", 0, evm_cls=_FakeEVM)
+    assert logs and "block" not in _FakeEVM.seen   # no set_block_env call
