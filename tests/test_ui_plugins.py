@@ -2101,19 +2101,19 @@ class TestDetailsEventsView:
 
     def test_default_filters_to_our_transfers(self, qtbot, tmp_qeth):
         dlg = self._dialog(qtbot)
-        dlg._on_logs_ready(self._logs())
-        text = dlg.events_view.toPlainText()
+        dlg._events.set_logs(self._logs())
+        text = dlg._events.events_view.toPlainText()
         assert "Transfer(" in text
         assert ADDR.lower() in text.lower()
         assert "Approval(" not in text          # stranger approval hidden
         assert "unknown event" not in text       # unknown hidden by default
-        assert dlg.show_all_events_btn.isEnabled()
+        assert dlg._events.show_all_events_btn.isEnabled()
 
     def test_show_all_reveals_every_event(self, qtbot, tmp_qeth):
         dlg = self._dialog(qtbot)
-        dlg._on_logs_ready(self._logs())
-        dlg._on_show_all_events(True)
-        text = dlg.events_view.toPlainText()
+        dlg._events.set_logs(self._logs())
+        dlg._events._on_show_all_events(True)
+        text = dlg._events.events_view.toPlainText()
         assert "Transfer(" in text
         assert "Approval(" in text               # now visible
         assert "unknown event" in text           # raw fallback
@@ -2126,18 +2126,18 @@ class TestDetailsEventsView:
         log = {"address": contract,
                "topics": [topic, "0x" + "00" * 12 + ADDR[2:]],
                "data": "0x" + f"{42:064x}"}
-        dlg._on_logs_ready([log])
-        dlg._on_show_all_events(True)
+        dlg._events.set_logs([log])
+        dlg._events._on_show_all_events(True)
         # Not cached → renders raw and a fetch is kicked for the contract.
-        assert "unknown event" in dlg.events_view.toPlainText()
-        assert contract in dlg._abi_inflight
+        assert "unknown event" in dlg._events.events_view.toPlainText()
+        assert contract in dlg._events._abi_inflight
         # Simulate the ABI landing → the event is named + decoded.
         abi = [{"type": "event", "name": "Deposit", "anonymous": False,
                 "inputs": [
                     {"name": "dst", "type": "address", "indexed": True},
                     {"name": "wad", "type": "uint256", "indexed": False}]}]
-        dlg._on_event_abi_ready(contract, abi)
-        text = dlg.events_view.toPlainText()
+        dlg._events._on_event_abi_ready(contract, abi)
+        text = dlg._events.events_view.toPlainText()
         assert "Deposit(" in text and "dst" in text and "wad" in text
         assert "unknown event" not in text
 
@@ -2152,14 +2152,14 @@ class TestDetailsEventsView:
         from qeth.abi import _TRANSFER_TOPIC, _APPROVAL_TOPIC
         def ta(a): return "0x" + "00" * 12 + a[2:]
         max_uint = (1 << 256) - 1
-        dlg._on_logs_ready([
+        dlg._events.set_logs([
             {"address": usdc, "topics": [_TRANSFER_TOPIC, ta("0x" + "bb" * 20),
                                           ta(ADDR)], "data": "0x" + f"{5_000_000:064x}"},
             {"address": usdc, "topics": [_APPROVAL_TOPIC, ta(ADDR),
                                           ta("0x" + "cc" * 20)],
              "data": "0x" + f"{max_uint:064x}"},
         ])
-        text = dlg.events_view.toPlainText()
+        text = dlg._events.events_view.toPlainText()
         assert "# 5 USDC" in text                 # transfer amount
         assert "# unlimited USDC" in text          # max approval
 
@@ -2170,5 +2170,5 @@ class TestDetailsEventsView:
             SimpleNamespace(symbol="USDC") if a.lower() == usdc else None
         )
         dlg = self._dialog(qtbot, token_info=token_info)
-        dlg._on_logs_ready(self._logs())
-        assert "USDC" in dlg.events_view.toPlainText()
+        dlg._events.set_logs(self._logs())
+        assert "USDC" in dlg._events.events_view.toPlainText()

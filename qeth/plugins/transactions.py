@@ -1637,6 +1637,193 @@ class LogsFetchWorker(QThread):
         self.ready.emit(out)
 
 
+class _EventsView(QWidget):
+    """Reusable events pane: decode logs (from a receipt or a local
+    simulation) and render them Python-style — default view keeps
+    Transfer/Approval events touching one of our wallets, a toggle shows
+    everything, own addresses are bold+italic, known-token contracts are
+    prefixed with their logo + symbol, and fungible amounts get the
+    human-readable ``# 5000 USDC`` comment. Non-Transfer/Approval events
+    are named via their contract's ABI, fetched lazily on "Show all".
+
+    The host feeds logs with ``set_logs`` (or a placeholder string with
+    ``set_placeholder``); everything else is self-contained."""
+
+    def __init__(self, *, chain, known_addresses, token_info, icon_cache,
+                 abi_source, abi_cache, start_worker, parent=None):
+        super().__init__(parent)
+        self.chain = chain
+        self._known_addresses = {a.lower() for a in (known_addresses or ())}
+        self._token_info = token_info
+        self._icon_cache = icon_cache
+        self._abi_source = abi_source
+        self._abi_cache = abi_cache
+        self._start_worker = start_worker
+        self._logs: list = []
+        self._show_all_events = False
+        self._event_abis: dict = {}
+        self._abi_inflight: set = set()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Events:"))
+        header.addStretch(1)
+        self.show_all_events_btn = QPushButton("Show &all events")
+        self.show_all_events_btn.setCheckable(True)
+        self.show_all_events_btn.setEnabled(False)
+        self.show_all_events_btn.toggled.connect(self._on_show_all_events)
+        header.addWidget(self.show_all_events_btn)
+        lay.addLayout(header)
+        self.events_view = QTextEdit()
+        self.events_view.setReadOnly(True)
+        self.events_view.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.events_view.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.events_view.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding,
+        )
+        lay.addWidget(self.events_view, 1)
+
+    def set_placeholder(self, text: str) -> None:
+        self.events_view.setPlainText(text)
+        self.show_all_events_btn.setEnabled(False)
+
+    def set_logs(self, logs) -> None:
+        self._logs = logs or []
+        self.show_all_events_btn.setEnabled(bool(self._logs))
+        if self._show_all_events:
+            self._ensure_event_abis()
+        self._render_events_view()
+
+    def _on_show_all_events(self, checked: bool) -> None:
+        self._show_all_events = checked
+        if checked:
+            self._ensure_event_abis()
+        self._render_events_view()
+
+    def _ensure_event_abis(self) -> None:
+        """For each contract whose event we couldn't name from a known
+        signature, grab its ABI — from the local cache if present, else
+        a lazy Blockscout fetch. Events re-render as ABIs land."""
+        for lg in self._logs:
+            if decode_event(lg) is not None:
+                continue   # Transfer/Approval-family — no ABI needed
+            addr = (lg.get("address") or "").lower()
+            if (not addr or addr in self._event_abis
+                    or addr in self._abi_inflight):
+                continue
+            cached = self._abi_cache.load(self.chain.chain_id, addr)
+            if cached is not None:
+                self._event_abis[addr] = cached if cached else None
+                continue
+            self._abi_inflight.add(addr)
+            worker = AbiFetchWorker(
+                self._abi_source, self._abi_cache, self.chain.chain_id, addr,
+            )
+            worker.ready.connect(
+                lambda abi, a=addr: self._on_event_abi_ready(a, abi)
+            )
+            self._start_worker(worker)
+
+    def _on_event_abi_ready(self, addr: str, abi) -> None:
+        self._abi_inflight.discard(addr)
+        self._event_abis[addr] = abi if abi else None
+        if self._show_all_events:
+            self._render_events_view()
+
+    def _event_touches_ours(self, decoded: dict) -> bool:
+        for a in decoded.get("args") or []:
+            if (a.get("type") == "address"
+                    and str(a.get("value", "")).lower() in self._known_addresses):
+                return True
+        return False
+
+    def _token_prefix_html(self, doc, contract: str) -> str:
+        if self._token_info is None or not contract:
+            return ""
+        entry = self._token_info(self.chain.chain_id, contract)
+        if entry is None:
+            return ""
+        img = ""
+        if self._icon_cache is not None:
+            pix = self._icon_cache.get(self.chain.chain_id, contract)
+            if pix is not None and not pix.isNull():
+                url = f"tok:{contract.lower()}"
+                doc.addResource(QTextDocument.ImageResource, QUrl(url), pix)
+                img = f'<img src="{url}" width="14" height="14"> '
+        return f'{img}<b>{_escape_html(entry.symbol)}</b> '
+
+    def _render_events_view(self) -> None:
+        rendered: list[tuple] = []   # (decoded_or_None, raw_log)
+        for lg in self._logs:
+            abi = self._event_abis.get((lg.get("address") or "").lower())
+            decoded = decode_event(lg, abi)
+            if self._show_all_events:
+                rendered.append((decoded, lg))
+            elif (decoded is not None
+                    and decoded["event"] in KNOWN_EVENT_NAMES
+                    and self._event_touches_ours(decoded)):
+                rendered.append((decoded, lg))
+        if not rendered:
+            self.events_view.setPlainText(
+                "(no events) — showing all may reveal more"
+                if not self._show_all_events else "(no events in this transaction)"
+            )
+            return
+        doc = self.events_view.document()
+        # Bold-capable monospace family so <b> on names/own addresses
+        # renders bold (the generic "monospace" alias is Regular-only on
+        # Linux and would fall back to faux/no-bold).
+        mono = _pick_mono_font()
+        self.events_view.setFont(mono)
+        parts = [
+            f'<div style="white-space: pre-wrap; word-break: break-all; '
+            f"font-family: '{mono.family()}', monospace;\">"
+        ]
+        for i, (decoded, lg) in enumerate(rendered):
+            parts.append(self._event_html(decoded, lg, doc))
+            if i != len(rendered) - 1:
+                parts.append("\n")
+        parts.append("</div>")
+        self.events_view.setHtml("".join(parts))
+
+    def _event_html(self, decoded, lg, doc) -> str:
+        contract = (decoded or lg).get("contract") or lg.get("address") or "?"
+        contract_span = (
+            f'<span style="color:{_TYPE_COLOR};">{_escape_html(contract)}</span>'
+        )
+        prefix = self._token_prefix_html(doc, contract)
+        if decoded is None:
+            topic0 = (lg.get("topics") or ["?"])[0]
+            return (
+                f"{prefix}{contract_span}.<b>(unknown event)</b>("
+                f"topic0 = {_escape_html(str(topic0))}\n)\n"
+            )
+        head = f"{prefix}{contract_span}.<b>{_escape_html(decoded['event'])}</b>(\n"
+        args = decoded.get("args") or []
+        token_context = self._event_token_context(contract, decoded)
+        body = "".join(
+            _arg_html(a, indent=1, last=(j == len(args) - 1),
+                       token_context=token_context,
+                       known_addresses=self._known_addresses)
+            for j, a in enumerate(args)
+        )
+        return head + body + ")\n"
+
+    def _event_token_context(self, contract: str, decoded: dict):
+        if (self._token_info is None
+                or decoded.get("event") not in ("Transfer", "Approval")):
+            return None
+        if not any(a.get("name") == "value" for a in decoded.get("args") or []):
+            return None   # ERC-721 (tokenId) — not an amount
+        entry = self._token_info(self.chain.chain_id, contract)
+        decimals = getattr(entry, "decimals", None) if entry else None
+        if decimals is None:
+            return None
+        return {"symbol": entry.symbol, "decimals": decimals}
+
+
 class TransactionDetailsDialog(QDialog):
     """Modal-ish dialog showing the full tx record.
 
@@ -1800,31 +1987,13 @@ class TransactionDetailsDialog(QDialog):
         # Events tab — the receipt's logs, decoded. Default view is
         # Transfer/Approval events touching one of the user's wallets;
         # the toggle reveals everything else.
-        self._logs: list = []
-        self._show_all_events = False
-        # Per-emitting-contract ABIs for naming non-Transfer/Approval
-        # events, fetched lazily on "Show all". None = unverified / no
-        # ABI (so the event renders raw). _abi_inflight dedupes fetches.
-        self._event_abis: dict = {}
-        self._abi_inflight: set = set()
-        ev_header = QHBoxLayout()
-        ev_header.addWidget(QLabel("Events:"))
-        ev_header.addStretch(1)
-        self.show_all_events_btn = QPushButton("Show &all events")
-        self.show_all_events_btn.setCheckable(True)
-        self.show_all_events_btn.setEnabled(False)
-        self.show_all_events_btn.toggled.connect(self._on_show_all_events)
-        ev_header.addWidget(self.show_all_events_btn)
-        events_layout.addLayout(ev_header)
-        self.events_view = QTextEdit()
-        self.events_view.setReadOnly(True)
-        self.events_view.setFont(mono)
-        self.events_view.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.events_view.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-        self.events_view.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Expanding,
+        self._events = _EventsView(
+            chain=chain, known_addresses=known_addresses,
+            token_info=self._token_info, icon_cache=self._icon_cache,
+            abi_source=self._abi_source, abi_cache=self._abi_cache,
+            start_worker=self._start_worker,
         )
-        events_layout.addWidget(self.events_view, 1)
+        events_layout.addWidget(self._events, 1)
 
         # Buttons row: Explorer + Close.
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -1861,158 +2030,12 @@ class TransactionDetailsDialog(QDialog):
         # Events only exist on a mined tx — pending/dropped have no
         # receipt yet, so skip the fetch for those.
         if tx.pending or getattr(tx, "dropped", False):
-            self.events_view.setPlainText("(no events — transaction not mined)")
+            self._events.set_placeholder("(no events — transaction not mined)")
         else:
-            self.events_view.setPlainText("(loading events…)")
+            self._events.set_placeholder("(loading events…)")
             logs_worker = LogsFetchWorker(chain, tx.hash)
-            logs_worker.ready.connect(self._on_logs_ready)
+            logs_worker.ready.connect(self._events.set_logs)
             self._start_worker(logs_worker)
-
-    def _on_logs_ready(self, logs) -> None:
-        self._logs = logs or []
-        self.show_all_events_btn.setEnabled(bool(self._logs))
-        self._render_events_view()
-
-    def _on_show_all_events(self, checked: bool) -> None:
-        self._show_all_events = checked
-        if checked:
-            self._ensure_event_abis()
-        self._render_events_view()
-
-    def _ensure_event_abis(self) -> None:
-        """For each contract whose event we couldn't name from a known
-        signature, grab its ABI — from the local cache if present, else
-        a lazy Blockscout fetch. Events re-render as ABIs land."""
-        for lg in self._logs:
-            if decode_event(lg) is not None:
-                continue   # Transfer/Approval-family — no ABI needed
-            addr = (lg.get("address") or "").lower()
-            if (not addr or addr in self._event_abis
-                    or addr in self._abi_inflight):
-                continue
-            cached = self._abi_cache.load(self.chain.chain_id, addr)
-            if cached is not None:
-                # Verified ABI list, or the False "unverified" sentinel
-                # → store the ABI (or None so we don't re-fetch).
-                self._event_abis[addr] = cached if cached else None
-                continue
-            self._abi_inflight.add(addr)
-            worker = AbiFetchWorker(
-                self._abi_source, self._abi_cache, self.chain.chain_id, addr,
-            )
-            worker.ready.connect(
-                lambda abi, a=addr: self._on_event_abi_ready(a, abi)
-            )
-            self._start_worker(worker)
-
-    def _on_event_abi_ready(self, addr: str, abi) -> None:
-        self._abi_inflight.discard(addr)
-        self._event_abis[addr] = abi if abi else None
-        if self._show_all_events:
-            self._render_events_view()
-
-    def _event_touches_ours(self, decoded: dict) -> bool:
-        for a in decoded.get("args") or []:
-            if (a.get("type") == "address"
-                    and str(a.get("value", "")).lower() in self._known_addresses):
-                return True
-        return False
-
-    def _token_prefix_html(self, doc, contract: str) -> str:
-        """``[logo] SYMBOL `` prefix when the emitting contract is a
-        known token — empty otherwise. The logo is registered as a
-        document image resource and referenced inline."""
-        if self._token_info is None or not contract:
-            return ""
-        entry = self._token_info(self.chain.chain_id, contract)
-        if entry is None:
-            return ""
-        img = ""
-        if self._icon_cache is not None:
-            pix = self._icon_cache.get(self.chain.chain_id, contract)
-            if pix is not None and not pix.isNull():
-                url = f"tok:{contract.lower()}"
-                doc.addResource(QTextDocument.ImageResource, QUrl(url), pix)
-                img = f'<img src="{url}" width="14" height="14"> '
-        return f'{img}<b>{_escape_html(entry.symbol)}</b> '
-
-    def _render_events_view(self) -> None:
-        # Decode each log; default view keeps only Transfer/Approval-
-        # family events that touch one of our wallets, the toggle shows
-        # everything (decodable events rendered, the rest raw).
-        rendered: list[tuple] = []   # (decoded_or_None, raw_log)
-        for lg in self._logs:
-            abi = self._event_abis.get((lg.get("address") or "").lower())
-            decoded = decode_event(lg, abi)
-            if self._show_all_events:
-                rendered.append((decoded, lg))
-            elif (decoded is not None
-                    and decoded["event"] in KNOWN_EVENT_NAMES
-                    and self._event_touches_ours(decoded)):
-                rendered.append((decoded, lg))
-        if not rendered:
-            self.events_view.setPlainText(
-                "(no events) — showing all may reveal more"
-                if not self._show_all_events else "(no events in this transaction)"
-            )
-            return
-        doc = self.events_view.document()
-        # Use a monospace family that actually ships a Bold style, so the
-        # <b> on event names / own addresses renders bold rather than
-        # the faux/no-bold the generic "monospace" alias gives on Linux.
-        mono = _pick_mono_font()
-        self.events_view.setFont(mono)
-        parts = [
-            f'<div style="white-space: pre-wrap; word-break: break-all; '
-            f"font-family: '{mono.family()}', monospace;\">"
-        ]
-        for i, (decoded, lg) in enumerate(rendered):
-            parts.append(self._event_html(decoded, lg, doc))
-            if i != len(rendered) - 1:
-                parts.append("\n")
-        parts.append("</div>")
-        self.events_view.setHtml("".join(parts))
-
-    def _event_html(self, decoded, lg, doc) -> str:
-        contract = (decoded or lg).get("contract") or lg.get("address") or "?"
-        contract_span = (
-            f'<span style="color:{_TYPE_COLOR};">{_escape_html(contract)}</span>'
-        )
-        prefix = self._token_prefix_html(doc, contract)
-        if decoded is None:
-            # Undecodable (no known signature, no ABI) — show it raw.
-            topic0 = (lg.get("topics") or ["?"])[0]
-            return (
-                f"{prefix}{contract_span}.<b>(unknown event)</b>("
-                f"topic0 = {_escape_html(str(topic0))}\n)\n"
-            )
-        head = f"{prefix}{contract_span}.<b>{_escape_html(decoded['event'])}</b>(\n"
-        args = decoded.get("args") or []
-        # Annotate the fungible amount with its human-readable form
-        # (`# 5000 USDC`, `# unlimited USDC`) — same as the calldata view.
-        # Only for Transfer/Approval whose amount arg is named "value"
-        # (an ERC-721 "tokenId" is an id, not an amount) and when the
-        # emitting contract is a known token with decimals.
-        token_context = self._event_token_context(contract, decoded)
-        body = "".join(
-            _arg_html(a, indent=1, last=(j == len(args) - 1),
-                       token_context=token_context,
-                       known_addresses=self._known_addresses)
-            for j, a in enumerate(args)
-        )
-        return head + body + ")\n"
-
-    def _event_token_context(self, contract: str, decoded: dict):
-        if (self._token_info is None
-                or decoded.get("event") not in ("Transfer", "Approval")):
-            return None
-        if not any(a.get("name") == "value" for a in decoded.get("args") or []):
-            return None   # ERC-721 (tokenId) — not an amount
-        entry = self._token_info(self.chain.chain_id, contract)
-        decimals = getattr(entry, "decimals", None) if entry else None
-        if decimals is None:
-            return None
-        return {"symbol": entry.symbol, "decimals": decimals}
 
     def _on_abi_ready(self, abi) -> None:
         if abi is False:
