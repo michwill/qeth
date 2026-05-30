@@ -1424,6 +1424,13 @@ class TransactionListPanel(QWidget):
         for tx in reversed(txs):
             self.table.insertRow(0)
             self._populate_row(0, tx)
+        # insertRow(0) can leave the view's *current* index on the new
+        # (0,0) status cell, drawing a stray focus outline on the icon
+        # until the next full rebuild (confirm / tab switch). Clear the
+        # current index — any real row selection is preserved.
+        sm = self.table.selectionModel()
+        if sm is not None:
+            sm.clearCurrentIndex()
 
     def update_tx_by_hash(self, tx: Transaction) -> bool:
         """Repaint a single row in place when its tx has been

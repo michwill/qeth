@@ -250,6 +250,20 @@ class TestTransactionListPanel:
         # double-click without re-looking-up the cache).
         assert hash_cell.data(Qt.UserRole) is tx
 
+    def test_prepend_clears_stray_current_index(self, qtbot, tmp_qeth):
+        """Inserting a pending row at the top must not leave the view's
+        current index on the new (0,0) status cell — that draws a stray
+        focus outline on the icon until the next rebuild."""
+        panel = TransactionListPanel()
+        qtbot.addWidget(panel)
+        panel.set_context(ETH, ADDR)
+        panel.show_transactions([_tx(nonce=5), _tx(nonce=4)])
+        panel.table.setCurrentCell(0, 0)          # simulate the stray current
+        assert panel.table.currentIndex().isValid()
+        panel.prepend_transactions([_tx(nonce=6, pending=True)])
+        assert not panel.table.currentIndex().isValid()
+        assert panel.table.rowCount() == 3
+
     def test_failed_tx_marked_with_cross(self, qtbot, tmp_qeth):
         panel = TransactionListPanel()
         qtbot.addWidget(panel)
