@@ -330,3 +330,142 @@ def _stringify(value, type_hint: Optional[str] = None) -> str:
     if type_hint == "string" and isinstance(value, str):
         return '"' + value + '"'
     return str(value)
+
+
+# --- event-log decoding ---------------------------------------------------
+#
+# Decode a receipt log into the same {name, type, value} arg shape that
+# decode_call produces, so the UI can render events with the very same
+# Python-style renderer. The common ERC-20/721 Transfer/Approval events
+# decode from their well-known signatures with no ABI; anything else
+# decodes only when the emitting contract's ABI is supplied.
+
+
+def _event_topic0(signature: str) -> str:
+    from eth_utils import keccak
+    return "0x" + keccak(text=signature).hex()
+
+
+_TRANSFER_TOPIC = _event_topic0("Transfer(address,address,uint256)")
+_APPROVAL_TOPIC = _event_topic0("Approval(address,address,uint256)")
+_APPROVAL_FOR_ALL_TOPIC = _event_topic0("ApprovalForAll(address,address,bool)")
+
+# Events the default (filtered) view recognises without an ABI.
+KNOWN_EVENT_NAMES = frozenset({"Transfer", "Approval", "ApprovalForAll"})
+
+
+def _norm_topic(t) -> str:
+    if hasattr(t, "hex"):
+        h = t.hex()
+        return (h if h.startswith("0x") else "0x" + h).lower()
+    return str(t).lower()
+
+
+def _addr_from_topic(t: str) -> str:
+    from eth_utils import to_checksum_address
+    return to_checksum_address("0x" + t[-40:])
+
+
+def _u256(data: str) -> int:
+    d = data[2:] if data.startswith("0x") else data
+    return int(d[:64], 16) if d else 0
+
+
+def _ev(address, name, args) -> dict:
+    return {
+        "contract": address,
+        "event": name,
+        "args": [{"name": n, "type": t, "value": v} for n, t, v in args],
+    }
+
+
+def _decode_known_event(address, topics: list, data: str) -> Optional[dict]:
+    t0 = topics[0]
+    if t0 == _TRANSFER_TOPIC and len(topics) == 3:        # ERC-20
+        return _ev(address, "Transfer", [
+            ("from", "address", _addr_from_topic(topics[1])),
+            ("to", "address", _addr_from_topic(topics[2])),
+            ("value", "uint256", str(_u256(data)))])
+    if t0 == _TRANSFER_TOPIC and len(topics) == 4:        # ERC-721
+        return _ev(address, "Transfer", [
+            ("from", "address", _addr_from_topic(topics[1])),
+            ("to", "address", _addr_from_topic(topics[2])),
+            ("tokenId", "uint256", str(int(topics[3], 16)))])
+    if t0 == _APPROVAL_TOPIC and len(topics) == 3:        # ERC-20
+        return _ev(address, "Approval", [
+            ("owner", "address", _addr_from_topic(topics[1])),
+            ("spender", "address", _addr_from_topic(topics[2])),
+            ("value", "uint256", str(_u256(data)))])
+    if t0 == _APPROVAL_TOPIC and len(topics) == 4:        # ERC-721
+        return _ev(address, "Approval", [
+            ("owner", "address", _addr_from_topic(topics[1])),
+            ("approved", "address", _addr_from_topic(topics[2])),
+            ("tokenId", "uint256", str(int(topics[3], 16)))])
+    if t0 == _APPROVAL_FOR_ALL_TOPIC and len(topics) == 3:
+        return _ev(address, "ApprovalForAll", [
+            ("owner", "address", _addr_from_topic(topics[1])),
+            ("operator", "address", _addr_from_topic(topics[2])),
+            ("approved", "bool", str(bool(_u256(data))))])
+    return None
+
+
+def _decode_event_with_abi(address, log, abi: Abi) -> Optional[dict]:
+    try:
+        from web3 import Web3
+        from hexbytes import HexBytes
+        w3 = Web3()
+        events_abi = [e for e in abi if e.get("type") == "event"]
+        if not events_abi:
+            return None
+        contract = w3.eth.contract(abi=events_abi)
+        entry = {
+            "address": address,
+            "topics": [HexBytes(t) for t in (log.get("topics") or [])],
+            "data": HexBytes(log.get("data") or "0x"),
+            "logIndex": 0, "transactionIndex": 0,
+            "transactionHash": HexBytes(b""), "blockHash": HexBytes(b""),
+            "blockNumber": 0,
+        }
+        for ev in contract.events:
+            try:
+                decoded = ev().process_log(entry)
+            except Exception:
+                continue
+            name = decoded["event"]
+            ev_abi = next(
+                (e for e in events_abi if e.get("name") == name), None
+            )
+            inputs = (ev_abi or {}).get("inputs", []) or []
+            args = [
+                _describe(decoded["args"].get(inp.get("name")), inp)
+                for inp in inputs
+            ]
+            return {"contract": address, "event": name, "args": args}
+    except Exception:
+        return None
+    return None
+
+
+def decode_event(log, abi: Optional[Abi] = None) -> Optional[dict]:
+    """Decode one receipt ``log`` into
+
+        {"contract": "0x…", "event": "Transfer",
+         "args": [{"name": "from", "type": "address", "value": "0x…"}, …]}
+
+    Transfer / Approval / ApprovalForAll decode from their well-known
+    signatures with no ABI. Any other event decodes only when ``abi``
+    (the emitting contract's ABI) is supplied. Returns ``None`` when it
+    can't be decoded (caller can fall back to a raw display)."""
+    topics = [_norm_topic(t) for t in (log.get("topics") or [])]
+    if not topics:
+        return None
+    data = log.get("data") or "0x"
+    if hasattr(data, "hex"):
+        data = "0x" + data.hex()
+    address = log.get("address")
+    known = _decode_known_event(address, topics, data)
+    if known is not None:
+        return known
+    if abi:
+        return _decode_event_with_abi(address, log, abi)
+    return None

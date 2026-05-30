@@ -337,3 +337,79 @@ class TestStringify:
         from qeth.abi import _stringify
         addr = "0x7a16fF8270133F063aAb6C9977183D9e72835428"
         assert _stringify(addr, type_hint="address") == addr
+
+
+# --- event-log decoding ---------------------------------------------------
+
+from qeth.abi import decode_event, _TRANSFER_TOPIC, _APPROVAL_TOPIC, _event_topic0
+
+A = "0x" + "11" * 20
+B = "0x" + "22" * 20
+CONTRACT = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+
+def _topic_addr(addr: str) -> str:
+    return "0x000000000000000000000000" + addr[2:]
+
+
+def _u256_data(n: int) -> str:
+    return "0x" + f"{n:064x}"
+
+
+class TestDecodeEvent:
+    def test_erc20_transfer_without_abi(self):
+        log = {"address": CONTRACT,
+               "topics": [_TRANSFER_TOPIC, _topic_addr(A), _topic_addr(B)],
+               "data": _u256_data(100)}
+        ev = decode_event(log)
+        assert ev["event"] == "Transfer"
+        assert ev["contract"] == CONTRACT
+        names = [(a["name"], a["type"], a["value"].lower()) for a in ev["args"]]
+        assert names == [
+            ("from", "address", A), ("to", "address", B),
+            ("value", "uint256", "100"),
+        ]
+
+    def test_erc721_transfer_has_tokenid(self):
+        log = {"address": CONTRACT,
+               "topics": [_TRANSFER_TOPIC, _topic_addr(A), _topic_addr(B),
+                          _u256_data(7)],
+               "data": "0x"}
+        ev = decode_event(log)
+        assert [a["name"] for a in ev["args"]] == ["from", "to", "tokenId"]
+        assert ev["args"][2]["value"] == "7"
+
+    def test_erc20_approval_without_abi(self):
+        log = {"address": CONTRACT,
+               "topics": [_APPROVAL_TOPIC, _topic_addr(A), _topic_addr(B)],
+               "data": _u256_data(5)}
+        ev = decode_event(log)
+        assert ev["event"] == "Approval"
+        assert [a["name"] for a in ev["args"]] == ["owner", "spender", "value"]
+
+    def test_unknown_event_without_abi_is_none(self):
+        log = {"address": CONTRACT, "topics": ["0x" + "de" * 32], "data": "0x"}
+        assert decode_event(log) is None
+
+    def test_unknown_event_decodes_with_abi(self):
+        topic = _event_topic0("Deposit(address,uint256)")
+        log = {"address": CONTRACT,
+               "topics": [topic, _topic_addr(A)], "data": _u256_data(123)}
+        abi = [{"type": "event", "name": "Deposit", "anonymous": False,
+                "inputs": [
+                    {"name": "dst", "type": "address", "indexed": True},
+                    {"name": "wad", "type": "uint256", "indexed": False}]}]
+        ev = decode_event(log, abi)
+        assert ev["event"] == "Deposit"
+        assert ev["args"][0]["name"] == "dst"
+        assert ev["args"][0]["value"].lower() == A
+        assert ev["args"][1] == {"name": "wad", "type": "uint256", "value": "123"}
+
+    def test_handles_hexbytes_topics(self):
+        from hexbytes import HexBytes
+        log = {"address": CONTRACT,
+               "topics": [HexBytes(_TRANSFER_TOPIC), HexBytes(_topic_addr(A)),
+                          HexBytes(_topic_addr(B))],
+               "data": HexBytes(_u256_data(1))}
+        ev = decode_event(log)
+        assert ev["event"] == "Transfer" and ev["args"][2]["value"] == "1"
