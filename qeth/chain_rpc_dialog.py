@@ -329,11 +329,11 @@ class ChainRpcDialog(QDialog):
                 "Enter a URL manually above."
             )
         else:
-            line2 = (f"\n⚡ marks the {n_sim} supporting eth_simulateV1 "
-                     f"(fast tx-event previews)." if n_sim else "")
+            line2 = (f"\n⚡ marks the {n_sim} supporting tx simulation"
+                     if n_sim else "")
             self.status_lbl.setText(
-                f"{len(survivors)} reachable endpoint(s), simulateV1 first "
-                f"then by latency — click one to fill the URL field."
+                f"{len(survivors)} reachable endpoint(s), from best to worst "
+                f"by simulation ability and latency"
                 + line2
             )
 
