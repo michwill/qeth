@@ -554,6 +554,37 @@ def _is_full_history(txs: list[Transaction]) -> bool:
     return 0 in nonces and len(nonces) == max(nonces) + 1
 
 
+class NonceCheckWorker(QThread):
+    """Fetch the sender's on-chain transaction count (its next nonce).
+    When that exceeds the highest nonce in our recorded history, a tx was
+    sent from another wallet client — we never saw it, but the nonce gives
+    it away even though the explorer-backed history hasn't been re-fetched.
+    Cheap: one ``eth_getTransactionCount`` per poll. ``count`` is ``None``
+    on error (the poll is just skipped)."""
+
+    checked = Signal(object, object)   # (key, count | None)
+
+    def __init__(self, chain, address: str, key, parent=None):
+        super().__init__(parent)
+        self._chain = chain
+        self._address = address
+        self._key = key
+
+    def run(self) -> None:
+        try:
+            # "latest", not "pending": we want mined sends only — a
+            # pending count would include our own just-broadcast tx and
+            # trigger a spurious re-fetch. web3 wants a checksum address.
+            count = EthClient(self._chain).get_transaction_count(
+                to_checksum_address(self._address), "latest",
+            )
+        except Exception as e:
+            log.warning("nonce check failed for %s: %s", self._address, e)
+            self.checked.emit(self._key, None)
+            return
+        self.checked.emit(self._key, count)
+
+
 class TransactionsWorker(QThread):
     """Fetch ONE page of (sent) transactions from Blockscout.
 
@@ -621,6 +652,10 @@ class TransactionsPlugin(Plugin):
     # initial-walk paths. Independent of INITIAL_VISIBLE — this is
     # about the network round-trip budget, not the render budget.
     INITIAL_BATCH = 50
+    # How often to poll the current account's on-chain nonce to catch
+    # txs sent from another wallet client (NonceCheckWorker). One cheap
+    # RPC call; on a hit it re-fetches page 1 to pull the new tx in.
+    NONCE_POLL_INTERVAL_MS = 30_000
 
     def __init__(
         self,
@@ -687,6 +722,9 @@ class TransactionsPlugin(Plugin):
         # Wired in attach(); polls for receipts of broadcast txs whose
         # hashes are sitting in cache with pending=True.
         self._pending_watcher: Optional[PendingTxWatcher] = None
+        # Keys with a NonceCheckWorker in flight (coalesce polls).
+        self._nonce_in_flight: set[tuple[int, str]] = set()
+        self._nonce_timer: Optional[QTimer] = None
 
     # --- Plugin contract ----------------------------------------------------
 
@@ -694,6 +732,15 @@ class TransactionsPlugin(Plugin):
         super().attach(host)
         self._pending_watcher = PendingTxWatcher(self, parent=self)
         self._pending_watcher.start()
+        # Catch txs sent from another wallet client: the explorer-backed
+        # history only refreshes on tab/account/chain change (and the
+        # _is_full_history short-circuit means a "complete" cache never
+        # re-fetches), so an external send is otherwise invisible until
+        # something forces a refetch. Polling the nonce gives it away.
+        self._nonce_timer = QTimer(self)
+        self._nonce_timer.setInterval(self.NONCE_POLL_INTERVAL_MS)
+        self._nonce_timer.timeout.connect(self._poll_external_nonce)
+        self._nonce_timer.start()
 
     def widget(self) -> QWidget:
         if self._panel is None:
@@ -904,6 +951,45 @@ class TransactionsPlugin(Plugin):
             # is the user explicitly opening the tab.
             self._refresh(addr, force_fetch=True)
 
+    # --- external-send detection -------------------------------------------
+
+    def _poll_external_nonce(self) -> None:
+        """Timer tick: check the current account's on-chain nonce against
+        our history. Only the displayed account, one in-flight at a time."""
+        if self.host is None:
+            return
+        address = self.host.selected_address
+        if not address:
+            return
+        chain = self.host.current_chain()
+        key = (chain.chain_id, address.lower())
+        if key in self._nonce_in_flight:
+            return
+        self._nonce_in_flight.add(key)
+        worker = NonceCheckWorker(chain, address, key)
+        worker.checked.connect(self._on_external_nonce)
+        self.host.start_worker(worker)
+
+    def _on_external_nonce(self, key, count) -> None:
+        """``count`` = the chain's tx-sent count (next nonce), so the last
+        sent nonce is ``count - 1``. If that's beyond the highest nonce we
+        hold, a tx was sent elsewhere — drop the ``exhausted`` flag (our
+        'full history' assumption is now stale) and re-fetch page 1, which
+        merges + prepends the new row."""
+        self._nonce_in_flight.discard(key)
+        if count is None or self.host is None:
+            return
+        addr = self.host.selected_address
+        if addr is None:
+            return
+        if key != (self.host.current_chain().chain_id, addr.lower()):
+            return   # account/chain moved on since the poll started
+        cached = self._cache.get(key) or []
+        our_max = max((t.nonce for t in cached), default=-1)
+        if count - 1 > our_max:
+            self._exhausted.discard(key)
+            self._fetch_page(key, addr, page=1)
+
     # --- core --------------------------------------------------------------
 
     def _is_active(self) -> bool:
@@ -986,9 +1072,15 @@ class TransactionsPlugin(Plugin):
                 f"Transactions aren't available for {chain.name}."
             )
             return
+        # Check the on-chain nonce *now*, not just on the 30s timer — so
+        # opening / switching to an account immediately catches a tx sent
+        # from another client, even when the cache looks complete and the
+        # short-circuit below would otherwise skip the fetch.
+        self._poll_external_nonce()
         # If we already hold the wallet's full sent history (nonce 0
         # present + contiguous), there's nothing newer to refresh and
-        # nothing older to scroll for. Skip the network call.
+        # nothing older to scroll for. Skip the network call. (The nonce
+        # check above re-opens this if a send happened elsewhere.)
         if _is_full_history(cached or []):
             self._exhausted.add(key)
             return

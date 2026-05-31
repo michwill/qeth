@@ -44,6 +44,16 @@ class _StubHost:
 
 # --- TransactionsPlugin ----------------------------------------------------
 
+def _tx_send(*, nonce: int):
+    """A minimal sent Transaction (from ADDR) at a given nonce."""
+    return Transaction(
+        chain_id=1, hash="0x" + f"{nonce:064x}", block_number=1, timestamp=1,
+        nonce=nonce, from_addr=ADDR, to_addr="0xbeef",
+        value_wei=0, gas_used=0, gas_price_wei=0,
+        method_id="", input_data="0x", success=True,
+    )
+
+
 class TestTransactionsPlugin:
     def test_widget_returns_transaction_panel(self, qtbot, tmp_qeth):
         from qeth.plugins.transactions import TransactionListPanel
@@ -371,6 +381,69 @@ class TestTransactionsPlugin:
         # Now that cache is exhausted, next scroll goes to network.
         plugin._on_scroll_bottom()
         assert len(calls) == 1
+
+    def test_external_send_detected_by_nonce_refetches(self, qtbot, tmp_qeth):
+        """An on-chain nonce beyond our highest cached nonce means a tx was
+        sent from another client — re-fetch page 1 (clearing the
+        'exhausted' short-circuit) to pull it in."""
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        key = (ETH.chain_id, ADDR.lower())
+        # We hold a "complete" history up to nonce 4 and think we're done.
+        plugin._cache[key] = [_tx_send(nonce=n) for n in range(5)]
+        plugin._exhausted.add(key)
+        calls: list = []
+        plugin._fetch_page = lambda k, a, page, **kw: calls.append((k, a, page))
+
+        # Chain says 6 txs sent (nonces 0..5) → nonce 5 is new.
+        plugin._on_external_nonce(key, 6)
+        assert key not in plugin._exhausted        # short-circuit lifted
+        assert calls == [(key, ADDR, 1)]           # page-1 re-fetch kicked
+
+    def test_no_refetch_when_nonce_matches_history(self, qtbot, tmp_qeth):
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [_tx_send(nonce=n) for n in range(5)]  # 0..4
+        plugin._exhausted.add(key)
+        calls: list = []
+        plugin._fetch_page = lambda k, a, page, **kw: calls.append(1)
+        plugin._on_external_nonce(key, 5)          # count 5 → last sent = 4 = our max
+        assert calls == []                         # nothing new
+        assert key in plugin._exhausted            # untouched
+
+    def test_activation_kicks_immediate_nonce_check(self, qtbot, tmp_qeth):
+        """Opening the tab must nonce-check *now*, not wait for the 30s
+        timer — otherwise a complete-looking cache that's missing a tx
+        sent elsewhere stays stale until the first tick."""
+        from qeth.plugins.transactions import NonceCheckWorker
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        # A "complete" history (0..2) so the _is_full_history short-circuit
+        # would otherwise skip the fetch entirely.
+        plugin._cache[(ETH.chain_id, ADDR.lower())] = [
+            _tx_send(nonce=n) for n in range(3)
+        ]
+        host.started_workers.clear()
+        plugin.on_activated()
+        assert any(isinstance(w, NonceCheckWorker)
+                   for w in host.started_workers)
+
+    def test_nonce_poll_skips_when_no_account_or_error(self, qtbot, tmp_qeth):
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [_tx_send(nonce=0)]
+        calls: list = []
+        plugin._fetch_page = lambda *a, **kw: calls.append(1)
+        plugin._nonce_in_flight.add(key)
+        plugin._on_external_nonce(key, None)       # error result → no-op
+        assert calls == [] and key not in plugin._nonce_in_flight
 
     def test_render_decoded_lays_out_python_signature(self, qtbot, tmp_qeth):
         """Decoded calls render with type annotations and the function

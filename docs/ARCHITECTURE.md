@@ -708,6 +708,16 @@ a receipt poll), which matters because load-balanced RPCs like DRPC sometimes
    warning. `raw_signed` is public data (no key material), cleared on
    confirm/drop.
 
+**Txs sent from another client** are caught by a second poll
+(`NonceCheckWorker`, `NONCE_POLL_INTERVAL_MS` = 30s): it reads the displayed
+account's on-chain tx-count and, when the last sent nonce (`count − 1`) exceeds
+the highest nonce in our cached history, a send happened elsewhere that the
+explorer-backed list never refreshed (the `_is_full_history` short-circuit means
+a "complete" cache otherwise never re-fetches, even on tab open). It clears the
+`exhausted` flag and re-fetches page 1, which merges + prepends the new row. The
+check is nonce-based, so it only catches *outgoing* txs — which is exactly what
+this sent-only list shows.
+
 Status column renders themed icons with Unicode-glyph fallback (§5.3 pattern):
 `content-loading`/⏳ pending, `dialog-ok`/✓ success, `dialog-error`/✗ reverted,
 `user-trash`/⊘ dropped — never blank, tooltip carries the meaning.
