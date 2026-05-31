@@ -306,6 +306,53 @@ class TestApplyGasPolicy1559:
         assert out["max_priority_fee_per_gas"] == 50_000_000
         assert out["max_fee_per_gas"] == 100_000_000
 
+    def test_l2_tiny_base_fee_floors_tip_at_node_suggestion(self):
+        """OP-stack L2 (Optimism/Base): baseFee is a few hundred wei, so
+        baseFee × 0.05 underflows to a ~zero tip and the tx is
+        underpriced. The node's eth_maxPriorityFeePerGas is the real
+        floor; maxFee must cover base+tip (baseFee × 2 is a useless 578
+        wei here)."""
+        out = apply_gas_policy(
+            estimated_gas=21_000,
+            eip1559=True,
+            base_fee_wei=289,           # Optimism, live
+            gas_price_wei=0,
+            req=_req(),
+            max_priority_fee_wei=1_000_000,   # node tip ≈ 0.001 gwei
+        )
+        assert out["max_priority_fee_per_gas"] == 1_000_000  # not (289*5)//100 == 14
+        assert out["max_fee_per_gas"] == 289 + 1_000_000
+        assert out["max_fee_per_gas"] >= out["max_priority_fee_per_gas"]
+
+    def test_node_tip_ignored_when_below_five_percent_of_base(self):
+        """Ethereum: the node sometimes returns a nonsense tiny tip
+        (single-digit wei); baseFee × 0.05 dominates and is used, so the
+        floor doesn't disturb mainnet behaviour."""
+        out = apply_gas_policy(
+            estimated_gas=21_000,
+            eip1559=True,
+            base_fee_wei=20 * 10**9,
+            gas_price_wei=0,
+            req=_req(),
+            max_priority_fee_wei=11,    # DRPC's bogus mainnet value
+        )
+        assert out["max_priority_fee_per_gas"] == 10**9   # 5 % of 20 gwei
+        assert out["max_fee_per_gas"] == 40 * 10**9        # base × 2, unchanged
+
+    def test_base_zero_priority_floored_at_node_tip(self):
+        """baseFee == 0 and the node suggests a higher tip than gas_price
+        → use the node tip (doubled for the ceiling)."""
+        out = apply_gas_policy(
+            estimated_gas=21_000,
+            eip1559=True,
+            base_fee_wei=0,
+            gas_price_wei=50_000_000,
+            req=_req(),
+            max_priority_fee_wei=80_000_000,
+        )
+        assert out["max_priority_fee_per_gas"] == 80_000_000
+        assert out["max_fee_per_gas"] == 160_000_000
+
 
 class TestFormatUsd:
     """Adaptive precision so layer-2 fees in the sub-cent range

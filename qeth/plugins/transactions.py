@@ -2442,23 +2442,31 @@ def apply_gas_policy(
     base_fee_wei: int,
     gas_price_wei: int,
     req: SigningRequest,
+    max_priority_fee_wei: int = 0,
 ) -> dict:
     """Pure function: turn raw chain readings (gas estimate, current
-    base fee or gas price) into the suggested gas/fee values per
-    project policy.
+    base fee or gas price, node-suggested tip) into the suggested
+    gas/fee values per project policy.
 
     Policy:
 
       gas limit                = max(estimate × 1.5, dapp gas)
       EIP-1559 chain, baseFee > 0:
-        maxFeePerGas           = baseFee × 2  (≥ dapp's)
-        maxPriorityFeePerGas   = baseFee × 0.05  (ALWAYS — dapp's
-                                 value is ignored)
+        maxPriorityFeePerGas   = max(baseFee × 0.05, node tip)
+        maxFeePerGas           = max(baseFee × 2, baseFee + tip)  (≥ dapp's)
       EIP-1559 chain, baseFee == 0 (BSC-style):
-        maxFeePerGas           = gasPrice × 2  (≥ dapp's)
-        maxPriorityFeePerGas   = gasPrice (network's required minimum)
+        maxPriorityFeePerGas   = max(gasPrice, node tip)
+        maxFeePerGas           = tip × 2  (≥ dapp's)
       Legacy chain:
         gasPrice               = current × 1.35  (≥ dapp's)
+
+    The ``node tip`` floor (``max_priority_fee_wei``, from
+    ``eth_maxPriorityFeePerGas``) is what makes this work on OP-stack
+    L2s: there the base fee is a few hundred wei, so ``baseFee × 0.05``
+    underflows to a ~zero tip and the tx is underpriced. The node's
+    suggested tip (≈0.001 gwei) is the real floor. On Ethereum the node
+    value is unreliable (often single-digit wei) but ``baseFee × 0.05``
+    dominates, so ``max()`` picks the right signal on every chain.
 
     Dapp-supplied gas limit and maxFeePerGas act as a floor — we
     never silently lower these because they're safety buffers (a
@@ -2479,21 +2487,26 @@ def apply_gas_policy(
         if base_fee_wei > 0:
             # Ethereum-flavoured: baseFee already covers the bulk
             # of the cost, so a 5 % tip is a reasonable hint to
-            # validators.
+            # validators…
             ref = base_fee_wei
-            max_fee = ref * 2
             priority = (ref * 5) // 100
+            # …but on OP-stack L2s baseFee is ~0, so 5 % underflows the
+            # tip; floor it at the node's own suggested minimum.
+            priority = max(priority, max_priority_fee_wei)
+            # 2× base fee for spike headroom, but never below base+tip —
+            # that's what binds when the base fee is negligible.
+            max_fee = max(ref * 2, ref + priority)
         else:
             # baseFee == 0 (BNB Smart Chain and friends): the
             # network's reported gas_price IS the mandatory
             # minimum priority fee. Taking 5 % of it lands the tx
             # under the chain's accept threshold — BSC rejects
             # outright with "gas tip cap below minimum needed".
-            # Use gas_price as the priority floor and double it
-            # as the max_fee ceiling.
+            # Use gas_price (floored at the node tip) as the priority,
+            # doubled as the max_fee ceiling.
             ref = gas_price_wei
-            max_fee = ref * 2
-            priority = ref
+            priority = max(ref, max_priority_fee_wei)
+            max_fee = priority * 2
         if (req.max_fee_per_gas is not None
                 and req.max_fee_per_gas > max_fee):
             max_fee = req.max_fee_per_gas
@@ -2544,11 +2557,18 @@ class GasSuggestionWorker(QThread):
                 log.warning("estimate_gas failed: %s", e)
                 estimated = 21_000 if self._req.data in ("", "0x") else 250_000
 
+            max_priority = 0
             if self._chain.eip1559:
                 latest = client.rpc("eth_getBlockByNumber", ["latest", False])
                 base_fee_hex = (latest or {}).get("baseFeePerGas")
                 base_fee = int(base_fee_hex, 16) if base_fee_hex else 0
                 gas_price = client.gas_price() if base_fee == 0 else 0
+                # The chain's own suggested tip — the floor that keeps
+                # OP-stack L2s (negligible base fee) from being underpriced.
+                try:
+                    max_priority = client.max_priority_fee()
+                except Exception as e:
+                    log.warning("max_priority_fee failed: %s", e)
             else:
                 base_fee = 0
                 gas_price = client.gas_price()
@@ -2559,6 +2579,7 @@ class GasSuggestionWorker(QThread):
                 base_fee_wei=base_fee,
                 gas_price_wei=gas_price,
                 req=self._req,
+                max_priority_fee_wei=max_priority,
             )
             out["nonce"] = client.get_transaction_count(
                 self._req.from_addr, "pending",
