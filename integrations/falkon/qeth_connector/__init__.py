@@ -97,6 +97,12 @@ class QethConnectorPlugin(Falkon.PluginInterface, QtCore.QObject):
         # running (requests reject; no retry storm).
         return True
 
+    def showSettings(self, parent=None):
+        # No configuration — just a read-only "is the wallet reachable?"
+        # status dialog (Preferences → Extensions → Settings).
+        from qeth_connector.settings import StatusDialog
+        StatusDialog(parent).exec()
+
     # --- internals ----------------------------------------------------
 
     def _scripts(self):

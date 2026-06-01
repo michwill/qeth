@@ -65,6 +65,11 @@ Signing (`eth_sendTransaction`, `personal_sign`, `eth_signTypedData*`) is
 handled by qeth itself: the provider forwards the request and qeth pops
 its own confirmation UI. Whatever qeth's server supports, the dapp gets.
 
+There's nothing to configure, but the plugin's **Settings** button
+(Preferences → Extensions) opens a small read-only status dialog showing
+whether the qeth wallet is reachable, and if so the current account and
+network — handy for confirming the link is live.
+
 ## Install
 
 Falkon loads Python plugins from `~/.config/falkon/plugins/`. Symlink (or
@@ -101,6 +106,8 @@ strict-CSP sites.
   (page main world).
 - `qeth_connector/relay.js` — SafeJsWorld relay bridging postMessage to
   the native bridge.
+- `qeth_connector/settings.py` — read-only connection-status dialog
+  (the extension's Settings button).
 - `qeth_connector/qeth-icon.svg` — wallet logo (also the EIP-6963 icon).
 - `qeth_connector/metadata.desktop` — Falkon plugin manifest.
 
