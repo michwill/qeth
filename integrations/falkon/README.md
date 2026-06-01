@@ -54,6 +54,11 @@ seconds.
 - Announces qeth via **EIP-6963** (`eip6963:announceProvider`) with the
   wallet name and logo, so modern dapps list it in their picker with no
   `window.ethereum` races.
+- Sets `window.ethereum.isMetaMask = true` so dapps that only wire up the
+  injected wallet for MetaMask (Web3Modal / Reown AppKit / wagmi's
+  `injected` connector — e.g. Holyheld) accept qeth instead of falling
+  back to a WalletConnect QR. Modern dapps still get the real "qeth"
+  identity via EIP-6963, so nothing that already works regresses.
 - Carries each request's real dapp **Origin** through to qeth, so
   per-origin chain selection (`wallet_switchEthereumChain`) scopes to the
   requesting dapp — one dapp switching chains doesn't move the others.

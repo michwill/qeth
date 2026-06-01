@@ -61,6 +61,18 @@
   function QethProvider() {
     Emitter.call(this);
     this.isQeth = true;
+    // Appear as MetaMask. Many dapps (Web3Modal / Reown AppKit / wagmi's
+    // "injected" connector — e.g. Holyheld) only offer the injected
+    // wallet when window.ethereum.isMetaMask is set; otherwise they drop
+    // to a WalletConnect QR. Modern dapps still see us as "qeth" via the
+    // EIP-6963 announcement below, so nothing that already works
+    // regresses. Rabby / Coinbase set this flag the same way.
+    this.isMetaMask = true;
+    // Minimal slice of MetaMask's "experimental" API that some dapps
+    // probe before they'll treat the provider as unlocked.
+    this._metamask = {
+      isUnlocked: function () { return Promise.resolve(true); },
+    };
     this.chainId = null;
     this.networkVersion = null;
     this.selectedAddress = null;
