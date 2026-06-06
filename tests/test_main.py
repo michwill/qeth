@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication
 
-from qeth.__main__ import _ensure_legible_icon_theme
+from qeth.__main__ import _adopt_host_qt_font, _ensure_legible_icon_theme
 
 
 def test_icon_theme_is_a_noop_outside_flatpak(qtbot):
@@ -27,3 +28,26 @@ def test_icon_theme_pinned_inside_flatpak(qtbot):
             "Papirus", "Adwaita", "breeze", "breeze-dark")
     finally:
         QIcon.setThemeName(before)
+
+
+def test_font_adopted_from_qt6ct_in_flatpak(qtbot, tmp_path):
+    # FLATPAK_ID set + a qt6ct.conf present → adopt its [Fonts] general font.
+    (tmp_path / "qt6ct").mkdir()
+    (tmp_path / "qt6ct" / "qt6ct.conf").write_text(
+        '[Fonts]\ngeneral="Courier New,16,-1,5,50,0,0,0,0,0"\n')
+    app = QApplication.instance()
+    before = app.font()
+    try:
+        _adopt_host_qt_font(
+            app, {"FLATPAK_ID": "x", "XDG_CONFIG_HOME": str(tmp_path)})
+        assert round(app.font().pointSizeF()) == 16
+    finally:
+        app.setFont(before)
+
+
+def test_font_is_a_noop_outside_flatpak(qtbot, tmp_path):
+    # No FLATPAK_ID → never touch the font (native Qt reads qt6ct itself).
+    app = QApplication.instance()
+    before = app.font()
+    _adopt_host_qt_font(app, {"XDG_CONFIG_HOME": str(tmp_path)})
+    assert app.font() == before

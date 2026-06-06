@@ -42,6 +42,8 @@ finish-args:
   - --device=all                         # Ledger USB HID (host udev rules are STILL required)
   - --filesystem=~/.qeth                 # shared config: accounts / chains / keystores (with native qeth)
   - --filesystem=xdg-config/Kvantum:ro   # optional: lets the org.kde.KStyle.Kvantum theme extension apply
+  - --filesystem=xdg-config/qt6ct:ro     # qeth reads your configured font from here (sandbox can't load qt6ct)
+  - --filesystem=xdg-config/qt5ct:ro     # (falls back to a qt5ct config too)
   - --talk-name=org.freedesktop.Notifications
   - --talk-name=org.kde.StatusNotifierWatcher   # system tray (SNI)
 
@@ -57,6 +59,10 @@ cleanup-commands:
   - rm -rfv ${FLATPAK_DEST}/lib/libLLVM.so* ${FLATPAK_DEST}/lib/libclang-cpp.so* ${FLATPAK_DEST}/lib/libclang.so*
 
 modules:
+  # No qt6ct module: the qt6ct platform-theme plugin isn't in the runtime, and
+  # qt6ct 0.9 won't build against its Qt 6.10. Instead qeth reads the font out
+  # of the host's qt6ct/qt5ct config itself at startup (see _adopt_host_qt_font
+  # in qeth/__main__.py); those config dirs are mounted read-only above.
   - name: qeth
     buildsystem: simple
     build-options:

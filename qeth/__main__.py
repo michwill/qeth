@@ -67,6 +67,35 @@ def _ensure_legible_icon_theme(environ) -> None:
             return
 
 
+def _adopt_host_qt_font(app, environ) -> None:
+    """Inside a Flatpak, adopt the font from the host's qt6ct/qt5ct config.
+
+    The sandbox can't load the qt6ct platform-theme plugin (it isn't in the
+    runtime, and qt6ct 0.9 doesn't build against the runtime's Qt 6.10), so
+    the user's configured font never reaches the app and Qt falls back to a
+    smaller default. qt6ct stores the general font as a ``QFont.toString()``
+    value under ``[Fonts] general``, which ``QFont.fromString()`` round-trips
+    — so we just read and apply it ourselves (those config dirs are mounted
+    read-only in the manifest). A no-op natively (Qt's own qt6ct plugin
+    handles it) or when no config / font is found."""
+    if not environ.get("FLATPAK_ID"):
+        return
+    from pathlib import Path
+    from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QFont
+    cfg = environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    for name in ("qt6ct", "qt5ct"):
+        conf = Path(cfg) / name / f"{name}.conf"
+        if not conf.is_file():
+            continue
+        raw = QSettings(
+            str(conf), QSettings.Format.IniFormat).value("Fonts/general")
+        font = QFont()
+        if raw and font.fromString(str(raw)):
+            app.setFont(font)
+            return
+
+
 def main() -> int:
     _harden_x11_backing_store(os.environ, sys.platform)
 
@@ -87,9 +116,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("qeth")
     app.setOrganizationName("qeth")
-    # Sandboxed runs only: make sure theme icons are legible before any
-    # widget is built. No-op natively.
+    # Sandboxed runs only (no-op natively): make theme icons legible and adopt
+    # the host's configured font — both before any widget is built.
     _ensure_legible_icon_theme(os.environ)
+    _adopt_host_qt_font(app, os.environ)
     # Pick the light- or dark-bg variant of the window icon based
     # on the current palette. Theme swaps mid-session don't update
     # it — restart picks up the new one.
