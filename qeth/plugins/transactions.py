@@ -24,7 +24,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Optional
 
-from eth_utils import is_address, to_checksum_address
+from eth_utils import to_checksum_address
 
 
 def _escape_html(text: str) -> str:
@@ -3787,9 +3787,21 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         # Recipient — editable. Validated only on Confirm so the user
         # can paste partial text without seeing intermediate errors.
         self.recipient_edit = QLineEdit()
-        self.recipient_edit.setPlaceholderText("0x… recipient address")
+        self.recipient_edit.setPlaceholderText("0x… address or name.eth")
         self.recipient_edit.setFont(mono)
         header.addRow("&To:", self.recipient_edit)
+        # ENS: when the recipient is a name (name.eth), forward-resolve it
+        # and show the 0x address here (highlighted) so the user verifies
+        # the actual destination before signing. Hidden for a plain address.
+        self._ens_input = ""
+        self._ens_resolved: Optional[str] = None
+        self._ens_label = QLabel("")
+        self._ens_label.setWordWrap(True)
+        self._ens_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        header.addRow(self._ens_label)
+        self._ens_form = header
+        self._ens_form.setRowVisible(self._ens_label, False)
         # Identity of the typed recipient (when it resolves to a contract):
         # name / verified / age / deployer — filled async, see
         # _update_recipient_identity.
@@ -3958,6 +3970,7 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         # Wire live updates: recipient/amount changes re-evaluate the
         # Confirm button enable state and (for native) the Total line.
         # Gas spinners re-render the Expected fee + Total.
+        self.recipient_edit.textChanged.connect(self._update_ens)
         self.recipient_edit.textChanged.connect(self._update_recipient_identity)
         self.recipient_edit.textChanged.connect(self._update_state)
         self.recipient_edit.textChanged.connect(self._update_recipient_hint)
@@ -4108,13 +4121,16 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         label = self._identity_label
         if label is None:
             return
-        text = self.recipient_edit.text().strip()
-        if not is_address(text):
+        # Identify the ACTUAL destination — the resolved address for an ENS
+        # name, or the typed 0x address. _parsed_recipient() returns None
+        # until an ENS name resolves, so the row stays blank meanwhile.
+        resolved = self._parsed_recipient()
+        if resolved is None:
             label.setText("")
             label.setStyleSheet("")
             self._identity_last_addr = None
             return
-        addr = text.lower()
+        addr = resolved.lower()
         if addr == self._identity_last_addr:
             return
         self._identity_last_addr = addr
@@ -4204,14 +4220,74 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         )
         self.amount_edit.setText(format(bal, "f"))
 
+    @staticmethod
+    def _looks_like_ens(text: str) -> bool:
+        # A name to forward-resolve: has a dot, isn't a 0x address. web3
+        # decides whether it actually resolves; this just gates the lookup.
+        return bool(text) and "." in text and not text.startswith("0x")
+
+    def _update_ens(self) -> None:
+        """When the recipient is an ENS name, forward-resolve it (on
+        mainnet) and reveal the resolved 0x address row. The resolution is
+        the source of truth for _parsed_recipient(), so Send stays disabled
+        until a name resolves."""
+        text = self.recipient_edit.text().strip()
+        if not self._looks_like_ens(text):
+            if self._ens_input:        # was a name, now a plain address/empty
+                self._ens_input = ""
+                self._ens_resolved = None
+                self._ens_form.setRowVisible(self._ens_label, False)
+            return
+        if text.lower() == self._ens_input:
+            return                     # already resolving / resolved this name
+        self._ens_input = text.lower()
+        self._ens_resolved = None
+        self._ens_label.setStyleSheet("")
+        self._ens_label.setText(f"resolving {text} …")
+        self._ens_form.setRowVisible(self._ens_label, True)
+        from ..chains import DEFAULT_CHAINS
+        from ..ens import EnsResolveWorker
+        rpc = next((c.rpc_url for c in DEFAULT_CHAINS if c.chain_id == 1), None)
+        if rpc is None:
+            return
+        worker = EnsResolveWorker(rpc, text)
+        worker.resolved.connect(
+            lambda _nm, addr, key=text.lower(): self._on_ens_resolved(key, addr))
+        self._start_worker(worker)
+
+    def _on_ens_resolved(self, key: str, address: str) -> None:
+        if key != self._ens_input:
+            return                     # recipient changed while in flight
+        if address:
+            self._ens_resolved = to_checksum_address(address)
+            self._ens_label.setText(f"↳ {self._ens_resolved}")
+            self._ens_label.setStyleSheet(            # theme-safe green pill
+                "background:#d1e7dd; color:#0f5132; padding:1px 6px;"
+                " border-radius:4px;")
+        else:
+            self._ens_resolved = None
+            self._ens_label.setText("⚠ name not found")
+            self._ens_label.setStyleSheet(
+                "background:#f8d7da; color:#842029; padding:1px 6px;"
+                " border-radius:4px;")
+        # The resolved address feeds the Send gate, calldata, gas estimate
+        # and the contract-identity row — re-run them all.
+        self._update_state()
+        self._update_recipient_hint()
+        self._update_recipient_identity()
+        self._reestimate_timer.start()
+
     def _parsed_recipient(self) -> Optional[str]:
         text = self.recipient_edit.text().strip()
-        if not (text.startswith("0x") and len(text) == 42):
-            return None
-        try:
-            return to_checksum_address(text)
-        except Exception:
-            return None
+        if text.startswith("0x") and len(text) == 42:
+            try:
+                return to_checksum_address(text)
+            except Exception:
+                return None
+        # An ENS name is a valid recipient only once it has resolved.
+        if text and text.lower() == self._ens_input and self._ens_resolved:
+            return self._ens_resolved
+        return None
 
     def _recipient_is_token(self, recipient: str) -> bool:
         """True when the recipient address is itself a token contract —

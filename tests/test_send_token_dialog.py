@@ -507,3 +507,71 @@ class TestRecipientIdentity:
         dlg.recipient_edit.setText("0xnope")          # invalid → clears
         assert dlg._identity_last_addr is None
         assert dlg._identity_label.text() == ""
+
+
+VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+
+class TestEnsRecipient:
+    """Sending to an ENS name: forward-resolve, show the actual 0x
+    address (highlighted) for verification, and only treat the recipient
+    as valid once it resolves."""
+
+    def test_looks_like_ens(self):
+        from qeth.plugins.transactions import SendTokenDialog as S
+        assert S._looks_like_ens("vitalik.eth")
+        assert S._looks_like_ens("swiss-stake.eth")
+        assert not S._looks_like_ens("0x" + "12" * 20)
+        assert not S._looks_like_ens("")
+        assert not S._looks_like_ens("plainword")        # no dot → not a name
+
+    def test_name_gates_send_until_resolved(self, qtbot, monkeypatch):
+        dlg = _make_dialog(qtbot, monkeypatch, balance_raw=10**18, is_native=True)
+        dlg.recipient_edit.setText("vitalik.eth")
+        # Before resolution: not a valid recipient; the row shows "resolving".
+        assert dlg._parsed_recipient() is None
+        assert dlg._ens_form.isRowVisible(dlg._ens_label)
+        assert "resolving" in dlg._ens_label.text()
+        # Resolution lands → the resolved address becomes the recipient.
+        dlg._on_ens_resolved("vitalik.eth", VITALIK)
+        assert dlg._parsed_recipient() == VITALIK
+        assert VITALIK in dlg._ens_label.text() and "↳" in dlg._ens_label.text()
+
+    def test_not_found_is_warned_and_invalid(self, qtbot, monkeypatch):
+        dlg = _make_dialog(qtbot, monkeypatch, balance_raw=10**18, is_native=True)
+        dlg.recipient_edit.setText("nope.eth")
+        dlg._on_ens_resolved("nope.eth", "")
+        assert dlg._parsed_recipient() is None
+        assert "not found" in dlg._ens_label.text()
+
+    def test_stale_resolution_is_dropped(self, qtbot, monkeypatch):
+        dlg = _make_dialog(qtbot, monkeypatch, balance_raw=10**18, is_native=True)
+        dlg.recipient_edit.setText("vitalik.eth")
+        dlg.recipient_edit.setText("swiss-stake.eth")    # changed mid-flight
+        dlg._on_ens_resolved("vitalik.eth", VITALIK)     # old result arrives
+        assert dlg._parsed_recipient() is None           # ignored
+
+    def test_plain_address_clears_ens_row(self, qtbot, monkeypatch):
+        dlg = _make_dialog(qtbot, monkeypatch, balance_raw=10**18, is_native=True)
+        dlg.recipient_edit.setText("vitalik.eth")
+        dlg._on_ens_resolved("vitalik.eth", VITALIK)
+        dlg.recipient_edit.setText("0x" + "22" * 20)     # switch to an address
+        assert dlg._ens_input == ""
+        assert not dlg._ens_form.isRowVisible(dlg._ens_label)
+        assert dlg._parsed_recipient() == "0x" + "22" * 20
+
+
+def test_resolve_ens_address(monkeypatch):
+    from qeth import ens
+
+    class _Ens:
+        def address(self, name):
+            return (VITALIK.lower() if name == "vitalik.eth" else None)
+
+    class _W3:
+        def __init__(self, _provider):
+            self.ens = _Ens()
+
+    monkeypatch.setattr("web3.Web3", _W3)
+    assert ens.resolve_ens_address("http://x", "vitalik.eth") == VITALIK
+    assert ens.resolve_ens_address("http://x", "nope.eth") is None

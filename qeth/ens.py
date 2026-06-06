@@ -70,6 +70,53 @@ def lookup_ens_name(rpc_url: str, address: str) -> Optional[str]:
     return name
 
 
+def resolve_ens_address(rpc_url: str, name: str) -> Optional[str]:
+    """Forward-resolve an ENS name to a checksummed address on mainnet,
+    or None when the name has no address record / any RPC error (ENS is
+    informational — failures degrade to "unresolved", never raise)."""
+    try:
+        from eth_utils import to_checksum_address
+        from web3 import Web3
+        from web3.providers.rpc import HTTPProvider
+    except ImportError:
+        return None
+    try:
+        w3 = Web3(HTTPProvider(
+            rpc_url,
+            request_kwargs={
+                "headers": {"User-Agent": USER_AGENT},
+                "timeout": 15,
+            },
+        ))
+        addr = w3.ens.address(name)  # type: ignore[union-attr]  # .ens is set (provider built), never the Empty sentinel
+    except Exception as e:
+        log.debug("ENS forward resolve failed for %s: %s", name, e)
+        return None
+    if not addr:
+        return None
+    try:
+        return to_checksum_address(addr)
+    except Exception:
+        return None
+
+
+class EnsResolveWorker(QThread):
+    """One-shot forward resolution (name → address) off the Qt main
+    thread. Emits ``resolved(name, address)`` with ``address`` the empty
+    string when the name doesn't resolve."""
+
+    resolved = Signal(str, str)
+
+    def __init__(self, rpc_url: str, name: str, parent=None):
+        super().__init__(parent)
+        self._rpc_url = rpc_url
+        self._name = name
+
+    def run(self) -> None:
+        addr = resolve_ens_address(self._rpc_url, self._name) or ""
+        self.resolved.emit(self._name, addr)
+
+
 class EnsReverseWorker(QThread):
     """One-shot reverse lookup off the Qt main thread. Emits
     ``resolved(address, name)`` where ``name`` is the empty string
