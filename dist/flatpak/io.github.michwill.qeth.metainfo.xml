@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.michwill.qeth</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>qeth</name>
+  <summary>Qt Ethereum wallet with Ledger support</summary>
+  <description>
+    <p>
+      qeth is a Qt-based Ethereum desktop wallet with Ledger hardware-wallet
+      support and a Frame-compatible JSON-RPC server, so dapps in the browser
+      can connect to it unchanged.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Ledger and watch-only accounts, plus encrypted hot wallets</li>
+      <li>Token discovery and balances across Ethereum, OP, Polygon, Arbitrum and Base</li>
+      <li>Send native and ERC-20 assets, with ENS-name resolution and an address book</li>
+      <li>Speed up or cancel pending transactions (replace-by-fee)</li>
+      <li>Contract-identity hints: who deployed it, and how often you've interacted</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.michwill.qeth.desktop</launchable>
+  <provides>
+    <binary>qeth</binary>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>Finance</category>
+  </categories>
+  <url type="homepage">https://github.com/michwill/qeth</url>
+  <url type="bugtracker">https://github.com/michwill/qeth/issues</url>
+  <developer id="io.github.michwill">
+    <name>Michael Egorov</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.9.5" date="2026-06-06"/>
+  </releases>
+</component>

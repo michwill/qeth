@@ -1,0 +1,81 @@
+# qeth Flatpak — self-distributed bundle (NOT a Flathub submission).
+#
+# Build intermediates are kept OUT of the repo (~/.cache/qeth-flatpak) so the
+# `dir` source below doesn't copy them back into itself.
+#
+# Build + install locally (run from the repo root):
+#   flatpak-builder --user --force-clean --install \
+#       --state-dir ~/.cache/qeth-flatpak/state \
+#       ~/.cache/qeth-flatpak/build \
+#       dist/flatpak/io.github.michwill.qeth.yml
+#   flatpak run io.github.michwill.qeth
+#
+# Make a single-file bundle to copy to another machine (e.g. Mint 21.1):
+#   flatpak-builder --user --force-clean --repo=~/.cache/qeth-flatpak/repo \
+#       --state-dir ~/.cache/qeth-flatpak/state \
+#       ~/.cache/qeth-flatpak/build dist/flatpak/io.github.michwill.qeth.yml
+#   flatpak build-bundle ~/.cache/qeth-flatpak/repo \
+#       dist/flatpak/qeth.flatpak io.github.michwill.qeth
+#
+# Design notes:
+#  - PySide6 comes from io.qt.PySide.BaseApp (prebuilt against the runtime's
+#    Qt 6.10), so it is intentionally NOT a pip dependency. Because the app
+#    uses the *runtime* Qt, Breeze works and a user can layer their own theme
+#    via the org.kde.KStyle.Kvantum extension.
+#  - This build lets pip fetch qeth's other deps from PyPI (--share=network in
+#    the module). That's fine for a self-distributed bundle; Flathub would
+#    instead require offline, hash-pinned sources.
+id: io.github.michwill.qeth
+runtime: org.kde.Platform
+runtime-version: "6.10"
+sdk: org.kde.Sdk
+base: io.qt.PySide.BaseApp
+base-version: "6.10"
+command: qeth
+
+finish-args:
+  - --share=network                      # JSON-RPC: DRPC/Blockscout/Etherscan + local Frame server :1248
+  - --share=ipc                          # X11 shared memory
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri                         # GPU-accelerated Qt rendering
+  - --device=all                         # Ledger USB HID (host udev rules are STILL required)
+  - --filesystem=~/.qeth                 # shared config: accounts / chains / keystores (with native qeth)
+  - --filesystem=xdg-config/Kvantum:ro   # optional: lets the org.kde.KStyle.Kvantum theme extension apply
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher   # system tray (SNI)
+
+cleanup-commands:
+  # qeth is pure Qt Widgets. BASEAPP_REMOVE_WEBENGINE strips the unused
+  # QtWebEngine/Chromium (~276 MB); BASEAPP_DISABLE_NUMPY drops the unused
+  # numpy/OpenBLAS (~35 MB). cleanup-BaseApp.sh calls the QtWebEngine dev-file
+  # cleanup itself at the end, so we must NOT invoke that helper separately (it
+  # self-deletes, which would make the script's final step fail and abort).
+  - BASEAPP_REMOVE_WEBENGINE=1 BASEAPP_DISABLE_NUMPY=1 /app/cleanup-BaseApp.sh
+  # libclang / libLLVM (~150 MB) are PySide6/shiboken *build* tooling — needed
+  # only to generate bindings, never to import them. Safe to drop at runtime.
+  - rm -rfv ${FLATPAK_DEST}/lib/libLLVM.so* ${FLATPAK_DEST}/lib/libclang-cpp.so* ${FLATPAK_DEST}/lib/libclang.so*
+
+modules:
+  - name: qeth
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network                # local build → pip may fetch from PyPI
+    build-commands:
+      # qeth + its declared deps (ledgereth, aiohttp, segno, eth-abi, web3 + transitive).
+      # PySide6 is NOT a dependency here — it is provided by the BaseApp.
+      - pip3 install --prefix=${FLATPAK_DEST} --break-system-packages --no-warn-script-location .
+      - install -Dm644 dist/flatpak/io.github.michwill.qeth.desktop ${FLATPAK_DEST}/share/applications/io.github.michwill.qeth.desktop
+      - install -Dm644 qeth/assets/logos/qeth-icon-mono.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
+      - install -Dm644 dist/flatpak/io.github.michwill.qeth.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.michwill.qeth.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .venv
+          - .git
+          - build
+          - .flatpak-builder
+          - resume
+          - dist/flatpak/qeth.flatpak
