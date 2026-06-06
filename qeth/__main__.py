@@ -6,7 +6,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 from .alerts import warn
 
-from .branding import app_icon_for
+from .branding import app_icon
 from .rpc import RpcServer
 from .store import Store
 from .tray import install_tray
@@ -120,10 +120,9 @@ def main() -> int:
     # the host's configured font — both before any widget is built.
     _ensure_legible_icon_theme(os.environ)
     _adopt_host_qt_font(app, os.environ)
-    # Pick the light- or dark-bg variant of the window icon based
-    # on the current palette. Theme swaps mid-session don't update
-    # it — restart picks up the new one.
-    app.setWindowIcon(app_icon_for(app.palette()))
+    # A single self-contained tile icon — legible on any surface, so we
+    # don't have to (and can't portably) guess the taskbar/panel colour.
+    app.setWindowIcon(app_icon())
 
     # Pull the web3/eth_abi/requests stack now, while no window
     # exists yet. They're deferred at import time (qeth.chain only

@@ -73,7 +73,7 @@ modules:
       # PySide6 is NOT a dependency here — it is provided by the BaseApp.
       - pip3 install --prefix=${FLATPAK_DEST} --break-system-packages --no-warn-script-location .
       - install -Dm644 dist/flatpak/io.github.michwill.qeth.desktop ${FLATPAK_DEST}/share/applications/io.github.michwill.qeth.desktop
-      - install -Dm644 qeth/assets/logos/qeth-icon-mono.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
+      - install -Dm644 qeth/assets/logos/qeth-icon-rounded.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
       - install -Dm644 dist/flatpak/io.github.michwill.qeth.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.michwill.qeth.metainfo.xml
     sources:
       - type: dir
