@@ -271,7 +271,9 @@ class TestTransactionListPanel:
             panel.table.horizontalHeaderItem(i).text()
             for i in range(panel.table.columnCount())
         ]
-        assert labels == ["", "Nonce", "Time", "Hash"]
+        # Activity is split into a verb column ("Activity") and a
+        # following coins-icon column (empty header).
+        assert labels == ["", "Nonce", "Time", "Activity", ""]
 
     def test_status_nonce_and_hash_render(self, qtbot, tmp_qeth):
         panel = TransactionListPanel()
@@ -284,17 +286,14 @@ class TestTransactionListPanel:
         # Time cell is locale-formatted — just assert non-empty rather
         # than locking in a specific format string.
         assert panel.table.item(0, 2).text()
-        # Hash cell stores the full hash as its text — Qt elides at
-        # paint time based on the column width, so widening the column
-        # reveals more of it. The cell text itself (which is what
-        # tests can observe) is the canonical 0x-prefixed 66-char form.
-        hash_cell = panel.table.item(0, 3)
-        assert hash_cell.text() == tx.hash
-        assert hash_cell.toolTip() == tx.hash
-        # The Hash cell carries the full Transaction object on
-        # UserRole (so the details dialog can pick it up from a
-        # double-click without re-looking-up the cache).
-        assert hash_cell.data(Qt.UserRole) is tx
+        # The Activity cell (col 3) paints "verb + coins" via a delegate,
+        # so its DisplayRole text is blank — but the full hash is on the
+        # tooltip, and the full Transaction rides on UserRole (so the
+        # details dialog / explorer can recover it from a double-click).
+        act_cell = panel.table.item(0, 3)
+        assert act_cell.text() == ""
+        assert act_cell.toolTip() == tx.hash
+        assert act_cell.data(Qt.UserRole) is tx
 
     def test_prepend_clears_stray_current_index(self, qtbot, tmp_qeth):
         """Inserting a pending row at the top must not leave the view's

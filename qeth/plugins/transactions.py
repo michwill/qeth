@@ -22,7 +22,7 @@ import html as _html
 import logging
 import time
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from eth_utils import to_checksum_address
 
@@ -36,7 +36,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence,
-    QPalette, QStandardItem, QStandardItemModel, QTextDocument, QTextOption,
+    QPalette, QResizeEvent, QStandardItem, QStandardItemModel, QTextDocument,
+    QTextOption,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCompleter, QDialog, QDialogButtonBox,
@@ -68,6 +69,11 @@ from ..transactions import (
     RoutedTransactionSource, Transaction, TransactionSource,
 )
 from ..transactions_cache import TransactionCache, merge_txs
+from ..tx_activity import (
+    Activity, AssetLeg, fetch_activities, transfer_legs_from_logs,
+)
+from ..icons import IconCache, bundled_native_icon
+from .tx_summary import Coin, TxSummary, coins_icon
 
 
 def _copy_noun(value: str) -> str:
@@ -676,6 +682,32 @@ class TransactionsWorker(QThread):
             self.failed.emit(str(e))
 
 
+class TxActivityWorker(QThread):
+    """Off-thread build of per-tx Activity (verb + assets moved) for a
+    page of txs — one batched tokentx/internal fetch + ABI-decoded verbs,
+    sharing the disk ABI cache. Best-effort: on failure those rows just
+    keep showing the hash. Emits ``{tx_hash: Activity}``."""
+
+    loaded = Signal(int, str, object)   # (chain_id, addr_lower, dict[str, Activity])
+
+    def __init__(self, chain, address: str, txs: list[Transaction],
+                 abi_cache: AbiCache, parent=None):
+        super().__init__(parent)
+        self._chain = chain
+        self._address = address
+        self._txs = txs
+        self._abi_cache = abi_cache
+
+    def run(self) -> None:
+        try:
+            acts = fetch_activities(
+                self._chain, self._address, self._txs, abi_cache=self._abi_cache)
+        except Exception as e:
+            log.debug("activity build failed: %s", e)
+            acts = {}
+        self.loaded.emit(self._chain.chain_id, self._address.lower(), acts)
+
+
 class TransactionsPlugin(Plugin):
     name = "Transactions"
 
@@ -775,6 +807,15 @@ class TransactionsPlugin(Plugin):
         # for the same view we already painted — Qt then preserves the
         # scrollbar and the user's scrolled-in batches stay intact.
         self._rendered_for: Optional[tuple[int, str]] = None
+        # tx hash → (out ERC-20 contracts, in ERC-20 contracts) learned from
+        # a receipt or pre-broadcast simulation, folded into the activity so
+        # a swap's coins show before Blockscout indexes the transfers.
+        self._known_legs: dict[str, tuple[list[str], list[str]]] = {}
+        # (chain_id, contract) → ticker, harvested from Blockscout-built
+        # activities (their tokentx carries tokenSymbol). Lets a receipt/sim
+        # leg show the right symbol (e.g. Gnosis "EURe" → "E") even when the
+        # curated token lists don't know the token, instead of a bare "?".
+        self._symbol_cache: dict[tuple[int, str], str] = {}
         # The widget is built lazily so the plugin can be instantiated
         # outside a Qt event loop (useful in pure-Python imports).
         self._panel: Optional[TransactionListPanel] = None
@@ -973,6 +1014,12 @@ class TransactionsPlugin(Plugin):
                 # state from the cache.
                 if self._panel is not None and self._rendered_for == key:
                     self._panel.update_tx_by_hash(txs[i])
+                # Fold the receipt's ERC-20 Transfer events into the row's
+                # activity now — so a swap/transfer shows its coins the
+                # instant it confirms, instead of waiting for Blockscout to
+                # index the transfers (or an app restart).
+                logs = receipt.get("logs") if hasattr(receipt, "get") else None
+                self.note_transfer_legs(chain_id, tx_hash, logs, key[1])
                 return
 
     def _on_tx_dropped(self, chain, tx_hash: str) -> None:
@@ -1096,6 +1143,79 @@ class TransactionsPlugin(Plugin):
         # When multi-plugin, only the active one is visible.
         return panel.isVisible()
 
+    def _kick_activities(self, chain, address: str,
+                         txs: list[Transaction]) -> None:
+        """Build Activity (verb + assets moved) for ``txs`` off-thread,
+        sharing the disk ABI cache; feed it back to the panel if it's
+        still showing this view. Called by the panel for newly-shown rows."""
+        if self.host is None or self._panel is None or not txs:
+            return
+        key = (chain.chain_id, address.lower())
+        worker = TxActivityWorker(chain, address, list(txs), self._abi_cache)
+        worker.loaded.connect(
+            lambda _cid, _addr, acts, k=key: self._on_activities(k, acts))
+        self.host.start_worker(worker)
+
+    def _on_activities(self, key, acts) -> None:
+        # Remember every real ticker these (Blockscout-built) activities
+        # carry, so a later receipt/sim leg for the same token reads "EURe"
+        # not "?". Harvest before merging.
+        for a in acts.values():
+            for leg in (*a.out, *a.inn):
+                if leg.contract and leg.symbol and leg.symbol != "?":
+                    self._symbol_cache[(key[0], leg.contract)] = leg.symbol
+        if self._panel is not None and self._rendered_for == key:
+            acts = {h: self._with_known_legs(key[0], h, a)
+                    for h, a in acts.items()}
+            self._panel.set_activities(acts)
+
+    def _with_known_legs(self, chain_id: int, tx_hash: str,
+                         activity: Activity) -> Activity:
+        """Fold in ERC-20 legs learned from a receipt / simulation that
+        Blockscout's tokentx hasn't indexed yet (so a just-confirmed or
+        still-pending swap shows its coins immediately, not after a
+        restart). Idempotent — contracts the Activity already lists are
+        skipped, and the native ETH legs are preserved."""
+        extra = self._known_legs.get(tx_hash)
+        if not extra:
+            return activity
+        out_c, in_c = extra
+        have = {leg.contract for leg in (*activity.out, *activity.inn)
+                if leg.contract}
+
+        def make(contract: str) -> AssetLeg:
+            info = self.host.token_info(chain_id, contract) if self.host else None
+            sym = (getattr(info, "symbol", None)
+                   or self._symbol_cache.get((chain_id, contract))
+                   or "?")
+            return AssetLeg(sym, contract)
+
+        new_out = activity.out + tuple(
+            make(c) for c in out_c if c not in have)
+        new_in = activity.inn + tuple(
+            make(c) for c in in_c if c not in have)
+        if new_out == activity.out and new_in == activity.inn:
+            return activity
+        from dataclasses import replace
+        return replace(activity, out=new_out, inn=new_in)
+
+    def note_transfer_legs(self, chain_id: int, tx_hash: str,
+                           logs: object, viewer: str) -> None:
+        """Record the ERC-20 contracts a tx's logs moved through ``viewer``
+        (from a receipt or a pre-broadcast simulation) and repaint that
+        row's activity with the coins folded in."""
+        out_c, in_c = transfer_legs_from_logs(logs, viewer)
+        if not out_c and not in_c:
+            return
+        self._known_legs[tx_hash] = (out_c, in_c)
+        key = (chain_id, viewer.lower())
+        if self._panel is None or self._rendered_for != key:
+            return
+        base = self._panel.activity_for(tx_hash)
+        if base is not None:
+            self._panel.set_activities(
+                {tx_hash: self._with_known_legs(chain_id, tx_hash, base)})
+
     def _refresh(self, address: str, force_fetch: bool = False) -> None:
         """Render cached transactions immediately (if any) and kick a
         background fetch when the plugin is currently visible and
@@ -1110,6 +1230,13 @@ class TransactionsPlugin(Plugin):
         key = (chain.chain_id, address.lower())
 
         self._panel.set_context(chain, address)
+        # Wire the Activity column's deps (shared icon cache + token-logo
+        # lookup) and the off-thread Activity builder. All idempotent.
+        ic_fn = getattr(self.host, "icon_cache", None)
+        ti_fn = getattr(self.host, "token_info", None)
+        self._panel.set_icon_deps(ic_fn() if callable(ic_fn) else None,
+                                  ti_fn if callable(ti_fn) else None)
+        self._panel.set_activity_kicker(self._kick_activities)
         cached = self._cache.get(key)
         if cached is None:
             # First time this (chain, addr) is seen this session — try
@@ -1381,10 +1508,34 @@ class TransactionListPanel(QWidget):
         # Status / Nonce / Time / Hash. The Status column has an empty
         # label — the ✓/✗ glyph speaks for itself, and dropping the word
         # "Status" lets the column be tight against the left edge.
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["", "Nonce", "Time", "Hash"])
-        # Status column shows a themed icon (glyph fallback) — keep it small.
-        self.table.setIconSize(QSize(16, 16))
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["", "Nonce", "Time", "Activity", ""])
+        # "Activity" is split into two plain columns so each renders with
+        # standard cell painting (no custom delegate, no whole-line image —
+        # both broke selection/hover/scroll or font rendering under the
+        # user's theme): col 3 is the decoded **verb as text** (theme font,
+        # native selection colour); col 4 is a small **coins-only icon**
+        # (assets moved, out → in) with no text inside it. Until a row's
+        # activity resolves (or on a chain with no source) both stay empty.
+        self._activities: dict[str, Activity] = {}
+        self._icons: Optional[IconCache] = None
+        self._token_info: Optional[Callable[..., object]] = None
+        # Plugin-supplied callback (chain, address, txs) → fetch their
+        # Activity off-thread; the panel calls it for newly-shown rows.
+        self._activity_kicker: Optional[Callable[..., None]] = None
+        # Lazy coin-icon arrivals are coalesced: collect the contracts whose
+        # logo just downloaded and repaint each affected row ONCE on a short
+        # timer, instead of re-rendering every shared-coin row per arrival.
+        self._icon_dirty: set[str] = set()
+        self._icon_timer = QTimer(self)
+        self._icon_timer.setSingleShot(True)
+        self._icon_timer.setInterval(60)
+        self._icon_timer.timeout.connect(self._flush_icon_updates)
+        # Icon area: 16px tall keeps the Status check at its native theme
+        # size (a taller iconSize re-picked/scaled the glyph). 180px wide
+        # fits up to 4+arrow+4 coins; only the stretched coins column uses
+        # the width — Status is Fixed and text columns carry no icon.
+        self.table.setIconSize(QSize(180, 16))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1392,7 +1543,10 @@ class TransactionListPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setShowGrid(False)
-        # Padding + hover only — see TokenListPanel comment.
+        # Cell padding + no hover highlight (same as TokenListPanel). Safe
+        # again now the Activity column is a plain icon cell rather than a
+        # custom delegate: the ``:hover`` rule no longer blanks it and the
+        # row selection highlight reaches it normally.
         self.table.setStyleSheet(
             "QTableView::item {"
             "  padding: 3px 6px;"
@@ -1407,13 +1561,12 @@ class TransactionListPanel(QWidget):
         # the details dialog for the highlighted row — same as
         # double-click.
         self.table.installEventFilter(self)
-        # ElideMiddle on the view lets the Hash column adapt: the full
-        # hash is stored in the cell, and Qt truncates at paint time
-        # only as much as needed to fit the column width — so the
-        # rendered text grows as the user widens the column.
-        # Short-text cells (Status/Nonce/Time, all ResizeToContents)
-        # always fit, so this setting only ever takes effect on Hash.
-        self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        # ElideRight on the verb (the only stretchable text column): when
+        # the window narrows, a long method name is truncated from the end
+        # ("increase_unlock_ti…") rather than the middle. Short-text cells
+        # (Nonce/Time, ResizeToContents) always fit, so this only bites the
+        # verb column.
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         # Scroll-to-bottom drives the load-more UX.
         self.table.verticalScrollBar().valueChanged.connect(
             self._on_scroll_change
@@ -1423,12 +1576,30 @@ class TransactionListPanel(QWidget):
         # nothing meaningful to widen them to). Hash stretches to fill
         # the remaining space; its rendered text is the short
         # 0x1234…abcd form, so the wider cell looks padded rather than
-        # full-bleed. Stretch + ResizeToContents together also mean
-        # there's no empty trailing space after Hash.
-        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Status
+        # full-bleed.
+        # Status is Fixed-width (not ResizeToContents) so its 16px icon
+        # column stays tight regardless of iconSize. Nonce/Time/Verb fit
+        # their text. The coins column stretches to fill — its icon is
+        # left-aligned, so the coins sit right after the verb with the
+        # spare space trailing.
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)             # Status
+        self.table.setColumnWidth(0, 34)
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # Nonce
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Time
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)           # Hash
+        # Verb is sized by hand (_fit_verb_column): just wide enough for
+        # its text so the coins sit right after it, but capped to whatever
+        # space is left so it gives way first — eliding long method names —
+        # when the window narrows. Coins are sized to content so every coin
+        # always fits. No horizontal scrollbar: the verb never widens past
+        # the available room, so nothing overflows.
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)             # Verb
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Coins
+        h.setMinimumSectionSize(24)
+        self.table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Widest verb text seen so far (px) — the verb column's natural
+        # width; tracked incrementally so the fit never scans all rows.
+        self._max_verb_px = 0
         v.addWidget(self.table, 1)
 
         # The empty-state / loading / error label sits stacked under the
@@ -1537,6 +1708,143 @@ class TransactionListPanel(QWidget):
         self._viewer = viewer_address
         self._update_action_buttons()
 
+    # --- Activity column (verb + coins moved) -------------------------------
+
+    def activity_for(self, tx_hash: str) -> Optional[Activity]:
+        """The Activity currently held for ``tx_hash`` (if its worker has
+        resolved), so the plugin can fold late-arriving receipt coins in."""
+        return self._activities.get(tx_hash)
+
+    def set_icon_deps(self, icon_cache: Optional[IconCache],
+                      token_info: object) -> None:
+        """Wire the shared icon cache (+ optional token_info logo lookup)
+        the Activity column uses to paint coins. Connected once; lazy icon
+        arrivals repaint the rows that reference them."""
+        if self._icons is icon_cache:
+            return
+        self._icons = icon_cache
+        self._token_info = token_info if callable(token_info) else None
+        if icon_cache is not None:
+            icon_cache.icon_ready.connect(self._on_icon_ready)
+
+    def set_activities(self, mapping: dict) -> None:
+        """Merge a freshly-built ``{hash: Activity}`` and fill the rows that
+        just gained one (verb text + coins icon)."""
+        if not mapping:
+            return
+        self._activities.update(mapping)
+        for row in range(self.table.rowCount()):
+            tx = self._tx_at(row)
+            if tx is None or tx.hash not in mapping:
+                continue
+            self._apply_activity(row, mapping[tx.hash])
+        self._fit_verb_column()
+
+    def _apply_activity(self, row: int, activity: Activity) -> None:
+        """Write an Activity into its two cells: the verb (col 3, text) and
+        the moved-coins icon (col 4)."""
+        summary = self._build_summary(activity)
+        verb = self.table.item(row, 3)
+        if verb is not None:
+            verb.setText(summary.verb)
+            self._max_verb_px = max(
+                self._max_verb_px,
+                self.table.fontMetrics().horizontalAdvance(summary.verb))
+            if summary.muted:
+                verb.setForeground(self.table.palette().color(
+                    QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text))
+        coins = self.table.item(row, 4)
+        if coins is not None:
+            coins.setIcon(self._coins_icon(summary))
+
+    def _fit_verb_column(self) -> None:
+        """Size the verb column to its text, but never wider than the room
+        left after the fixed columns — so the coins always fit, the verb
+        elides when squeezed, and no horizontal scrollbar appears."""
+        t = self.table
+        if t.columnCount() < 5:
+            return
+        others = sum(t.columnWidth(i) for i in (0, 1, 2, 4))
+        avail = t.viewport().width() - others
+        # text + the cell's L/R padding (stylesheet 6px each) + a little
+        # slack so the widest verb doesn't elide when there's room.
+        natural = self._max_verb_px + 24
+        t.setColumnWidth(3, max(24, min(natural, max(24, avail))))
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._fit_verb_column()
+
+    def _build_summary(self, activity: Activity) -> TxSummary:
+        return TxSummary(
+            activity.verb,
+            tuple(self._coin(leg) for leg in activity.out),
+            tuple(self._coin(leg) for leg in activity.inn),
+            show_arrow=activity.show_arrow,
+            muted=activity.muted,
+        )
+
+    def _coins_icon(self, summary: TxSummary) -> QIcon:
+        """Coins-only icon (out → in) for col 4, with Normal/Selected
+        pixmaps so the vector arrow + generic coins follow the selection."""
+        pal = self.table.palette()
+        return coins_icon(
+            summary,
+            pal.color(QPalette.ColorRole.Text),
+            pal.color(QPalette.ColorRole.HighlightedText),
+            self.table.devicePixelRatioF(),
+        )
+
+    def _coin(self, leg) -> Coin:
+        if leg.contract is None:                      # native coin
+            return Coin(leg.symbol, bundled_native_icon(leg.symbol))
+        chain_id = self._chain.chain_id if self._chain is not None else 0
+        pix = self._icons.get(chain_id, leg.contract) if self._icons is not None else None
+        if pix is None and self._icons is not None and self._token_info is not None:
+            entry = self._token_info(chain_id, leg.contract)
+            url = getattr(entry, "logo_uri", None)
+            if url:
+                self._icons.request(chain_id, leg.contract, url)   # lazy; repaints on arrival
+        return Coin(leg.symbol, pix)
+
+    def _on_icon_ready(self, chain_id: int, contract: str) -> None:
+        # Don't repaint per arrival — a burst of logos (e.g. a swap's two
+        # tokens, or the Tokens panel warming the shared cache) would each
+        # sweep the whole list. Coalesce and flush once.
+        self._icon_dirty.add(contract.lower())
+        self._icon_timer.start()
+
+    def _flush_icon_updates(self) -> None:
+        dirty = self._icon_dirty
+        self._icon_dirty = set()
+        if not dirty:
+            return
+        for row in range(self.table.rowCount()):
+            tx = self._tx_at(row)
+            act = self._activities.get(tx.hash) if tx is not None else None
+            if act is None:
+                continue
+            if any((leg.contract or "") in dirty
+                   for leg in (*act.out, *act.inn)):
+                # Only the coins icon depends on the logo; leave the verb
+                # cell untouched so just the picture refreshes, not the row.
+                coins = self.table.item(row, 4)
+                if coins is not None:
+                    coins.setIcon(self._coins_icon(self._build_summary(act)))
+
+    def set_activity_kicker(self, fn: Optional[Callable[..., None]]) -> None:
+        self._activity_kicker = fn
+
+    def _request_activities(self, txs: list[Transaction]) -> None:
+        """Ask the plugin to build Activity for any of ``txs`` we don't
+        have yet. Called from the render methods so every path (initial,
+        append, prepend) enriches the rows it just added."""
+        if self._activity_kicker is None or self._chain is None or not self._viewer:
+            return
+        pending = [t for t in txs if t.hash not in self._activities]
+        if pending:
+            self._activity_kicker(self._chain, self._viewer, pending)
+
     def _on_scroll_change(self, value: int) -> None:
         """Emit ``scrolled_to_bottom`` when the user reaches the
         bottom of the table. The 4-pixel slack matches Qt's default
@@ -1583,6 +1891,8 @@ class TransactionListPanel(QWidget):
     def clear(self) -> None:
         self.table.setRowCount(0)
         self.status_lbl.setVisible(False)
+        self._activities.clear()
+        self._max_verb_px = 0
         self._chain = None
         self._viewer = None
 
@@ -1591,6 +1901,7 @@ class TransactionListPanel(QWidget):
             self.show_empty()
             return
         self.status_lbl.setVisible(False)
+        self._max_verb_px = 0   # this view's verbs re-measure from scratch
         h = self.table.horizontalHeader()
         col_count = self.table.columnCount()
         # ResizeToContents columns re-measure all rows of that column
@@ -1618,6 +1929,8 @@ class TransactionListPanel(QWidget):
             self.table.blockSignals(False)
             for i, mode in enumerate(prior_modes):
                 h.setSectionResizeMode(i, mode)
+        self._request_activities(txs)
+        self._fit_verb_column()
 
     def append_transactions(self, txs: list[Transaction]) -> None:
         """Add rows at the bottom of the existing list (older entries
@@ -1630,6 +1943,8 @@ class TransactionListPanel(QWidget):
         self.table.setRowCount(start + len(txs))
         for offset, tx in enumerate(txs):
             self._populate_row(start + offset, tx)
+        self._request_activities(txs)
+        self._fit_verb_column()
 
     def prepend_transactions(self, txs: list[Transaction]) -> None:
         """Add rows at the top of the existing list (newer entries —
@@ -1642,6 +1957,8 @@ class TransactionListPanel(QWidget):
         for tx in reversed(txs):
             self.table.insertRow(0)
             self._populate_row(0, tx)
+        self._request_activities(txs)
+        self._fit_verb_column()
         # insertRow(0) can leave the view's *current* index on the new
         # (0,0) status cell, drawing a stray focus outline on the icon
         # until the next full rebuild (confirm / tab switch). Clear the
@@ -1696,15 +2013,25 @@ class TransactionListPanel(QWidget):
 
         time_item = QTableWidgetItem(_format_datetime(tx.timestamp))
 
-        hash_item = QTableWidgetItem(tx.hash)
-        hash_item.setFont(QFont("monospace"))
-        hash_item.setToolTip(tx.hash)
-        hash_item.setData(Qt.ItemDataRole.UserRole, tx)
+        # Activity = two cells: the verb (col 3, plain text) and the
+        # moved-coins icon (col 4). The verb cell also carries the full
+        # hash on its tooltip and the Transaction on UserRole, for the
+        # copy / explorer / details handlers (and _tx_at). Both stay empty
+        # until this tx's Activity resolves; _apply_activity fills them.
+        verb_item = QTableWidgetItem()
+        verb_item.setToolTip(tx.hash)
+        verb_item.setData(Qt.ItemDataRole.UserRole, tx)
+        coins_item = QTableWidgetItem()
 
         self.table.setItem(row, 0, status)
         self.table.setItem(row, 1, nonce)
         self.table.setItem(row, 2, time_item)
-        self.table.setItem(row, 3, hash_item)
+        self.table.setItem(row, 3, verb_item)
+        self.table.setItem(row, 4, coins_item)
+
+        activity = self._activities.get(tx.hash)
+        if activity is not None:
+            self._apply_activity(row, activity)
 
     def _tx_at(self, row: int) -> Optional[Transaction]:
         item = self.table.item(row, 3)

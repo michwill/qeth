@@ -71,6 +71,7 @@ BLOCKSCOUT_INSTANCES: dict[int, str] = {
     137:   "https://polygon.blockscout.com",
     42161: "https://arbitrum.blockscout.com",
     8453:  "https://base.blockscout.com",
+    100:   "https://gnosis.blockscout.com",
 }
 
 

@@ -1000,6 +1000,16 @@ class MainWindow(QMainWindow):
             self.transactions_plugin.add_pending(
                 tx_hash, req, chain, raw_signed=raw_signed,
             )
+            # The Sign/Send dialog already simulated this tx and holds the
+            # Transfer logs it will emit — fold them into the pending row's
+            # activity so a swap shows its coins immediately (before the
+            # receipt, before Blockscout indexes). The confirmed receipt
+            # later re-asserts the same legs.
+            sim_logs = getattr(dialog, "_logs", None)
+            if sim_logs:
+                self.transactions_plugin.note_transfer_legs(
+                    chain.chain_id, tx_hash, sim_logs, req.from_addr,
+                )
         except Exception:
             import logging
             logging.getLogger("qeth.ui").exception("add_pending failed")

@@ -389,6 +389,32 @@ def _function_signature(entry: dict) -> Optional[str]:
     return f"{name}({types})"
 
 
+def selector_names(abi: Abi) -> dict[str, str]:
+    """Map each function's 4-byte selector ("0x…") to its name, so a call
+    can be labelled by the contract's *own* ABI — unambiguous, unlike a
+    4byte guess. Tuple-aware (so e.g. ``aggregate3((address,bool,bytes)[])``
+    hashes correctly). First name wins on the rare intra-ABI clash; proxy-
+    own entries already lead after _dedup_by_selector."""
+    from eth_utils.abi import (
+        collapse_if_tuple, function_signature_to_4byte_selector,
+    )
+    out: dict[str, str] = {}
+    for entry in abi:
+        if entry.get("type") != "function":
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        try:
+            sig = f"{name}(" + ",".join(
+                collapse_if_tuple(i) for i in (entry.get("inputs") or [])) + ")"
+            sel = "0x" + function_signature_to_4byte_selector(sig).hex()
+        except Exception:
+            continue
+        out.setdefault(sel, str(name))
+    return out
+
+
 def _urllib_transport(url: str, timeout: float) -> bytes:
     req = urllib.request.Request(
         url,
