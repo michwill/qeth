@@ -69,6 +69,7 @@ from ..transactions import (
     RoutedTransactionSource, Transaction, TransactionSource,
 )
 from ..transactions_cache import TransactionCache, merge_txs
+from ..activity_cache import ActivityCache
 from ..tx_activity import (
     Activity, AssetLeg, fetch_activities, transfer_legs_from_logs,
 )
@@ -816,6 +817,11 @@ class TransactionsPlugin(Plugin):
         # leg show the right symbol (e.g. Gnosis "EURe" → "E") even when the
         # curated token lists don't know the token, instead of a bare "?".
         self._symbol_cache: dict[tuple[int, str], str] = {}
+        # Resolved activities persisted to disk — a confirmed tx's verb +
+        # coins never change, so a return visit to a chain paints from here
+        # instantly instead of refetching (and receipt coins survive a
+        # restart).
+        self._activity_cache = ActivityCache()
         # The widget is built lazily so the plugin can be instantiated
         # outside a Qt event loop (useful in pure-Python imports).
         self._panel: Optional[TransactionListPanel] = None
@@ -1164,10 +1170,11 @@ class TransactionsPlugin(Plugin):
             for leg in (*a.out, *a.inn):
                 if leg.contract and leg.symbol and leg.symbol != "?":
                     self._symbol_cache[(key[0], leg.contract)] = leg.symbol
+        merged = {h: self._with_known_legs(key[0], h, a)
+                  for h, a in acts.items()}
+        self._activity_cache.update(key[0], key[1], merged)
         if self._panel is not None and self._rendered_for == key:
-            acts = {h: self._with_known_legs(key[0], h, a)
-                    for h, a in acts.items()}
-            self._panel.set_activities(acts)
+            self._panel.set_activities(merged)
 
     def _with_known_legs(self, chain_id: int, tx_hash: str,
                          activity: Activity) -> Activity:
@@ -1213,8 +1220,9 @@ class TransactionsPlugin(Plugin):
             return
         base = self._panel.activity_for(tx_hash)
         if base is not None:
-            self._panel.set_activities(
-                {tx_hash: self._with_known_legs(chain_id, tx_hash, base)})
+            merged = {tx_hash: self._with_known_legs(chain_id, tx_hash, base)}
+            self._activity_cache.update(chain_id, key[1], merged)
+            self._panel.set_activities(merged)
 
     def _refresh(self, address: str, force_fetch: bool = False) -> None:
         """Render cached transactions immediately (if any) and kick a
@@ -1271,6 +1279,11 @@ class TransactionsPlugin(Plugin):
             # rows it's well under 50 ms.
             cap = min(self.INITIAL_VISIBLE, len(cached))
             self._displayed_count[key] = cap
+            # Seed last session's resolved activities so the rows paint
+            # their verb + coins immediately; only the still-unknown ones
+            # get a worker.
+            self._panel.prime_activities(
+                self._activity_cache.load(chain.chain_id, address))
             self._panel.show_transactions(cached[:cap])
             self._rendered_for = key
         elif view_changed and (force_fetch or self._is_active()):
@@ -1714,6 +1727,12 @@ class TransactionListPanel(QWidget):
         """The Activity currently held for ``tx_hash`` (if its worker has
         resolved), so the plugin can fold late-arriving receipt coins in."""
         return self._activities.get(tx_hash)
+
+    def prime_activities(self, mapping: dict) -> None:
+        """Seed the activity map from the disk cache *before* the rows are
+        built, so _populate_row paints them with no worker round-trip and
+        _request_activities only kicks the ones still missing."""
+        self._activities.update(mapping)
 
     def set_icon_deps(self, icon_cache: Optional[IconCache],
                       token_info: object) -> None:

@@ -77,6 +77,7 @@ files = [
     "qeth/abi_cache.py",
     "qeth/contract_identity.py",
     "qeth/simulate.py",
+    "qeth/activity_cache.py",
     "qeth/transactions.py",
     "qeth/transactions_cache.py",
     "qeth/tx_activity.py",
