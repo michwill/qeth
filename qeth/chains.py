@@ -17,25 +17,41 @@ class Chain:
     # additions (BSC, Fantom, niche L2s) can opt out and the gas
     # suggestion logic picks the right path automatically.
     eip1559: bool = True
+    # Backup RPC endpoints, tried in order when the primary errors at the
+    # transport level. EthClient fails over to these so a flaky provider
+    # doesn't blank out balances — DRPC's free Gnosis endpoint, for one,
+    # 400s on every eth_call ("can't route") while routing eth_getBalance
+    # fine, which silently dropped all ERC-20 tokens until the multicall
+    # gave up. publicnode covers all these chains and is a solid default.
+    fallback_rpcs: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 DEFAULT_CHAINS: list[Chain] = [
-    Chain("Ethereum", 1,     "https://eth.drpc.org",       "ETH",   "https://etherscan.io",            "ethereum"),
-    Chain("Optimism", 10,    "https://optimism.drpc.org",  "ETH",   "https://optimistic.etherscan.io", "ethereum"),
+    Chain("Ethereum", 1,     "https://eth.drpc.org",       "ETH",   "https://etherscan.io",            "ethereum",
+          fallback_rpcs=("https://ethereum-rpc.publicnode.com",)),
+    Chain("Optimism", 10,    "https://optimism.drpc.org",  "ETH",   "https://optimistic.etherscan.io", "ethereum",
+          fallback_rpcs=("https://optimism-rpc.publicnode.com",)),
     # Polygon's native id on CoinGecko is "polygon-ecosystem-token" since
     # the MATIC -> POL rebrand. The on-chain symbol is still MATIC.
-    Chain("Polygon",  137,   "https://polygon.drpc.org",   "MATIC", "https://polygonscan.com",         "polygon-ecosystem-token"),
-    Chain("Arbitrum", 42161, "https://arbitrum.drpc.org",  "ETH",   "https://arbiscan.io",             "ethereum"),
-    Chain("Base",     8453,  "https://base.drpc.org",      "ETH",   "https://basescan.org",            "ethereum"),
+    Chain("Polygon",  137,   "https://polygon.drpc.org",   "MATIC", "https://polygonscan.com",         "polygon-ecosystem-token",
+          fallback_rpcs=("https://polygon-bor-rpc.publicnode.com",)),
+    Chain("Arbitrum", 42161, "https://arbitrum.drpc.org",  "ETH",   "https://arbiscan.io",             "ethereum",
+          fallback_rpcs=("https://arbitrum-one-rpc.publicnode.com",)),
+    Chain("Base",     8453,  "https://base.drpc.org",      "ETH",   "https://basescan.org",            "ethereum",
+          fallback_rpcs=("https://base-rpc.publicnode.com",)),
     # xDai / chiado has its own native; the CoinGecko id is "xdai".
-    Chain("Gnosis",   100,   "https://gnosis.drpc.org",    "XDAI",  "https://gnosisscan.io",           "xdai"),
+    # gnosis.drpc.org can't route eth_call (only eth_getBalance), so it's
+    # demoted to a last-resort fallback behind two endpoints that can.
+    Chain("Gnosis",   100,   "https://gnosis-rpc.publicnode.com", "XDAI", "https://gnosisscan.io",     "xdai",
+          fallback_rpcs=("https://rpc.gnosischain.com", "https://gnosis.drpc.org")),
     # BNB Smart Chain — PoA consensus (validator sigs in extraData),
     # but EthClient injects ExtraDataToPOAMiddleware so the standard
     # block-reading paths just work. EIP-1559 is supported since
     # BEP-336 (2024) though baseFee is typically 0; gas_price
     # fallback in the suggestion worker handles that case cleanly.
-    Chain("BNB Smart Chain", 56, "https://bsc.drpc.org",   "BNB",   "https://bscscan.com",             "binancecoin"),
+    Chain("BNB Smart Chain", 56, "https://bsc.drpc.org",   "BNB",   "https://bscscan.com",             "binancecoin",
+          fallback_rpcs=("https://bsc-rpc.publicnode.com",)),
 ]

@@ -441,3 +441,51 @@ class TestDecodeStringOrBytes32:
 
     def test_garbage_returns_empty(self):
         assert _decode_string_or_bytes32(b"\x00" * 7) == ""
+
+
+class TestRpcFailover:
+    """EthClient rotates to a fallback RPC when the primary errors at the
+    transport level (e.g. DRPC's free Gnosis endpoint 400s on eth_call)."""
+
+    def test_rpc_urls_dedup_and_inherit_defaults(self):
+        from qeth.chains import Chain
+        from qeth.chain import _rpc_urls
+        # explicit fallbacks, deduped against the primary
+        c = Chain("X", 999, "http://a", fallback_rpcs=("http://b", "http://a"))
+        assert _rpc_urls(c) == ["http://a", "http://b"]
+        # a custom override with no fallbacks inherits the matching default
+        custom = Chain("MyGnosis", 100, "http://custom")
+        urls = _rpc_urls(custom)
+        assert urls[0] == "http://custom"
+        assert "https://rpc.gnosischain.com" in urls   # from default Gnosis
+
+    def test_failover_rotates_past_transport_error(self, monkeypatch):
+        import qeth.chain as ch
+        ch._ensure_heavy_imports()
+        seen = []
+
+        def fake_make_request(self, method, params):
+            seen.append(self.endpoint_uri)
+            if "broken" in self.endpoint_uri:
+                raise ch.requests.exceptions.HTTPError("400 can't route")
+            return {"jsonrpc": "2.0", "id": 1, "result": "0xok"}
+
+        monkeypatch.setattr(ch.HTTPProvider, "make_request", fake_make_request)
+        provider = ch._failover_provider(
+            ["http://broken", "http://good"], request_kwargs={}, session=None)
+        resp = provider.make_request("eth_call", [])
+        assert resp["result"] == "0xok"
+        assert seen == ["http://broken", "http://good"]   # tried broken, fell over
+        # a JSON-RPC error (revert) is a valid answer — must NOT fail over
+        seen.clear()
+
+        def revert(self, method, params):
+            seen.append(self.endpoint_uri)
+            return {"jsonrpc": "2.0", "id": 1,
+                    "error": {"code": 3, "message": "execution reverted"}}
+
+        monkeypatch.setattr(ch.HTTPProvider, "make_request", revert)
+        p2 = ch._failover_provider(
+            ["http://a", "http://b"], request_kwargs={}, session=None)
+        out = p2.make_request("eth_call", [])
+        assert "error" in out and seen == ["http://a"]   # stopped at first

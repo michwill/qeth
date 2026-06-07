@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from web3.providers.rpc import HTTPProvider
     from web3.types import BlockIdentifier, RPCEndpoint, TxParams
 
-from .chains import Chain
+from .chains import Chain, DEFAULT_CHAINS
 
 log = logging.getLogger("qeth.chain")
 
@@ -117,6 +117,61 @@ def _build_session():
     return s
 
 
+def _rpc_urls(chain: Chain) -> list[str]:
+    """Primary RPC followed by its ordered fallbacks, deduped. A chain with
+    no fallbacks of its own (e.g. a user's custom-RPC override) inherits the
+    matching DEFAULT_CHAINS entry's fallbacks, so failover still applies."""
+    fallbacks = chain.fallback_rpcs
+    if not fallbacks:
+        default = next((c for c in DEFAULT_CHAINS
+                        if c.chain_id == chain.chain_id), None)
+        fallbacks = default.fallback_rpcs if default else ()
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in (chain.rpc_url, *fallbacks):
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _failover_provider(urls: list[str], *, request_kwargs: dict,
+                       session: Any) -> "HTTPProvider":
+    """An ``HTTPProvider`` whose ``make_request`` rotates through ``urls`` on
+    a *transport* failure — an HTTP error (DRPC's free Gnosis endpoint 400s
+    on every eth_call), a connection error, a timeout — and then sticks to
+    whichever endpoint answered. A JSON-RPC *error* response (a revert, a
+    request the node understood and rejected) is a valid answer, not a
+    transport failure, so it does NOT trigger failover. With a single URL
+    it's a plain HTTPProvider."""
+    members = [HTTPProvider(u, request_kwargs=request_kwargs, session=session)
+               for u in urls]
+    provider = members[0]
+    if len(members) == 1:
+        return provider
+    state = {"i": 0}
+
+    def make_request(method: Any, params: Any) -> Any:
+        last: Optional[Exception] = None
+        for offset in range(len(members)):
+            i = (state["i"] + offset) % len(members)
+            try:
+                # Call the *class* method on the member so the primary's
+                # patched make_request (this very function) isn't re-entered.
+                resp = HTTPProvider.make_request(members[i], method, params)
+                if i != state["i"]:
+                    log.debug("rpc failover -> %s", urls[i])
+                state["i"] = i
+                return resp
+            except requests.exceptions.RequestException as exc:
+                last = exc
+        assert last is not None   # len(members) >= 2, so the loop ran
+        raise last
+
+    setattr(provider, "make_request", make_request)
+    return provider
+
+
 class EthClient:
     """Thin wrapper around ``web3.Web3`` that provides:
 
@@ -135,8 +190,8 @@ class EthClient:
         self.chain = chain
         self.timeout = timeout
         self._session = _build_session()
-        self._w3 = Web3(HTTPProvider(
-            chain.rpc_url,
+        self._w3 = Web3(_failover_provider(
+            _rpc_urls(chain),
             request_kwargs={"timeout": timeout},
             session=self._session,
         ))
