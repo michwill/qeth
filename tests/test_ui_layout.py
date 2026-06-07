@@ -19,20 +19,24 @@ from qeth.tokens import TokenBalance
 # --- Account actions row ----------------------------------------------------
 
 def test_account_actions_rendered_as_buttons(mainwindow):
-    """Three account actions (Add / Copy / Remove) are wired up and
-    rendered as buttons. They live on the MainWindow so the test doesn't
-    care which container holds them (they now sit on the slot's bottom
-    action row, styled like the Tokens 'Send' button)."""
+    """Add / Copy / Remove are wired as buttons on the slot's bottom row.
+    Add is the labelled primary (like the Tokens 'Send'); Copy / Remove are
+    icon-only flat buttons (like the Tokens utility icons), with their label
+    moved to the tooltip."""
     # Texts carry GNOME-HIG access-key mnemonics ("&A" → Alt+A).
     assert mainwindow.act_add.text() == "&Add Account"
     assert mainwindow.act_copy.text() == "&Copy Address"
     assert mainwindow.act_remove.text() == "&Remove Account"
-    # All three are QPushButtons (matching the Send button); their text
-    # keeps the "&" mnemonic, so compare on the plain label.
-    button_texts = {
-        b.text().replace("&", "") for b in mainwindow.findChildren(QPushButton)
-    }
-    assert {"Add Account", "Copy Address", "Remove Account"} <= button_texts
+    buttons = mainwindow.findChildren(QPushButton)
+    # Add is the labelled primary button.
+    assert any(b.text().replace("&", "") == "Add Account" for b in buttons)
+    # Copy / Remove are icon-only (no text) — identified by their tooltip,
+    # carrying an icon, flat, so they read as utility buttons.
+    for label in ("Copy Address", "Remove Account"):
+        match = [b for b in buttons if b.toolTip() == label]
+        assert match, f"no button tooltipped {label!r}"
+        btn = match[0]
+        assert not btn.text() and not btn.icon().isNull() and btn.isFlat()
 
 
 def test_accounts_tree_has_copy_and_delete_shortcuts(mainwindow):

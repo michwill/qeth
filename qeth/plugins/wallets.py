@@ -517,13 +517,20 @@ class WalletsPlugin(Plugin):
         add_btn.setMenu(self._add_menu)
         self._account_buttons.append(add_btn)
 
-        # Copy / Remove mirror their QActions (which also carry the tree's
-        # Ctrl+C / Del shortcuts): same label/icon/tooltip, and the
-        # button's enabled state tracks the action's via enabledChanged.
+        # Copy / Remove become icon-only flat buttons matching the Tokens /
+        # Transactions panels' utility buttons, so the two slots' bottom
+        # rows read the same: one labelled primary action (Add, like Send)
+        # followed by small icon-only ones. They still mirror their QActions
+        # (which carry the tree's Ctrl+C / Del shortcuts and the enabled
+        # state); the label moves to the tooltip since there's no text.
         for act in (self.act_copy, self.act_remove):
-            btn = QPushButton(act.text())
+            btn = QPushButton()
             btn.setIcon(act.icon())
-            btn.setToolTip(act.toolTip())
+            btn.setToolTip(act.toolTip() or act.text().replace("&", ""))
+            btn.setFlat(True)
+            btn.setMaximumSize(28, 28)
+            btn.setIconSize(QSize(16, 16))
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.setEnabled(act.isEnabled())
             act.enabledChanged.connect(btn.setEnabled)
             btn.clicked.connect(act.trigger)
