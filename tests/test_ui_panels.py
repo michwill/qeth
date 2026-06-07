@@ -599,3 +599,50 @@ def test_identity_row_loading_placeholder_then_badge(qtbot, tmp_path):
     assert label.text() == "RewardClaimHelper" and label.isEnabled()
     captured[0].ready.emit(None)                   # transient error → blank
     assert label.text() == ""
+
+
+def test_context_menu_opens_on_justify_gap_columns(qtbot, tmp_qeth, monkeypatch):
+    """Right-clicking the empty stretch gap columns must still open the tx
+    menu — they hold no QTableWidgetItem, so the old itemAt() lookup
+    returned None there and the menu never appeared. (Patch the module's
+    QMenu with a fake — a real menu.exec() would block on a modal popup.)"""
+    import qeth.plugins.transactions as txmod
+    from qeth.plugins.transactions import _C_GAP1, _C_GAP2
+    from PySide6.QtCore import QPoint
+
+    class _FakeAction:
+        def setEnabled(self, *a):
+            pass
+
+    class _FakeMenu:
+        opened: list = []
+
+        def __init__(self, *a, **k):
+            pass
+
+        def addAction(self, *a, **k):
+            return _FakeAction()
+
+        def addSeparator(self):
+            pass
+
+        def exec(self, *a, **k):
+            _FakeMenu.opened.append(1)
+
+    monkeypatch.setattr(txmod, "QMenu", _FakeMenu)
+
+    panel = TransactionListPanel()
+    qtbot.addWidget(panel)
+    panel.resize(800, 300)
+    panel.set_context(ETH, ADDR)
+    panel.show_transactions([_tx(nonce=42, to_addr="0xbeef", success=True)])
+    panel.show()
+    qtbot.wait(100)                       # let the table lay its columns out
+    for gap in (_C_GAP1, _C_GAP2):
+        assert panel.table.columnWidth(gap) > 0   # the gap actually stretched
+        _FakeMenu.opened.clear()
+        x = (panel.table.columnViewportPosition(gap)
+             + panel.table.columnWidth(gap) // 2)
+        y = panel.table.rowViewportPosition(0) + 4
+        panel._on_context_menu(QPoint(x, y))
+        assert _FakeMenu.opened == [1], f"menu didn't open on gap {gap}"

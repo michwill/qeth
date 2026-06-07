@@ -2181,10 +2181,14 @@ class TransactionListPanel(QWidget):
         QDesktopServices.openUrl(QUrl(url))
 
     def _on_context_menu(self, pos) -> None:
-        item = self.table.itemAt(pos)
-        if item is None:
+        # Resolve the row, not the item: the justify gap columns hold no
+        # QTableWidgetItem, so itemAt() returns None there and a right-click
+        # on the empty space between columns opened nothing. indexAt() gives
+        # a valid index for any cell in the row.
+        index = self.table.indexAt(pos)
+        if not index.isValid():
             return
-        tx = self._tx_at(item.row())
+        tx = self._tx_at(index.row())
         if tx is None:
             return
         menu = QMenu(self)
