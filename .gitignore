@@ -26,3 +26,6 @@ venv/
 
 # mypy type-checker cache
 .mypy_cache/
+
+# Local test config (e.g. a local archive node for the anvil fork). NOT committed.
+.env

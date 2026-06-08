@@ -30,6 +30,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # it for the suite; the watcher's own tests opt back in via monkeypatch.
 os.environ.setdefault("QETH_LIVE_WS", "0")
 
+# Local-only test config from a gitignored `.env` at the repo root. Mainly a
+# fast local archive node for the anvil fork — e.g.
+# `QETH_ANVIL_FORK_RPC=http://10.0.0.5:8545` — so tests/test_live_anvil.py
+# forks instantly with no public-RPC rate limits. `setdefault` so an explicit
+# shell env var still wins, and it's loaded *after* the lines above so they
+# keep priority (a stray QETH_LIVE_WS in .env can't enable ws in the suite).
+_dotenv = Path(__file__).resolve().parent.parent / ".env"
+if _dotenv.exists():
+    for _line in _dotenv.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _, _val = _line.partition("=")
+            os.environ.setdefault(_key.strip(), _val.strip())
+
 
 @pytest.fixture
 def tmp_qeth(tmp_path, monkeypatch) -> Path:
