@@ -46,10 +46,19 @@ PY="$APPDIR/usr/python/bin/python3"
 
 # 3. qeth + bundled PySide6 + the eth stack, installed FRESH from PyPI manylinux
 #    wheels. Anything without a wheel compiles with the container's generic gcc
-#    (old glibc, no -march=native) — still portable. No host venv is ever copied
-#    in: that is the whole point of building here.
+#    (old glibc, no -march=native) — still portable.
+#    The source is copied to a WRITABLE dir first: pip's egg_info build step
+#    writes into the tree, and /src is mounted read-only. The exclude list keeps
+#    the host .venv/.git/build artifacts out — no host binary ever rides along,
+#    which is the whole point of building in here.
+BUILD_SRC="$WORK/src"
+mkdir -p "$BUILD_SRC"
+tar -C "$SRC" \
+    --exclude=.git --exclude=.venv --exclude=build --exclude=dist \
+    --exclude=.flatpak-builder --exclude=resume --exclude='__pycache__' \
+    -cf - . | tar -C "$BUILD_SRC" -xf -
 "$PY" -m pip install --no-cache-dir --upgrade pip wheel >/dev/null
-"$PY" -m pip install --no-cache-dir "${SRC}[bundled]"
+"$PY" -m pip install --no-cache-dir "${BUILD_SRC}[bundled]"
 
 # 4. Bundle the external (non-wheel) shared-lib deps of Qt's libs + plugins.
 #    PySide6 already ships its own libQt6*.so inside site-packages; we only need
