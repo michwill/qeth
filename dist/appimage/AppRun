@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# qeth AppImage entrypoint. The AppImage runtime has already exported $APPDIR
+# (the extracted mount) and $APPIMAGE (the .AppImage path) — qeth keys its
+# bundled-Qt theme/font adoption off $APPIMAGE (see _running_bundled_qt in
+# qeth/__main__.py), so we don't set it here.
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "$0")")"
+
+export PYTHONHOME="$HERE/usr/python"
+export PYTHONNOUSERSITE=1   # ignore ~/.local site-packages — stay self-contained
+
+# The xcb plugin's extra system deps (libxcb-cursor, libxkbcommon, …) we bundled
+# from the old-glibc build container live here:
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# PySide6 locates its own Qt + plugins relative to the package, so no plugin-path
+# pin is needed. QT_QPA_PLATFORMTHEME stays unset: there's no qt6ct plugin in
+# the bundle, so qeth adopts the host font/icons itself.
+exec "$HERE/usr/python/bin/python3" -m qeth "$@"

@@ -28,6 +28,14 @@ def _harden_x11_backing_store(environ, platform) -> None:
         environ.setdefault("QT_X11_NO_MITSHM", "1")
 
 
+def _running_bundled_qt(environ) -> bool:
+    """True when Qt is bundled *without* the host's qt6ct/Kvantum platform-theme
+    plugin — a Flatpak (``FLATPAK_ID``) or an AppImage (its runtime exports
+    ``APPIMAGE``). In both, qeth adopts the host font + a legible icon theme
+    itself; natively (neither set) Qt's own qt6ct plugin does it."""
+    return bool(environ.get("FLATPAK_ID") or environ.get("APPIMAGE"))
+
+
 def _ensure_legible_icon_theme(environ) -> None:
     """Inside a Flatpak, pick an icon theme that actually renders.
 
@@ -47,7 +55,12 @@ def _ensure_legible_icon_theme(environ) -> None:
     Must run after QApplication exists (the icon engine needs it) but
     before any widgets are built, so their icons resolve against the
     chosen theme."""
-    if not environ.get("FLATPAK_ID"):
+    # Flatpak (sandbox has only Breeze/hicolor) or AppImage (bundled Qt, no
+    # qt6ct plugin to read the user's theme). Native installs keep their real
+    # desktop icon theme. TODO(appimage): an AppImage is *un*sandboxed, so the
+    # user's real themes are on disk — honour their configured qt6ct icon_theme
+    # before falling back to this legible default (needs VM verification).
+    if not _running_bundled_qt(environ):
         return
     from PySide6.QtGui import QIcon, QPalette
     from PySide6.QtWidgets import QApplication
@@ -77,8 +90,10 @@ def _adopt_host_qt_font(app, environ) -> None:
     value under ``[Fonts] general``, which ``QFont.fromString()`` round-trips
     — so we just read and apply it ourselves (those config dirs are mounted
     read-only in the manifest). A no-op natively (Qt's own qt6ct plugin
-    handles it) or when no config / font is found."""
-    if not environ.get("FLATPAK_ID"):
+    handles it) or when no config / font is found. Applies equally to an
+    AppImage (also a bundled Qt with no qt6ct plugin; reads the real config
+    straight off disk since there's no sandbox)."""
+    if not _running_bundled_qt(environ):
         return
     from pathlib import Path
     from PySide6.QtCore import QSettings

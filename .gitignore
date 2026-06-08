@@ -4,11 +4,13 @@ __pycache__/
 *.egg-info/
 .eggs/
 build/
-# Ignore build artifacts under dist/, but keep the Flatpak packaging sources
-# (manifest / .desktop / .metainfo) tracked — only the built bundle is ignored.
+# Ignore build artifacts under dist/, but keep the Flatpak + AppImage packaging
+# sources tracked — only the built bundles / output dirs are ignored.
 /dist/*
 !/dist/flatpak/
 /dist/flatpak/qeth.flatpak
+!/dist/appimage/
+/dist/appimage/out/
 
 # venv
 .venv/

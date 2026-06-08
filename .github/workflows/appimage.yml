@@ -1,0 +1,40 @@
+name: AppImage
+
+# Build the portable AppImage in a manylinux container so it requires only an
+# OLD glibc (2.34) and a GENERIC x86-64 baseline — never the CI/dev host's libc
+# or CPU tuning. Runs on tags (attaches to the release) or on demand.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build runs INSIDE the manylinux image via `docker run` (rather than
+      # the job's `container:`) so the host job still has node/gh/docker for the
+      # surrounding steps, and the bundle's only base is the old container.
+      - name: Build AppImage in manylinux_2_34
+        run: |
+          mkdir -p "$PWD/out"
+          docker run --rm \
+            -v "$PWD":/src:ro \
+            -v "$PWD/out":/out \
+            -e PYVER=cp312-cp312 \
+            quay.io/pypa/manylinux_2_34_x86_64 \
+            bash /src/dist/appimage/build-appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qeth-appimage
+          path: out/*.AppImage
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" out/*.AppImage --clobber

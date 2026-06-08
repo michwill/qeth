@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=qeth
+GenericName=Ethereum Wallet
+Comment=Qt Ethereum wallet with Ledger support and a Frame-compatible JSON-RPC server
+Exec=AppRun
+Icon=io.github.michwill.qeth
+Terminal=false
+Categories=Network;Finance;Qt;
+Keywords=ethereum;wallet;crypto;ledger;web3;

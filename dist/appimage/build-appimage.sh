@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Assemble the qeth AppImage *inside a manylinux container* (glibc 2.34, generic
+# x86-64). Nothing from the developer's host (Gentoo, -march=native, glibc 2.42)
+# enters the bundle: the interpreter, every wheel, and the bundled system libs
+# all come from the old, generic container. Run via build-in-container.sh or CI
+# — NOT on the host directly (a host-built AppImage would need the host's glibc
+# 2.42 and its CPU's instruction set, i.e. run almost nowhere — not even the VM).
+#
+# Env knobs (all optional):
+#   SRC    repo checkout            (default /src)
+#   OUT    where the .AppImage lands (default /out)
+#   WORK   scratch build dir         (default /tmp/qeth-appimage)
+#   PYVER  manylinux CPython tag     (default cp312-cp312)
+#
+# Lower the glibc floor to 2.28 (Debian 10 / RHEL 8 / Ubuntu 20.04+): run this
+# in quay.io/pypa/manylinux_2_28_x86_64 AND pin PySide6<6.10 in the [bundled]
+# extra — 6.10 moved PySide6's own wheel floor up to glibc 2.34.
+set -euo pipefail
+
+SRC="${SRC:-/src}"
+OUT="${OUT:-/out}"
+WORK="${WORK:-/tmp/qeth-appimage}"
+PYVER="${PYVER:-cp312-cp312}"
+ARCH="x86_64"
+APPDIR="$WORK/AppDir"
+
+rm -rf "$WORK"; mkdir -p "$APPDIR/usr/lib" "$OUT"
+
+# 1. System libraries the Qt xcb platform plugin dlopens but the PySide6 wheel
+#    does NOT bundle (libxcb-cursor is the usual culprit on Qt 6.5+). Pulled
+#    from the container (old glibc, generic), never the host. NOTE: this list
+#    is a starting point — the real test is launching on a clean target (the
+#    VM) and chasing whatever the xcb plugin reports missing.
+dnf install -y -q \
+    libxcb libxkbcommon libxkbcommon-x11 xcb-util-cursor xcb-util-image \
+    xcb-util-keysyms xcb-util-renderutil xcb-util-wm libX11 libXext libXrender \
+    libXrandr libXi libSM libICE fontconfig freetype mesa-libGL \
+    >/dev/null 2>&1 || echo "WARN: some packages unavailable — refine for the target"
+
+# 2. A relocatable CPython from the container ($ORIGIN-relative RPATH, so it
+#    runs from anywhere once PYTHONHOME points at it).
+cp -a "/opt/python/${PYVER}" "$APPDIR/usr/python"
+M="${PYVER#cp3}"; M="${M%%-*}"                 # cp312-cp312 -> 12
+ln -sf "python3.${M}" "$APPDIR/usr/python/bin/python3"
+PY="$APPDIR/usr/python/bin/python3"
+
+# 3. qeth + bundled PySide6 + the eth stack, installed FRESH from PyPI manylinux
+#    wheels. Anything without a wheel compiles with the container's generic gcc
+#    (old glibc, no -march=native) — still portable. No host venv is ever copied
+#    in: that is the whole point of building here.
+"$PY" -m pip install --no-cache-dir --upgrade pip wheel >/dev/null
+"$PY" -m pip install --no-cache-dir "${SRC}[bundled]"
+
+# 4. Bundle the external (non-wheel) shared-lib deps of Qt's libs + plugins.
+#    PySide6 already ships its own libQt6*.so inside site-packages; we only need
+#    the system libs those link that aren't in the wheel.
+QTDIR="$(echo "$APPDIR"/usr/python/lib/python*/site-packages/PySide6/Qt)"
+{ find "$QTDIR/lib" -name 'libQt6*.so*' 2>/dev/null
+  find "$QTDIR/plugins/platforms" -name '*.so' 2>/dev/null; } | while read -r so; do
+    ldd "$so" 2>/dev/null || true
+done | awk '/=> \// {print $3}' \
+  | grep -vE 'PySide6/|/libQt6|/libpython|/ld-linux|/libc\.so|/libm\.so|/libdl|/libpthread|/librt|/libstdc\+\+|/libgcc_s' \
+  | sort -u | xargs -r -I{} cp -Lu {} "$APPDIR/usr/lib/" 2>/dev/null || true
+
+# 5. AppImage metadata at the AppDir root (AppImage conventions: AppRun + one
+#    top-level .desktop + a matching icon).
+install -Dm755 "$SRC/dist/appimage/AppRun"                          "$APPDIR/AppRun"
+install -Dm644 "$SRC/dist/appimage/io.github.michwill.qeth.desktop" "$APPDIR/io.github.michwill.qeth.desktop"
+install -Dm644 "$SRC/qeth/assets/logos/qeth-icon-rounded.svg"       "$APPDIR/io.github.michwill.qeth.svg"
+
+# 6. Pack. --appimage-extract-and-run avoids needing FUSE inside the container.
+VERSION="$("$PY" -c 'import qeth; print(qeth.__version__)')"
+curl -sSL -o "$WORK/appimagetool" \
+  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+chmod +x "$WORK/appimagetool"
+ARCH="$ARCH" "$WORK/appimagetool" --appimage-extract-and-run \
+  "$APPDIR" "$OUT/qeth-${VERSION}-${ARCH}.AppImage"
+echo "OK -> $OUT/qeth-${VERSION}-${ARCH}.AppImage  (needs glibc >= 2.34, generic x86-64)"
