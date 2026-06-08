@@ -39,7 +39,10 @@ dnf install -y -q \
 
 # 2. A relocatable CPython from the container ($ORIGIN-relative RPATH, so it
 #    runs from anywhere once PYTHONHOME points at it).
-cp -a "/opt/python/${PYVER}" "$APPDIR/usr/python"
+# /opt/python/cpXYZ is a SYMLINK into /opt/_internal — copy the *resolved* tree,
+# or the AppDir gets a dangling link and ships empty.
+mkdir -p "$APPDIR/usr/python"
+cp -a "$(readlink -f "/opt/python/${PYVER}")/." "$APPDIR/usr/python/"
 M="${PYVER#cp3}"; M="${M%%-*}"                 # cp312-cp312 -> 12
 ln -sf "python3.${M}" "$APPDIR/usr/python/bin/python3"
 PY="$APPDIR/usr/python/bin/python3"
