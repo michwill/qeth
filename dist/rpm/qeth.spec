@@ -1,5 +1,5 @@
 Name:           qeth
-Version:        0.11.0
+Version:        0.11.1
 Release:        1%{?dist}
 Summary:        Qt Ethereum wallet with Ledger support and a Frame-compatible JSON-RPC server
 
@@ -107,5 +107,10 @@ install -Dm0644 qeth/assets/logos/qeth-icon-rounded.svg \
 %{_datadir}/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
 
 %changelog
+* Tue Jun 09 2026 Michael Egorov <michwill@yieldbasis.com> - 0.11.1-1
+- JSON-RPC proxy: fail over to the chain's fallback_rpcs on a transport error.
+- Cache upstream DNS for 1h so short DNS outages are absorbed.
+- Fix an eth_getLogs crash on a malformed/non-JSON upstream response.
+
 * Tue Jun 09 2026 Michael Egorov <michwill@yieldbasis.com> - 0.11.0-1
 - Initial Fedora package: system PySide6 + eth stack, vendor web3/ledgereth/etc.

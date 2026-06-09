@@ -84,4 +84,5 @@ modules:
           - build
           - .flatpak-builder
           - resume
+          - .env
           - dist/flatpak/qeth.flatpak
