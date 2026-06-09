@@ -16,6 +16,13 @@ ExclusiveArch:  x86_64
 %global debug_package %{nil}
 %global __strip /bin/true
 
+# The vendor dir is self-contained manylinux wheels: their .so files RPATH their
+# own bundled libs (the hashed lib*-<hash>.so copies), which no system package
+# provides. Exclude the whole vendor tree from automatic dependency generation —
+# the wheels are self-sufficient; the real system deps are the explicit Requires.
+%global __requires_exclude_from ^%{_prefix}/lib/%{name}/vendor/.*$
+%global __provides_exclude_from ^%{_prefix}/lib/%{name}/vendor/.*$
+
 BuildRequires:  python3-devel
 BuildRequires:  python3-pip
 BuildRequires:  gcc
