@@ -681,6 +681,14 @@ class TransactionsWorker(QThread):
     # (chain_id, addr_lower, page_idx, list[Transaction], has_more)
     failed = Signal(str)
 
+    # A sparse-sent account needs many pages to fill the view, and Blockscout
+    # is slow/flaky for high-activity addresses — so retry a page a couple of
+    # times before failing, rather than letting one transient blip abort the
+    # whole walk (which left just the 3 sent txs from page 1 for a busy
+    # receive-heavy account whose 657 sent txs are sparse among received ones).
+    MAX_ATTEMPTS = 3
+    RETRY_BACKOFF_S = 0.6
+
     def __init__(self, source: TransactionSource, chain, address: str,
                  page: int = 1, page_size: int = 100,
                  sent_only: bool = True, before_block=None, parent=None):
@@ -695,23 +703,36 @@ class TransactionsWorker(QThread):
 
     def run(self) -> None:
         viewer = self.address.lower()
-        try:
-            raw = self.source.list_transactions(
-                self.chain, self.address,
-                page=self.page, limit=self.page_size,
-                before_block=self.before_block,
-            )
-            # A partial page means Blockscout has nothing more — used
-            # by the plugin to flag the (chain, addr) as exhausted.
-            has_more = len(raw) >= self.page_size
-            page = raw
-            if self.sent_only:
-                page = [t for t in raw if t.from_addr.lower() == viewer]
-            self.fetched.emit(
-                self.chain.chain_id, viewer, self.page, page, has_more,
-            )
-        except Exception as e:
-            self.failed.emit(str(e))
+        raw = None
+        last_err: Optional[Exception] = None
+        for attempt in range(self.MAX_ATTEMPTS):
+            try:
+                raw = self.source.list_transactions(
+                    self.chain, self.address,
+                    page=self.page, limit=self.page_size,
+                    before_block=self.before_block,
+                )
+                last_err = None
+                break
+            except Exception as e:
+                # One transient blip on a deep page must not abort the walk —
+                # retry with a short backoff before failing (see the
+                # MAX_ATTEMPTS note above).
+                last_err = e
+                if attempt < self.MAX_ATTEMPTS - 1:
+                    time.sleep(self.RETRY_BACKOFF_S * (attempt + 1))
+        if raw is None:
+            self.failed.emit(str(last_err) if last_err else "no result")
+            return
+        # A partial page means Blockscout has nothing more — used
+        # by the plugin to flag the (chain, addr) as exhausted.
+        has_more = len(raw) >= self.page_size
+        page = raw
+        if self.sent_only:
+            page = [t for t in raw if t.from_addr.lower() == viewer]
+        self.fetched.emit(
+            self.chain.chain_id, viewer, self.page, page, has_more,
+        )
 
 
 class TxActivityWorker(QThread):
