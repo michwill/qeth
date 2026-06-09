@@ -794,6 +794,12 @@ class TransactionsPlugin(Plugin):
     # txs sent from another wallet client (NonceCheckWorker). One cheap
     # RPC call; on a hit it re-fetches page 1 to pull the new tx in.
     NONCE_POLL_INTERVAL_MS = 30_000
+    # A pending tx looks "dropped" when its nonce is spent but we can't fetch
+    # its receipt. That single reading is unreliable behind a load-balanced RPC
+    # (a backend can miss a mined tx's receipt), so only believe it after this
+    # many consecutive readings across watcher ticks — a mined tx's receipt
+    # propagates and confirms within a tick or two, clearing the count.
+    DROP_CONFIRM_READINGS = 3
 
     def __init__(
         self,
@@ -852,6 +858,10 @@ class TransactionsPlugin(Plugin):
         # a (chain, addr) — that's what prevents the empty → populated
         # flicker on startup.
         self._cache: dict[tuple[int, str], list[Transaction]] = {}
+        # Per-hash count of consecutive "looks dropped" readings — a single one
+        # is unreliable behind a load-balanced RPC, so we wait for repeats
+        # before flipping a tx to the terminal dropped state.
+        self._drop_readings: dict[str, int] = {}
         # Active fetches — prevents duplicate Blockscout calls when
         # on_activated / on_account_changed / on_chain_changed all fire
         # close together (e.g. user clicks a new account while the tab
@@ -971,6 +981,20 @@ class TransactionsPlugin(Plugin):
         of the immutable snapshot (built on the main thread)."""
         entry = self._live_snapshot.get(chain_id)
         return entry[1] if entry is not None else []
+
+    def pending_nonce_floor(self, chain_id: int, address: str) -> Optional[int]:
+        """One past the highest nonce among the txs WE broadcast from
+        ``address`` and are still tracking as pending — the nonce a brand-new
+        send must use so it doesn't collide with one of ours that's still in
+        flight. ``None`` when nothing is in flight (the mined count is then
+        authoritative). We're the sole signer for the account, so this is
+        exact and needs no trust in the node's flaky "pending" view."""
+        addr = address.lower()
+        nonces = [
+            t.nonce for t in self._live_pending_provider(chain_id)
+            if t.from_addr.lower() == addr and t.nonce is not None
+        ]
+        return max(nonces) + 1 if nonces else None
 
     def _rebuild_live_snapshot(self) -> None:
         """Main-thread rebuild of the pending snapshot the LiveWatcher reads,
@@ -1162,6 +1186,8 @@ class TransactionsPlugin(Plugin):
         the receive-side of a swap before Blockscout indexes it
         (3+ minutes lag on busy chains)."""
         chain_id = chain.chain_id
+        # Confirmed → cancel any tentative drop-readings for this hash.
+        self._drop_readings.pop(tx_hash, None)
         # Forward to TokensPlugin regardless of whether we still
         # have a matching pending entry — the tokens scan only
         # cares about the logs, not the local cache state.
@@ -1205,7 +1231,22 @@ class TransactionsPlugin(Plugin):
         different tx, so this hash will never confirm. Flip the cached
         entry to the terminal ``dropped`` state (no longer pending, not
         a revert), drop the stored raw bytes, persist, and repaint the
-        one row if it's on screen."""
+        one row if it's on screen.
+
+        Guarded by a consecutive-reading count: a single "nonce spent + no
+        receipt" reading is unreliable behind an RPC load balancer (a backend
+        can return a null receipt for a tx that IS mined). Only act once the
+        reading repeats ``DROP_CONFIRM_READINGS`` times across ticks — by then
+        a mined tx's receipt has propagated and confirmed instead."""
+        seen = self._drop_readings.get(tx_hash, 0) + 1
+        self._drop_readings[tx_hash] = seen
+        if seen < self.DROP_CONFIRM_READINGS:
+            log.debug(
+                "tx %s looks dropped (%d/%d readings) — re-checking before "
+                "believing it", tx_hash, seen, self.DROP_CONFIRM_READINGS,
+            )
+            return
+        self._drop_readings.pop(tx_hash, None)
         from dataclasses import replace
         chain_id = chain.chain_id
         for key, txs in list(self._cache.items()):
@@ -3562,10 +3603,15 @@ class GasSuggestionWorker(QThread):
     suggested = Signal(object)  # dict
     failed = Signal(str)
 
-    def __init__(self, chain, req: SigningRequest, parent=None):
+    def __init__(self, chain, req: SigningRequest,
+                 nonce_floor: Optional[int] = None, parent=None):
         super().__init__(parent)
         self._chain = chain
         self._req = req
+        # One past our own highest in-flight nonce (or None). The node's
+        # "pending" count lags a just-broadcast tx, so without this floor a
+        # back-to-back send reuses the nonce and the two txs replace each other.
+        self._nonce_floor = nonce_floor
 
     def run(self) -> None:
         try:
@@ -3611,8 +3657,16 @@ class GasSuggestionWorker(QThread):
                 req=self._req,
                 max_priority_fee_wei=max_priority,
             )
-            out["nonce"] = client.get_transaction_count(
-                self._req.from_addr, "pending",
+            # Nonce: don't trust the node's "pending" count — RPCs behind a
+            # load balancer report it inconsistently. The MINED ("latest")
+            # count is the reliable cold-start baseline; our own in-flight
+            # nonces (nonce_floor, from the txs WE broadcast and still track —
+            # nobody else signs for this account) carry it forward so
+            # back-to-back sends each get a fresh, increasing nonce.
+            mined = client.get_transaction_count(self._req.from_addr, "latest")
+            out["nonce"] = (
+                max(mined, self._nonce_floor)
+                if self._nonce_floor is not None else mined
             )
             self.suggested.emit(out)
         except Exception as e:
@@ -3692,6 +3746,8 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
                  fixed_nonce: Optional[int] = None,
                  fee_floor: Optional["ReplacementFloor"] = None,
                  replace_label: Optional[str] = None,
+                 nonce_floor_provider:
+                     "Optional[Callable[[int, str], Optional[int]]]" = None,
                  parent=None):
         super().__init__(parent)
         self.req = req
@@ -3703,6 +3759,7 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
             identity_cache if identity_cache is not None
             else ContractIdentityCache())
         self._tx_cache = tx_cache
+        self._nonce_floor_provider = nonce_floor_provider
         self._start_worker = start_worker
         self._token_info = token_info
         self._known_addresses = {a.lower() for a in (known_addresses or ())}
@@ -3949,7 +4006,9 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
             self.decoded_view.setPlainText("(plain value transfer — no calldata)")
 
         # --- kick the gas suggestion --------------------------------
-        gas_worker = GasSuggestionWorker(chain, req)
+        floor = (self._nonce_floor_provider(chain.chain_id, req.from_addr)
+                 if self._nonce_floor_provider is not None else None)
+        gas_worker = GasSuggestionWorker(chain, req, nonce_floor=floor)
         gas_worker.suggested.connect(self._on_gas_suggested)
         gas_worker.failed.connect(self._on_gas_failed)
         self._start_worker(gas_worker)
@@ -4329,6 +4388,8 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
                  identity_source: Optional[ContractIdentitySource] = None,
                  identity_cache: Optional[ContractIdentityCache] = None,
                  tx_cache: Optional[TransactionCache] = None,
+                 nonce_floor_provider:
+                     "Optional[Callable[[int, str], Optional[int]]]" = None,
                  parent=None):
         super().__init__(parent)
         # Address book = (address, label) of the user's OWN wallets only —
@@ -4347,6 +4408,7 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
             identity_cache if identity_cache is not None
             else ContractIdentityCache())
         self._tx_cache = tx_cache
+        self._nonce_floor_provider = nonce_floor_provider
         self._start_worker = start_worker
         self._token_info = token_info
         self._icon_cache = icon_cache
@@ -5174,7 +5236,9 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
                 value_wei=0,
                 data=_erc20_transfer_calldata(recipient, 1),
             )
-        gas_worker = GasSuggestionWorker(self.chain, probe)
+        floor = (self._nonce_floor_provider(self.chain.chain_id, self._from_addr)
+                 if self._nonce_floor_provider is not None else None)
+        gas_worker = GasSuggestionWorker(self.chain, probe, nonce_floor=floor)
         gas_worker.suggested.connect(self._on_gas_suggested)
         gas_worker.failed.connect(self._on_gas_failed)
         self._start_worker(gas_worker)

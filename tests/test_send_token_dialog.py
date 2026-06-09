@@ -153,7 +153,7 @@ class TestGasEstimateNoPlaceholder:
         constructed: list = []
 
         class _StubWorker:
-            def __init__(self, chain, req):
+            def __init__(self, chain, req, nonce_floor=None):
                 constructed.append(req)
                 self.suggested = MagicMock(connect=MagicMock())
                 self.failed = MagicMock(connect=MagicMock())
@@ -184,7 +184,7 @@ class TestGasReestimateOnRecipientChange:
         constructed: list = []
 
         class _StubWorker:
-            def __init__(self, chain, req):
+            def __init__(self, chain, req, nonce_floor=None):
                 constructed.append(req)
                 self.suggested = MagicMock(connect=MagicMock())
                 self.failed = MagicMock(connect=MagicMock())
@@ -213,7 +213,7 @@ class TestGasReestimateOnRecipientChange:
         constructed: list = []
 
         class _StubWorker:
-            def __init__(self, chain, req):
+            def __init__(self, chain, req, nonce_floor=None):
                 constructed.append(req)
                 self.suggested = MagicMock(connect=MagicMock())
                 self.failed = MagicMock(connect=MagicMock())
@@ -239,7 +239,7 @@ class TestGasReestimateOnRecipientChange:
         constructed: list = []
 
         class _StubWorker:
-            def __init__(self, chain, req):
+            def __init__(self, chain, req, nonce_floor=None):
                 constructed.append(req)
                 self.suggested = MagicMock(connect=MagicMock())
                 self.failed = MagicMock(connect=MagicMock())

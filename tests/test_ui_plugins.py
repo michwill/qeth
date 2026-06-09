@@ -999,7 +999,9 @@ class TestOnTxDropped:
         plugin._cache[key] = [self._pending()]
         plugin._disk_cache.save(*key, plugin._cache[key])
 
-        plugin._on_tx_dropped(ETH, plugin._cache[key][0].hash)
+        h = plugin._cache[key][0].hash
+        for _ in range(plugin.DROP_CONFIRM_READINGS):
+            plugin._on_tx_dropped(ETH, h)
 
         tx = plugin._cache[key][0]
         assert tx.pending is False
@@ -1008,6 +1010,18 @@ class TestOnTxDropped:
         assert tx.raw_signed is None       # no point re-broadcasting a dead nonce
         # Disk round-trip preserves the dropped state.
         assert plugin._disk_cache.load(*key)[0].dropped is True
+
+    def test_single_reading_keeps_it_pending(self, qtbot, tmp_qeth):
+        # One "looks dropped" reading is unreliable behind a load-balanced RPC,
+        # so the tx must stay pending for the next tick to re-check — not flip
+        # to the terminal dropped state on the strength of a single null receipt.
+        plugin = TransactionsPlugin()
+        qtbot.addWidget(plugin.widget())
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [self._pending()]
+        plugin._on_tx_dropped(ETH, plugin._cache[key][0].hash)
+        assert plugin._cache[key][0].pending is True
+        assert plugin._cache[key][0].dropped is False
 
     def test_dropped_glyph_distinct_from_revert(self, qtbot, tmp_qeth):
         plugin = TransactionsPlugin()
@@ -1020,7 +1034,9 @@ class TestOnTxDropped:
         plugin._rendered_for = key
         assert panel.table.item(0, 0).toolTip() == "Pending"
 
-        plugin._on_tx_dropped(ETH, plugin._cache[key][0].hash)
+        h = plugin._cache[key][0].hash
+        for _ in range(plugin.DROP_CONFIRM_READINGS):
+            plugin._on_tx_dropped(ETH, h)
         assert panel.table.item(0, 0).toolTip().startswith("Dropped")   # not ✗
 
 

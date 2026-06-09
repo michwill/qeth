@@ -611,6 +611,7 @@ class MainWindow(QMainWindow):
             icon_cache=self.icon_cache(),
             native_price_usd=native_price_usd,
             known_addresses=self.account_addresses(),
+            nonce_floor_provider=self.transactions_plugin.pending_nonce_floor,
             parent=self,
         )
         self._launch_sign_flow(
@@ -662,6 +663,7 @@ class MainWindow(QMainWindow):
             ),
             known_addresses=self.account_addresses(),
             address_book=self.account_book(),
+            nonce_floor_provider=self.transactions_plugin.pending_nonce_floor,
             parent=self,
         )
         self._launch_sign_flow(
