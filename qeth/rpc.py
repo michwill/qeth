@@ -605,52 +605,58 @@ class RpcServer:
             (c for c in self.store.chains if c.chain_id == cid),
             self.store.current_chain(),
         )
-        host = chain.rpc_url
-        now = asyncio.get_event_loop().time()
-        last_fail = self._host_last_fail.get(host)
-        if last_fail is not None and (now - last_fail) < self._FAIL_FAST_S:
-            # A previous request to this host has just failed —
-            # don't pile on another 15 s timeout. The dapp gets a
-            # standard JSON-RPC error and can retry; meanwhile the
-            # background re-probe path (the next request after
-            # the cool-down) tells us if connectivity is back.
-            raise RpcError(-32603, "upstream temporarily unreachable")
+        # Try the chain's primary RPC, then its fallbacks — the same list
+        # EthClient fails over but the proxy previously ignored. A transport
+        # blip on one provider (DNS hiccup, host down, a garbage body) now
+        # fails over to the next instead of failing the dapp's request; we only
+        # give up once every provider is exhausted (or on its fail-fast cooldown).
+        urls = [chain.rpc_url, *chain.fallback_rpcs]
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         assert self._client is not None  # set in _serve() before any request is handled
-        try:
-            async with self._client.post(
-                chain.rpc_url, json=payload, timeout=15,
-            ) as r:
-                status = r.status
-                body = await r.text()
-        except (
-            ClientConnectorError,
-            ClientOSError,
-            ServerDisconnectedError,
-            asyncio.TimeoutError,
-        ):
-            self._host_last_fail[host] = now
-            raise
-        try:
-            data = json.loads(body)
-        except (json.JSONDecodeError, ValueError):
-            # Upstream returned a non-JSON / truncated body — DRPC under
-            # load, a connection cut mid-response, a Cloudflare error page,
-            # etc. Don't let a JSONDecodeError crash the dispatch with a
-            # traceback: treat it as a host failure (so fail-fast kicks in)
-            # and hand the dapp a clean JSON-RPC error.
-            self._host_last_fail[host] = now
-            log.warning(
-                "proxy %s: non-JSON response from %s (HTTP %s): %r",
-                method, host, status, body[:200],
-            )
-            raise RpcError(
-                -32603, f"upstream returned an invalid response (HTTP {status})",
-            )
-        # Successful response — clear any prior fail-fast cooldown
-        # so the very next request goes through normally.
-        self._host_last_fail.pop(host, None)
-        if "error" in data and data["error"]:
-            err = data["error"]
-            raise RpcError(err.get("code", -32603), err.get("message", "upstream error"))
-        return data.get("result")
+        now = asyncio.get_event_loop().time()
+        last_err: Optional[Exception] = None
+        for url in urls:
+            last_fail = self._host_last_fail.get(url)
+            if last_fail is not None and (now - last_fail) < self._FAIL_FAST_S:
+                continue  # on cooldown — skip rather than pile on a 15 s timeout
+            try:
+                async with self._client.post(
+                    url, json=payload, timeout=15,
+                ) as r:
+                    status = r.status
+                    body = await r.text()
+            except (
+                ClientConnectorError,
+                ClientOSError,
+                ServerDisconnectedError,
+                asyncio.TimeoutError,
+            ) as e:
+                self._host_last_fail[url] = now
+                last_err = e
+                continue  # transport failure — fail over to the next provider
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                # Non-JSON / truncated body (DRPC under load, a cut connection,
+                # a Cloudflare error page). Treat as a host failure and fail
+                # over; surface it only if every provider is exhausted.
+                self._host_last_fail[url] = now
+                log.warning(
+                    "proxy %s: non-JSON response from %s (HTTP %s): %r",
+                    method, url, status, body[:200],
+                )
+                last_err = RpcError(
+                    -32603, f"upstream returned an invalid response (HTTP {status})",
+                )
+                continue
+            # Success — clear this host's cooldown so it's preferred next time.
+            self._host_last_fail.pop(url, None)
+            if "error" in data and data["error"]:
+                err = data["error"]
+                raise RpcError(err.get("code", -32603), err.get("message", "upstream error"))
+            return data.get("result")
+        # Every provider failed or is on cooldown. Surface the last error — a
+        # connection error gets demoted to a one-line WARNING by _handle_one.
+        if last_err is not None:
+            raise last_err
+        raise RpcError(-32603, "upstream temporarily unreachable")

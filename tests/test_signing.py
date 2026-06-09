@@ -1312,21 +1312,25 @@ class TestRpcProxyFailFast:
         assert asyncio.run(go()) is True
 
     def test_within_cooldown_short_circuits_without_calling_upstream(self):
+        # Short-circuit only when EVERY provider (primary + fallbacks) is on
+        # cooldown — otherwise the proxy fails over to a fresh one.
         from qeth.rpc import RpcError
+        from qeth.chains import DEFAULT_CHAINS
         server, host = self._make_server()
-        client = self._client("ok")  # would succeed if it were ever called
+        client = self._client("ok")  # would succeed if any host were tried
         server._client = client
 
         async def go():
             loop = asyncio.get_event_loop()
-            server._host_last_fail[host] = loop.time()  # failed just now
+            for url in [DEFAULT_CHAINS[0].rpc_url, *DEFAULT_CHAINS[0].fallback_rpcs]:
+                server._host_last_fail[url] = loop.time()  # all failed just now
             with pytest.raises(RpcError) as ei:
                 await server._proxy("eth_blockNumber", [])
             return ei.value.code, client.calls
 
         code, calls = asyncio.run(go())
         assert code == -32603
-        assert calls == 0  # never hit the wire during the cooldown
+        assert calls == 0  # never hit the wire — every provider on cooldown
 
     def test_success_after_cooldown_clears_the_mark(self):
         server, host = self._make_server()

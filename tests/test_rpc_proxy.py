@@ -75,3 +75,40 @@ def test_proxy_upstream_json_error_is_surfaced():
     with pytest.raises(RpcError) as ei:
         asyncio.run(srv._proxy("eth_call", []))
     assert ei.value.code == -32000
+
+
+def test_proxy_fails_over_to_fallback_on_transport_error():
+    """A transport blip (e.g. a DNS timeout) on the primary RPC fails over to
+    the chain's fallback_rpcs instead of failing the dapp — the DNS-outage fix."""
+    from aiohttp import ServerDisconnectedError
+    chain = DEFAULT_CHAINS[0]
+    primary, fallback = chain.rpc_url, chain.fallback_rpcs[0]
+
+    class _FailResp:
+        async def __aenter__(self):
+            raise ServerDisconnectedError()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _FailoverClient:
+        closed = False
+
+        def __init__(self):
+            self.tried = []
+
+        def post(self, url, *a, **k):
+            self.tried.append(url)
+            if url == primary:
+                return _FailResp()
+            return _FakeResp(200, '{"jsonrpc":"2.0","id":1,"result":"0xbeef"}')
+
+    store = MagicMock()
+    store.current_chain.return_value = chain
+    store.chains = [chain]
+    srv = RpcServer(store)
+    client = _FailoverClient()
+    srv._client = client
+
+    assert asyncio.run(srv._proxy("eth_call", [])) == "0xbeef"
+    assert client.tried == [primary, fallback]  # primary, then failed over
