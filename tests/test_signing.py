@@ -1757,3 +1757,15 @@ class TestRpcEventBroadcast:
         with pytest.raises(RpcError):
             asyncio.run(go())
         ws.send_str.assert_not_awaited()
+
+
+def test_chain_added_signal_carries_ids_above_qint32(qtbot):
+    """Dapp-supplied chain ids (wallet_addEthereumChain) can exceed qint32 —
+    Palm mainnet is 11297108109. The bridge's chain_added is declared
+    ``Signal("qulonglong")`` so the id arrives exactly; ``Signal(int)``
+    (qint32) would overflow at emit."""
+    bridge = SignerBridge()
+    got: list = []
+    bridge.chain_added.connect(got.append)
+    bridge.chain_added.emit(11297108109)
+    assert got == [11297108109]

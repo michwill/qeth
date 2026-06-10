@@ -16,7 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 
-from . import USER_AGENT
+from . import QULONGLONG, USER_AGENT
 
 log = logging.getLogger("qeth.icons")
 
@@ -128,7 +128,7 @@ class _ChainIconFetchWorker(QThread):
     quietly to the next URL; only when all sources miss do we
     emit ``None`` so the caller can drop the row entirely."""
 
-    fetched = Signal(int, object)  # (chain_id, bytes | None)
+    fetched = Signal(QULONGLONG, object)  # (chain_id, bytes | None)
 
     def __init__(self, chain_id: int, urls: list[str], parent=None):
         super().__init__(parent)
@@ -162,7 +162,7 @@ class ChainIconCache(QObject):
 
     Disk layout: ``~/.qeth/icons/chains/<chain_id>.png``."""
 
-    icon_ready = Signal(int)  # chain_id
+    icon_ready = Signal(QULONGLONG)  # chain_id (dapp-added ids can exceed qint32)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -228,7 +228,7 @@ class ChainIconCache(QObject):
 
 
 class _IconFetchWorker(QThread):
-    fetched = Signal(int, str, object)  # (chain_id, contract_lower, bytes|None)
+    fetched = Signal(QULONGLONG, str, object)  # (chain_id, contract_lower, bytes|None)
 
     def __init__(self, chain_id: int, contract: str, url: str, parent=None):
         super().__init__(parent)
@@ -259,7 +259,7 @@ class IconCache(QObject):
     icon arrives.
     """
 
-    icon_ready = Signal(int, str)  # (chain_id, contract_lower)
+    icon_ready = Signal(QULONGLONG, str)  # (chain_id, contract_lower)
 
     def __init__(self, parent=None):
         super().__init__(parent)

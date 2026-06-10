@@ -143,6 +143,19 @@ def _watcher():
     return LiveWatcher(lambda: [])       # no provider needed for direct probe
 
 
+def _pin_recorder(w):
+    """Shadow ``_broadcast_pinned`` with a recorder. Re-broadcasts must go
+    through the pinned-primary path — never the live ws transport (which
+    ``ws_urls_for`` may have connected to a *fallback*-derived endpoint)."""
+    sent: list = []
+
+    async def rec(chain, raw):
+        sent.append((chain.rpc_url, raw))
+
+    w._broadcast_pinned = rec            # instance attr shadows the staticmethod
+    return sent
+
+
 def test_probe_one_confirms_on_receipt(qapp):
     w = _watcher()
     got: list = []
@@ -157,6 +170,7 @@ def test_probe_one_confirms_on_receipt(qapp):
 
 def test_probe_one_drops_when_nonce_consumed(qapp):
     w = _watcher()
+    sent = _pin_recorder(w)
     drops: list = []
     w.dropped.connect(lambda c, h: drops.append(h))
     w3 = _FakeW3(_FakeProvider({
@@ -167,23 +181,45 @@ def test_probe_one_drops_when_nonce_consumed(qapp):
 
     asyncio.run(w._probe_one(_chain(100), tx, w3))
     assert drops == ["0xabc"]
-    assert w3.provider.sent == []           # dropped, so no re-broadcast
+    assert sent == []                       # dropped, so no re-broadcast
 
 
-def test_probe_one_rebroadcasts_when_still_open(qapp):
+def test_probe_one_rebroadcasts_pinned_when_still_open(qapp):
     w = _watcher()
+    sent = _pin_recorder(w)
+    chain = _chain(100)
     prov = _FakeProvider({
         "eth_getTransactionReceipt": None,
         "eth_getTransactionCount": "0x5",     # latest == tx nonce -> still open
     })
     tx = PendingTx("0xabc", "0xfrom", 5, "0xraw")
 
-    asyncio.run(w._probe_one(_chain(100), tx, _FakeW3(prov)))
-    assert prov.sent == ["0xraw"]
+    asyncio.run(w._probe_one(chain, tx, _FakeW3(prov)))
+    # Re-broadcast went to the chain's PRIMARY rpc via the pinned path…
+    assert sent == [(chain.rpc_url, "0xraw")]
+    # …and NEVER through the live transport (possibly a fallback's socket).
+    assert prov.sent == []
+
+
+def test_probe_one_emits_still_pending_when_open(qapp):
+    """An open-nonce reading must emit still_pending — the plugin uses it to
+    reset its tentative drop count (DROP_CONFIRM_READINGS is consecutive)."""
+    w = _watcher()
+    _pin_recorder(w)
+    pend: list = []
+    w.still_pending.connect(lambda c, h: pend.append(h))
+    prov = _FakeProvider({
+        "eth_getTransactionReceipt": None,
+        "eth_getTransactionCount": "0x5",
+    })
+    asyncio.run(w._probe_one(
+        _chain(100), PendingTx("0xabc", "0xfrom", 5, "0xraw"), _FakeW3(prov)))
+    assert pend == ["0xabc"]
 
 
 def test_probe_one_rebroadcast_is_capped(qapp):
     w = _watcher()
+    sent = _pin_recorder(w)
     prov = _FakeProvider({
         "eth_getTransactionReceipt": None,
         "eth_getTransactionCount": "0x5",
@@ -193,7 +229,46 @@ def test_probe_one_rebroadcast_is_capped(qapp):
 
     for _ in range(LiveWatcher.REBROADCAST_MAX_ATTEMPTS + 3):
         asyncio.run(w._probe_one(_chain(100), tx, w3))
-    assert len(prov.sent) == LiveWatcher.REBROADCAST_MAX_ATTEMPTS
+    assert len(sent) == LiveWatcher.REBROADCAST_MAX_ATTEMPTS
+
+
+class _FakeAiohttpResp:
+    async def read(self):
+        return b'{"result": "0x"}'
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeAiohttpSession:
+    def __init__(self, posted, **kw):
+        self._posted = posted
+
+    def post(self, url, **kw):
+        self._posted.append(url)
+        return _FakeAiohttpResp()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_broadcast_pinned_posts_only_to_primary(monkeypatch):
+    """The pinned broadcast POSTs eth_sendRawTransaction to chain.rpc_url and
+    nothing else — no fallback, no failover (Gnosis here has two fallbacks)."""
+    posted: list = []
+    monkeypatch.setattr(
+        lw.aiohttp, "ClientSession",
+        lambda **kw: _FakeAiohttpSession(posted, **kw))
+    chain = _chain(100)
+    assert chain.fallback_rpcs            # the test is vacuous without them
+    asyncio.run(LiveWatcher._broadcast_pinned(chain, "0xraw"))
+    assert posted == [chain.rpc_url]
 
 
 # --- Transfer-log subscription (Phase 2) ----------------------------------

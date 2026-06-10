@@ -1084,6 +1084,28 @@ class TestOnTxDropped:
         # Disk round-trip preserves the dropped state.
         assert plugin._disk_cache.load(*key)[0].dropped is True
 
+    def test_contradicting_still_pending_resets_the_count(self, qtbot, tmp_qeth):
+        """dropped ×2, STILL PENDING, dropped ×2 — must NOT flip: the
+        DROP_CONFIRM_READINGS guard counts CONSECUTIVE readings, and a
+        contradicting still-open reading resets the tally. Without the reset
+        the count is cumulative over the session and a flappy load-balanced
+        RPC still falsely drops a pending tx, just more slowly."""
+        plugin = TransactionsPlugin()
+        qtbot.addWidget(plugin.widget())
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [self._pending()]
+        plugin._disk_cache.save(*key, plugin._cache[key])
+        h = plugin._cache[key][0].hash
+
+        for _ in range(plugin.DROP_CONFIRM_READINGS - 1):
+            plugin._on_tx_dropped(ETH, h)
+        plugin._on_tx_still_pending(ETH, h)     # contradiction → tally resets
+        for _ in range(plugin.DROP_CONFIRM_READINGS - 1):
+            plugin._on_tx_dropped(ETH, h)
+        assert plugin._cache[key][0].pending is True    # not believed yet
+        plugin._on_tx_dropped(ETH, h)           # 3rd CONSECUTIVE reading
+        assert plugin._cache[key][0].dropped is True
+
     def test_single_reading_keeps_it_pending(self, qtbot, tmp_qeth):
         # One "looks dropped" reading is unreliable behind a load-balanced RPC,
         # so the tx must stay pending for the next tick to re-check — not flip

@@ -112,3 +112,86 @@ def test_proxy_fails_over_to_fallback_on_transport_error():
 
     assert asyncio.run(srv._proxy("eth_call", [])) == "0xbeef"
     assert client.tried == [primary, fallback]  # primary, then failed over
+
+
+# --- broadcasts: pinned to the user's chosen RPC, never a fallback ---------
+
+class _RecordingClient:
+    """Records every POSTed url; raises a transport error for ``fail_urls``."""
+    closed = False
+
+    def __init__(self, body, fail_urls=()):
+        self._body = body
+        self._fail = set(fail_urls)
+        self.tried: list = []
+
+    def post(self, url, *a, **k):
+        self.tried.append(url)
+        if url in self._fail:
+            class _Boom:
+                async def __aenter__(self):
+                    from aiohttp import ServerDisconnectedError
+                    raise ServerDisconnectedError()
+
+                async def __aexit__(self, *exc):
+                    return False
+            return _Boom()
+        return _FakeResp(200, self._body)
+
+
+def _recording_server(body, fail_urls=()):
+    store = MagicMock()
+    store.current_chain.return_value = DEFAULT_CHAINS[0]
+    store.chains = [DEFAULT_CHAINS[0]]
+    srv = RpcServer(store)
+    srv._client = _RecordingClient(body, fail_urls)
+    return srv
+
+
+def test_proxy_broadcast_goes_only_to_primary():
+    srv = _recording_server('{"jsonrpc":"2.0","id":1,"result":"0xhash"}')
+    out = asyncio.run(srv._proxy(
+        "eth_sendRawTransaction", ["0xraw"], broadcast=True))
+    assert out == "0xhash"
+    assert srv._client.tried == [DEFAULT_CHAINS[0].rpc_url]
+
+
+def test_proxy_broadcast_does_not_fail_over():
+    """Primary down → the broadcast ERRORS; the signed tx must never be
+    relayed to a fallback (it would leak a private / MEV-protected tx into a
+    public mempool and override the user's endpoint choice)."""
+    chain = DEFAULT_CHAINS[0]
+    srv = _recording_server('{"jsonrpc":"2.0","id":1,"result":"0xhash"}',
+                            fail_urls={chain.rpc_url})
+    with pytest.raises(Exception):
+        asyncio.run(srv._proxy(
+            "eth_sendRawTransaction", ["0xraw"], broadcast=True))
+    assert srv._client.tried == [chain.rpc_url]   # fallbacks untouched
+
+
+def test_proxy_broadcast_ignores_fail_fast_cooldown():
+    """With no alternative allowed, a broadcast must TRY a primary that's on
+    the fail-fast cooldown rather than skip straight to 'unreachable'."""
+    chain = DEFAULT_CHAINS[0]
+    srv = _recording_server('{"jsonrpc":"2.0","id":1,"result":"0xhash"}')
+    srv._host_last_fail[chain.rpc_url] = 1e18     # permanently "just failed"
+    out = asyncio.run(srv._proxy(
+        "eth_sendRawTransaction", ["0xraw"], broadcast=True))
+    assert out == "0xhash"
+    assert srv._client.tried == [chain.rpc_url]
+
+
+def test_handle_one_routes_raw_broadcast_with_broadcast_flag():
+    """The dispatch special-cases eth_sendRawTransaction → broadcast=True."""
+    srv = _recording_server('{"jsonrpc":"2.0","id":1,"result":"0xhash"}')
+    calls: dict = {}
+
+    async def fake_proxy(method, params, origin=None, broadcast=False):
+        calls.update(method=method, broadcast=broadcast)
+        return "0xhash"
+
+    srv._proxy = fake_proxy
+    asyncio.run(srv._handle_one(
+        {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+         "params": ["0xraw"]}, None))
+    assert calls == {"method": "eth_sendRawTransaction", "broadcast": True}

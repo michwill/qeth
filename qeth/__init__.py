@@ -1,4 +1,13 @@
+from typing import Any
+
 __version__ = "0.11.2"
+
+# PySide6 accepts C++ type names as strings in ``Signal(...)`` declarations;
+# ``"qulonglong"`` marshals a chain id through unsigned 64-bit (dapp-added
+# chain ids exceed qint32 — Palm = 11297108109). The PySide6 stubs type
+# Signal's args as ``type``, so the string form trips mypy; typing this
+# constant ``Any`` keeps call sites clean. See CLAUDE.md "PySide6 signals".
+QULONGLONG: Any = "qulonglong"
 
 # Single source of truth for the HTTP User-Agent we send on every
 # outbound request. DRPC's Cloudflare rejects the default

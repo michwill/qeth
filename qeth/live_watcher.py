@@ -36,8 +36,10 @@ import logging
 import threading
 from typing import (TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional)
 
+import aiohttp
 from PySide6.QtCore import QThread, Signal
 
+from . import USER_AGENT
 from .async_chain import make_async_web3, ws_urls_for
 
 if TYPE_CHECKING:
@@ -94,6 +96,7 @@ class LiveWatcher(QThread):
     link_state = Signal(object, bool)        # (chain, ws_connected)
     confirmed = Signal(object, str, object)  # (chain, hash, raw receipt dict)
     dropped = Signal(object, str)            # (chain, hash) — nonce consumed
+    still_pending = Signal(object, str)      # (chain, hash) — probe saw it open
     balance_dirty = Signal(object, str, str)  # (chain, account, token_address)
 
     _POLL_S = 1.0          # supervisor reconcile / stop-poll cadence
@@ -314,9 +317,12 @@ class LiveWatcher(QThread):
             self.dropped.emit(chain, tx.hash)
             self._forget(tx.hash)
             return
-        await self._maybe_rebroadcast(tx, w3)
+        # Nonce still open — a contradicting reading that cancels any
+        # tentative drop count (DROP_CONFIRM_READINGS means CONSECUTIVE).
+        self.still_pending.emit(chain, tx.hash)
+        await self._maybe_rebroadcast(tx, chain)
 
-    async def _maybe_rebroadcast(self, tx: PendingTx, w3: Any) -> None:
+    async def _maybe_rebroadcast(self, tx: PendingTx, chain: "Chain") -> None:
         if not tx.raw_signed:
             return
         attempts = self._rebroadcast_attempts.get(tx.hash, 0)
@@ -330,10 +336,30 @@ class LiveWatcher(QThread):
             return
         self._rebroadcast_attempts[tx.hash] = attempts + 1
         try:
-            await self._rpc(w3, "eth_sendRawTransaction", [tx.raw_signed])
+            await self._broadcast_pinned(chain, tx.raw_signed)
         except Exception as e:
             # "already known" / "nonce too low" are expected + harmless.
             log.debug("re-broadcast of %s: %s", tx.hash, e)
+
+    @staticmethod
+    async def _broadcast_pinned(chain: "Chain", raw_signed: str) -> None:
+        """Re-broadcast ONLY via the user's chosen RPC — never the live ws
+        connection (``ws_urls_for`` may have connected to a *fallback*-derived
+        endpoint) and never the async http failover stack. Same policy as
+        ``EthClient.send_raw_transaction``: a signed tx relayed to a fallback
+        would leak a private / MEV-protected transaction into a public mempool.
+        One-shot session: rebroadcasts are rare (capped per tx), so there's no
+        long-lived session to manage on the watcher's loop. A JSON-RPC error
+        body ("already known", "nonce too low") is a valid, harmless answer —
+        only transport errors raise (and the caller logs them at debug)."""
+        payload = {"jsonrpc": "2.0", "id": 1,
+                   "method": "eth_sendRawTransaction", "params": [raw_signed]}
+        async with aiohttp.ClientSession(
+                headers={"User-Agent": USER_AGENT}) as session:
+            async with session.post(
+                    chain.rpc_url, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                await resp.read()
 
     def _forget(self, tx_hash: str) -> None:
         self._rebroadcast_attempts.pop(tx_hash, None)

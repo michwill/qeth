@@ -34,6 +34,7 @@ from eth_utils import to_checksum_address
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from . import QULONGLONG
 
 log = logging.getLogger("qeth.signing")
 
@@ -351,8 +352,10 @@ class SignerBridge(QObject):
     # Fired from the RPC thread when a dapp adds a chain via
     # ``wallet_addEthereumChain``. The UI uses this to append the
     # new chain to the toolbar combo (and kick icon discovery)
-    # without waiting for the user to restart.
-    chain_added = Signal(int)
+    # without waiting for the user to restart. ``"qulonglong"``, not
+    # ``int``: the id is dapp-supplied and real chains exceed qint32
+    # (Palm = 11297108109) — Signal(int) would overflow at emit.
+    chain_added = Signal(QULONGLONG)
 
     async def submit_async(self, req) -> str:
         """Called from the aiohttp event loop. Emits the signal

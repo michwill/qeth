@@ -67,8 +67,19 @@ of container parameters declared as `dict` / `list` / `tuple`, so
 hit qint64 overflow at ~3.2×10¹⁹ on raw ERC-20 balances). Treat
 container parameters carrying chain values the same way — use
 `Signal(..., object, ...)` not `Signal(..., dict, ...)`. `int` is
-fine only for small, bounded primitives (chain ids, list indices,
-derivation indices, table rows).
+fine only for small, bounded primitives (list indices, derivation
+indices, table rows, page numbers).
+
+**Chain ids are NOT bounded** — dapps add chains via
+`wallet_addEthereumChain` with ids above qint32 (Palm = 11297108109),
+so a chain-id parameter uses the string-typed 64-bit form:
+`Signal(QULONGLONG, ...)` with `from qeth import QULONGLONG` (an
+`Any`-typed `"qulonglong"` — PySide6 accepts C++ type names as
+strings, but the stubs type Signal's args as `type`, so the bare
+string literal trips mypy). `"qulonglong"` round-trips any practical
+chain id exactly — verified up to 2⁶³⁺. Money values stay `object`:
+uint256 outgrows *any* Qt integer type — 10 ETH = 10¹⁹ wei already
+exceeds qint64.
 
 ### Long-lived QThreads
 

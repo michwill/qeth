@@ -584,6 +584,15 @@ class RpcServer:
                 "eth_signTransaction not supported (use eth_sendTransaction)",
             )
 
+        if method == "eth_sendRawTransaction":
+            # A dapp-submitted, pre-signed tx. Broadcast ONLY via the user's
+            # chosen RPC — never a fallback (the same policy as
+            # ``EthClient.send_raw_transaction``): relaying a signed tx to a
+            # fallback would leak a private / MEV-protected transaction into a
+            # public mempool and override the user's explicit endpoint choice.
+            return await self._proxy(method, params, origin=origin,
+                                     broadcast=True)
+
         return await self._proxy(method, params, origin=origin)
 
     # Recent transient failures per upstream host. When a host has
@@ -606,6 +615,7 @@ class RpcServer:
     async def _proxy(
         self, method: str, params: list,
         origin: Optional[str] = None,
+        broadcast: bool = False,
     ) -> Any:
         # Route reads to the requesting origin's chain (per
         # wallet_switchEthereumChain), falling back to the wallet
@@ -620,14 +630,19 @@ class RpcServer:
         # blip on one provider (DNS hiccup, host down, a garbage body) now
         # fails over to the next instead of failing the dapp's request; we only
         # give up once every provider is exhausted (or on its fail-fast cooldown).
-        urls = [chain.rpc_url, *chain.fallback_rpcs]
+        # EXCEPT broadcasts: a signed tx goes ONLY to the user's chosen RPC —
+        # never a fallback, and never skipped for a cooldown (with no
+        # alternative allowed, trying a recently-failed primary beats failing
+        # outright).
+        urls = [chain.rpc_url] if broadcast else [chain.rpc_url, *chain.fallback_rpcs]
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         assert self._client is not None  # set in _serve() before any request is handled
         now = asyncio.get_event_loop().time()
         last_err: Optional[Exception] = None
         for url in urls:
             last_fail = self._host_last_fail.get(url)
-            if last_fail is not None and (now - last_fail) < self._FAIL_FAST_S:
+            if (not broadcast and last_fail is not None
+                    and (now - last_fail) < self._FAIL_FAST_S):
                 continue  # on cooldown — skip rather than pile on a 15 s timeout
             try:
                 async with self._client.post(

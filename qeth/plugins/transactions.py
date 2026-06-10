@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from .. import QULONGLONG
 from ..abi import (
     KNOWN_EVENT_NAMES, BlockscoutAbiSource, EtherscanV2AbiSource,
     RoutedAbiSource, decode_call, decode_event,
@@ -341,6 +342,9 @@ class PendingTxWatcher(QObject):
 
     def _on_still_pending(self, _chain, tx_hash: str) -> None:
         self._in_flight_hashes.discard(tx_hash)
+        # Contradicting reading → reset the plugin's tentative drop count
+        # (DROP_CONFIRM_READINGS counts consecutive readings, not cumulative).
+        self._plugin._on_tx_still_pending(_chain, tx_hash)
 
     def _on_failed(self, _chain, tx_hash: str, msg: str) -> None:
         self._in_flight_hashes.discard(tx_hash)
@@ -677,7 +681,9 @@ class TransactionsWorker(QThread):
     empty round-trip."""
 
     # Object signal carries Python objects (avoids qint64 marshalling).
-    fetched = Signal(int, str, int, object, bool, object)
+    # Chain id travels as ``"qulonglong"`` — dapp-added chains can have ids
+    # above qint32 (e.g. Palm = 11297108109), where Signal(int) overflows.
+    fetched = Signal(QULONGLONG, str, int, object, bool, object)
     # (chain_id, addr_lower, page_idx, list[Transaction], has_more)
     failed = Signal(str)
 
@@ -745,7 +751,7 @@ class TxActivityWorker(QThread):
     sharing the disk ABI cache. Best-effort: on failure those rows just
     keep showing the hash. Emits ``{tx_hash: Activity}``."""
 
-    loaded = Signal(int, str, object)   # (chain_id, addr_lower, dict[str, Activity])
+    loaded = Signal(QULONGLONG, str, object)   # (chain_id, addr_lower, dict[str, Activity])
 
     def __init__(self, chain, address: str, txs: list[Transaction],
                  abi_cache: AbiCache, parent=None):
@@ -779,7 +785,7 @@ class ReceiptScanWorker(QThread):
     back, so the activity can be filled in from the Transfer events the
     indexer missed. Best-effort, sequential, capped — these are rare."""
 
-    found = Signal(int, str, object)   # chain_id, tx_hash, receipt logs
+    found = Signal(QULONGLONG, str, object)   # chain_id, tx_hash, receipt logs
 
     def __init__(self, chain, hashes: list[str], parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -969,6 +975,7 @@ class TransactionsPlugin(Plugin):
             )
             self._live_watcher.confirmed.connect(self._on_receipt_confirmed)
             self._live_watcher.dropped.connect(self._on_tx_dropped)
+            self._live_watcher.still_pending.connect(self._on_tx_still_pending)
             self._live_watcher.link_state.connect(self._on_ws_link_state)
             self._live_watcher.balance_dirty.connect(self._on_balance_dirty)
             self._update_live_account()
@@ -1251,6 +1258,15 @@ class TransactionsPlugin(Plugin):
                 self.note_transfer_legs(chain_id, tx_hash, logs, key[1])
                 return
 
+    def _on_tx_still_pending(self, _chain, tx_hash: str) -> None:
+        """A probe saw the tx still open — a contradicting reading, so cancel
+        any tentative drop count. Without this reset the
+        ``DROP_CONFIRM_READINGS`` guard counts *cumulative* readings over the
+        whole session instead of *consecutive* ones, and a flappy
+        load-balanced RPC (occasionally serving a stale backend) still falsely
+        drops a pending tx — just more slowly."""
+        self._drop_readings.pop(tx_hash, None)
+
     def _on_tx_dropped(self, chain, tx_hash: str) -> None:
         """PendingProbeWorker → here. The tx's nonce was consumed by a
         different tx, so this hash will never confirm. Flip the cached
@@ -1258,11 +1274,13 @@ class TransactionsPlugin(Plugin):
         a revert), drop the stored raw bytes, persist, and repaint the
         one row if it's on screen.
 
-        Guarded by a consecutive-reading count: a single "nonce spent + no
+        Guarded by a CONSECUTIVE-reading count: a single "nonce spent + no
         receipt" reading is unreliable behind an RPC load balancer (a backend
         can return a null receipt for a tx that IS mined). Only act once the
         reading repeats ``DROP_CONFIRM_READINGS`` times across ticks — by then
-        a mined tx's receipt has propagated and confirmed instead."""
+        a mined tx's receipt has propagated and confirmed instead. A
+        contradicting still-pending / confirmed reading resets the count
+        (``_on_tx_still_pending`` / ``_on_receipt_confirmed``)."""
         seen = self._drop_readings.get(tx_hash, 0) + 1
         self._drop_readings[tx_hash] = seen
         if seen < self.DROP_CONFIRM_READINGS:

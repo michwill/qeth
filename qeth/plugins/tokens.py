@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .. import QULONGLONG
 from ..alerts import warn
 from ..chain import EthClient, wei_to_ether
 from ..formatting import format_balance as _format_balance
@@ -102,8 +103,9 @@ class TokenListWorker(QThread):
 
     # native_wei must travel as ``object``; declaring ``int`` makes PySide6
     # marshal through qint32 and overflows for any balance above ~2.1e9 wei
-    # (well below a millionth of an ETH).
-    fetched = Signal(object, list)
+    # (well below a millionth of an ETH). The token list is ``object`` too —
+    # PySide6 marshals a declared ``list``'s contents.
+    fetched = Signal(object, object)
     failed = Signal(str)
 
     def __init__(self, chain, address: str, source: TokenSource,
@@ -147,7 +149,7 @@ class TokenListWorker(QThread):
 class RiskWorker(QThread):
     """Fetch GoPlus per-contract risk reports for any uncached contracts."""
 
-    fetched = Signal(int, object)
+    fetched = Signal(QULONGLONG, object)   # chain_id can exceed qint32
     failed = Signal(str)
 
     def __init__(self, source: GoPlusRisk, chain_id: int,
@@ -169,7 +171,7 @@ class MetadataWorker(QThread):
     """Fetch (name, symbol, decimals) on-chain via multicall for any
     contracts not already in the metadata cache."""
 
-    fetched = Signal(int, object)
+    fetched = Signal(QULONGLONG, object)   # chain_id can exceed qint32
     failed = Signal(str)
 
     def __init__(self, chain, contracts: list[str], parent=None):
@@ -191,7 +193,7 @@ class BalanceWorker(QThread):
 
     # `dict` would make PySide6 marshal its values through qint64; some
     # ERC-20 raw balances (e.g. ~3.2e19 for ASF with 18 decimals) overflow.
-    refreshed = Signal(int, object, object)
+    refreshed = Signal(QULONGLONG, object, object)
     failed = Signal(str)
 
     def __init__(self, chain, address: str, token_contracts: list[str], parent=None):
@@ -213,7 +215,7 @@ class BalanceWorker(QThread):
 class PricesWorker(QThread):
     """Fetch USD prices for the currently-displayed assets."""
 
-    prices_ready = Signal(int, object)
+    prices_ready = Signal(QULONGLONG, object)
 
     def __init__(self, source: PriceSource, chain, contracts: list[str],
                  include_native: bool, parent=None):
@@ -1339,21 +1341,21 @@ class TokenListPanel(QWidget):
 
     # User asked to hide a specific (chain_id, contract). Empty contract means
     # the native asset row was clicked (no-op for now — can't hide native).
-    hide_requested = Signal(int, str)
+    hide_requested = Signal(QULONGLONG, str)
     # User wants to add a custom token by contract address.
     add_custom_requested = Signal()
     # User wants to pin (force-show) the currently-selected token.
-    pin_requested = Signal(int, str)
+    pin_requested = Signal(QULONGLONG, str)
     # User toggled the "show all" view (no dust, no hide-list — only scams
     # still hidden).
     show_all_toggled = Signal(bool)
     # User double-clicked a token row; carries (chain_id, contract).
     # Native rows don't emit (no token-transfers page for native).
-    transfers_requested = Signal(int, str)
+    transfers_requested = Signal(QULONGLONG, str)
     # User clicked the Send button with a token row selected; carries
     # (chain_id, contract_or_empty_for_native). Plugin pops a Send
     # dialog with the user's recipient + amount + gas controls.
-    send_requested = Signal(int, str)
+    send_requested = Signal(QULONGLONG, str)
 
     NATIVE_CONTRACT = ""  # sentinel for the native row
 
