@@ -1138,6 +1138,37 @@ class TestOnTxDropped:
         plugin._on_tx_dropped(ETH, h)           # 3rd CONSECUTIVE reading
         assert plugin._cache[key][0].dropped is True
 
+    def test_watcher_probes_pending_txs_of_non_selected_accounts(
+            self, qtbot, tmp_qeth):
+        """The pending sweep walks the whole (chain, account) cache — a tx
+        broadcast from account A must keep getting probed/re-broadcast after
+        the user switches the UI to account B. Nothing in the tick may
+        consult the selected address."""
+        from types import SimpleNamespace
+        from qeth.plugins.transactions import (
+            PendingProbeWorker, PendingTxWatcher,
+        )
+        plugin = TransactionsPlugin()
+        qtbot.addWidget(plugin.widget())
+        spawned: list = []
+        plugin.host = SimpleNamespace(
+            chain_by_id=lambda cid: ETH if cid == ETH.chain_id else None,
+            start_worker=spawned.append,
+            selected_address="0x" + "99" * 20,   # a DIFFERENT account on screen
+        )
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [self._pending()]
+
+        watcher = PendingTxWatcher(plugin)
+        watcher._tick()
+
+        assert len(spawned) == 1
+        worker = spawned[0]
+        assert isinstance(worker, PendingProbeWorker)
+        assert worker._tx_hash == plugin._cache[key][0].hash
+        assert worker._raw == "0xdeadbeef"
+        assert worker._rebroadcast is True
+
     def test_single_reading_keeps_it_pending(self, qtbot, tmp_qeth):
         # One "looks dropped" reading is unreliable behind a load-balanced RPC,
         # so the tx must stay pending for the next tick to re-check — not flip

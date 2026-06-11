@@ -962,10 +962,11 @@ class TestSignAndBroadcastWorker:
         assert "hash" not in captured
         assert "user rejected" in captured["msg"]
 
-    def test_broadcast_failure_surfaces(self, qtbot, monkeypatch):
-        """Signer succeeds but eth_sendRawTransaction errors — worker
-        should report broadcast failure, not signing failure."""
-        from qeth import signing
+    def test_node_rejection_surfaces_as_failure(self, qtbot, monkeypatch):
+        """Signer succeeds but the node REJECTS the tx (it answered with
+        an RPC error — those bytes can never land). The worker reports
+        broadcast failure so the dialog stays open for a re-price."""
+        from web3.exceptions import Web3RPCError
         from qeth.signing import SignAndBroadcastWorker
         from qeth.chains import DEFAULT_CHAINS
 
@@ -973,15 +974,15 @@ class TestSignAndBroadcastWorker:
             def can_sign(self, addr): return True
             def sign(self, req, chain): return b"\x01" * 64
 
-        class _BadClient:
+        class _RejectingClient:
             def __init__(self, chain): pass
             def send_raw_transaction(self, raw):
-                raise RuntimeError("nonce too low")
+                raise Web3RPCError("{'code': -32000, 'message': 'nonce too low'}")
 
         # The worker imports EthClient lazily from qeth.chain inside
         # run(); patch the source-of-truth.
         import qeth.chain
-        monkeypatch.setattr(qeth.chain, "EthClient", _BadClient)
+        monkeypatch.setattr(qeth.chain, "EthClient", _RejectingClient)
 
         worker = SignAndBroadcastWorker(_OkSigner(), self._req(), DEFAULT_CHAINS[0])
         captured: dict = {}
@@ -991,6 +992,42 @@ class TestSignAndBroadcastWorker:
         assert "hash" not in captured
         assert "Broadcast failed" in captured["msg"]
         assert "nonce too low" in captured["msg"]
+
+    def test_transport_failure_still_emits_broadcast(self, qtbot, monkeypatch):
+        """The push died at the transport level (timeout / connection drop):
+        the node may or may not hold the tx, so the signed bytes must NOT be
+        dropped on the floor. The worker computes the hash locally (keccak of
+        the signed bytes) and emits broadcast with first_push_ok=False — the
+        pending row gets recorded and PendingTxWatcher re-broadcasts it,
+        regardless of which account is selected afterwards."""
+        from eth_utils import keccak
+        from qeth.signing import SignAndBroadcastWorker
+        from qeth.chains import DEFAULT_CHAINS
+
+        signed = b"\x02\xf8\x6f\x01\x02\x03"
+
+        class _OkSigner:
+            def can_sign(self, addr): return True
+            def sign(self, req, chain): return signed
+
+        class _DeadClient:
+            def __init__(self, chain): pass
+            def send_raw_transaction(self, raw):
+                raise ConnectionError("connection reset by peer")
+
+        import qeth.chain
+        monkeypatch.setattr(qeth.chain, "EthClient", _DeadClient)
+
+        worker = SignAndBroadcastWorker(_OkSigner(), self._req(), DEFAULT_CHAINS[0])
+        captured: dict = {}
+        worker.broadcast.connect(
+            lambda h, raw, ok: captured.update(hash=h, raw=raw, ok=ok))
+        worker.failed.connect(lambda msg: captured.setdefault("msg", msg))
+        worker.run()
+        assert "msg" not in captured
+        assert captured["hash"] == "0x" + keccak(signed).hex()
+        assert captured["raw"] == "0x" + signed.hex()
+        assert captured["ok"] is False
 
     def test_happy_path_emits_broadcast_with_hash(self, qtbot, monkeypatch):
         from qeth.signing import SignAndBroadcastWorker
@@ -1010,10 +1047,12 @@ class TestSignAndBroadcastWorker:
 
         worker = SignAndBroadcastWorker(_OkSigner(), self._req(), DEFAULT_CHAINS[0])
         captured: dict = {}
-        worker.broadcast.connect(lambda h: captured.setdefault("hash", h))
+        worker.broadcast.connect(
+            lambda h, raw, ok: captured.update(hash=h, ok=ok))
         worker.failed.connect(lambda msg: captured.setdefault("msg", msg))
         worker.run()
         assert captured.get("hash") == "0xfeed1234"
+        assert captured.get("ok") is True
         assert "msg" not in captured
 
 

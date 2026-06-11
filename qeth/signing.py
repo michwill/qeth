@@ -420,6 +420,25 @@ def explain_rpc_error(e: Exception) -> str:
     return text
 
 
+def _is_node_rejection(e: Exception) -> bool:
+    """Did the node actually answer with an error (vs a transport
+    failure where the tx may or may not have reached a mempool)?
+    A rejection means these exact signed bytes were validated and
+    refused — re-pushing them can't help, the user must re-price.
+    Anything else is ambiguous: the request may have been accepted
+    with the ack lost, so the tx is worth re-broadcasting."""
+    try:
+        from web3.exceptions import Web3RPCError
+        if isinstance(e, Web3RPCError):
+            return True
+    except ImportError:
+        pass
+    # Some web3 versions stringify the RPC error response as a dict
+    # literal instead of wrapping it (see explain_rpc_error).
+    text = str(e)
+    return text.startswith("{") and "'message'" in text
+
+
 class SignAndBroadcastWorker(QThread):
     """Off-main-thread orchestrator: ``signer.sign(req, chain)`` ->
     ``EthClient(chain).send_raw_transaction(...)`` -> emit the tx
@@ -427,7 +446,12 @@ class SignAndBroadcastWorker(QThread):
     user confirms on the device; the worker keeps the UI responsive
     in the meantime."""
 
-    broadcast = Signal(str, object)   # (tx hash 0x-prefixed, raw signed hex)
+    # (tx hash 0x-prefixed, raw signed hex, first push reached the node).
+    # first_push_ok=False means the broadcast call failed at the transport
+    # level — the tx is still recorded as pending (its hash is just the
+    # keccak of the signed bytes) and the PendingTxWatcher keeps
+    # re-broadcasting it, whatever account is selected meanwhile.
+    broadcast = Signal(str, object, bool)
     failed = Signal(str)              # human-readable reason
 
     def __init__(self, signer: Signer, req: SigningRequest, chain,
@@ -447,16 +471,6 @@ class SignAndBroadcastWorker(QThread):
             log.exception("signer raised unexpectedly")
             self.failed.emit(f"Signing failed: {e}")
             return
-        try:
-            # Import lazily so the test suite can patch EthClient at
-            # module level without the cross-import dance.
-            from .chain import EthClient
-            client = EthClient(self._chain)
-            tx_hash = client.send_raw_transaction(raw)
-        except Exception as e:
-            log.exception("broadcast failed")
-            self.failed.emit(f"Broadcast failed: {explain_rpc_error(e)}")
-            return
         # Keep the raw signed bytes so the pending-tx watcher can
         # re-broadcast if the RPC silently drops the tx. Normalise to a
         # 0x-hex string for storage.
@@ -464,7 +478,30 @@ class SignAndBroadcastWorker(QThread):
             raw_hex = raw if raw.startswith("0x") else "0x" + raw
         else:
             raw_hex = "0x" + bytes(raw).hex()
-        self.broadcast.emit(tx_hash, raw_hex)
+        first_push_ok = True
+        try:
+            # Import lazily so the test suite can patch EthClient at
+            # module level without the cross-import dance.
+            from .chain import EthClient
+            client = EthClient(self._chain)
+            tx_hash = client.send_raw_transaction(raw)
+        except Exception as e:
+            if _is_node_rejection(e):
+                log.exception("broadcast failed")
+                self.failed.emit(f"Broadcast failed: {explain_rpc_error(e)}")
+                return
+            # Transport failure — the node may have accepted the tx and
+            # we lost the ack, or never received it at all. Either way the
+            # signed bytes must not be dropped on the floor: compute the
+            # hash locally and record the tx as pending so the watcher
+            # keeps re-broadcasting it (idempotent, capped) — including
+            # after the user switches to a different account.
+            log.warning("first broadcast push failed (%s) — recording the "
+                        "tx as pending for watcher re-broadcast", e)
+            from eth_utils import keccak
+            tx_hash = "0x" + keccak(bytes.fromhex(raw_hex[2:])).hex()
+            first_push_ok = False
+        self.broadcast.emit(tx_hash, raw_hex, first_push_ok)
 
 
 class SignMessageWorker(QThread):

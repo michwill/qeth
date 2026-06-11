@@ -801,9 +801,9 @@ class MainWindow(QMainWindow):
 
         worker = SignAndBroadcastWorker(signer, finalised, chain)
         worker.broadcast.connect(
-            lambda h, raw, d=dialog, p=progress, r=finalised, c=chain,
+            lambda h, raw, ok, d=dialog, p=progress, r=finalised, c=chain,
                    ob=on_broadcast:
-                self._on_tx_broadcast(h, raw, d, p, r, c, ob)
+                self._on_tx_broadcast(h, raw, ok, d, p, r, c, ob)
         )
         worker.failed.connect(
             lambda msg, d=dialog, p=progress, of=on_fail:
@@ -989,10 +989,19 @@ class MainWindow(QMainWindow):
         progress.close()
         warn(self, "Signing failed", msg)
 
-    def _on_tx_broadcast(self, tx_hash, raw_signed, dialog, progress, req,
-                          chain, on_broadcast) -> None:
+    def _on_tx_broadcast(self, tx_hash, raw_signed, first_push_ok, dialog,
+                          progress, req, chain, on_broadcast) -> None:
         progress.close()
         dialog.accept()
+        if not first_push_ok:
+            # The first push never reached the node (transport failure) —
+            # the tx is recorded as pending below and the watcher keeps
+            # re-broadcasting it, but the user should know it's in limbo
+            # rather than cleanly sent.
+            self.status_message(
+                "⚠ Broadcast did not reach the node — the wallet will keep "
+                "re-trying in the background", timeout_ms=8000,
+            )
         # Snapshot the just-sent tx into the transactions list as a
         # pending row so the user sees it immediately — without
         # waiting for Blockscout indexing (it lags mempool by tens of
