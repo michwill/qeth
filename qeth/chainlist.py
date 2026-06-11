@@ -206,29 +206,23 @@ def probe_rpc(
     return True, latency, None
 
 
-def probe_simulate_v1(url: str, *, timeout: float = 5.0) -> Optional[bool]:
-    """Probe whether ``url`` implements ``eth_simulateV1`` — the one-call
-    simulation method qeth's event preview prefers (much faster than the
-    local fork). Returns:
+_DEAD = "0x000000000000000000000000000000000000dEaD"
+
+
+def _probe_method(url: str, method: str, params: list,
+                  timeout: float) -> Optional[bool]:
+    """POST one JSON-RPC request and classify the endpoint's support for
+    ``method``:
 
     - ``True``  — the endpoint ran the call and returned a result.
-    - ``False`` — a definitive ``-32601`` / method-not-found (e.g.
-      cloudflare-eth, DRPC's Arbitrum, the zkSync gateways).
+    - ``False`` — a definitive ``-32601`` / method-not-found.
     - ``None``  — inconclusive (unreachable, rate-limited, odd error):
       shown as 'unknown' rather than a wrong ✗.
-
-    A throwaway read-only simulation (a 1-wei self-send), so it's safe to
-    fire at arbitrary public endpoints."""
+    """
     if not url.startswith(("http://", "https://")):
         return None
-    dead = "0x000000000000000000000000000000000000dEaD"
     body = json.dumps({
-        "jsonrpc": "2.0", "id": 1, "method": "eth_simulateV1",
-        "params": [{
-            "blockStateCalls": [{"calls": [
-                {"from": dead, "to": dead, "value": "0x1"}]}],
-            "traceTransfers": False, "validation": False,
-        }, "latest"],
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
     }).encode("utf-8")
     req = urllib.request.Request(
         url, data=body, method="POST",
@@ -262,6 +256,40 @@ def probe_simulate_v1(url: str, *, timeout: float = 5.0) -> Optional[bool]:
             or "does not exist" in m or "disabled" in m):
         return False
     return None   # rate-limit / other error → unknown
+
+
+def probe_simulate_v1(url: str, *, timeout: float = 5.0) -> Optional[bool]:
+    """Probe whether ``url`` implements ``eth_simulateV1`` — the one-call
+    simulation method qeth's event preview prefers (much faster than the
+    local fork). Tri-state, see ``_probe_method`` (definitive ✗ examples:
+    cloudflare-eth, DRPC's Arbitrum, the zkSync gateways).
+
+    A throwaway read-only simulation (a 1-wei self-send), so it's safe to
+    fire at arbitrary public endpoints."""
+    return _probe_method(url, "eth_simulateV1", [{
+        "blockStateCalls": [{"calls": [
+            {"from": _DEAD, "to": _DEAD, "value": "0x1"}]}],
+        "traceTransfers": False, "validation": False,
+    }, "latest"], timeout)
+
+
+def probe_access_list(url: str, *, timeout: float = 5.0) -> Optional[bool]:
+    """Probe whether ``url`` implements ``eth_createAccessList`` — the
+    "which slots will this call touch" hint a verifying client (Helios)
+    needs from an untrusted RPC. Tri-state, see ``_probe_method``.
+
+    The probe shape matters (learned sweeping the chainid.network mainnet
+    list, 2026-06-12): send **no fee fields** — an explicit ``gasPrice``
+    of ``0x0`` is rejected by geth-style nodes ("gasprice must be non-zero
+    after london fork"), and a *priced* probe makes balance validation
+    bite on some nodes (publicnode) — both read as false negatives. A
+    zero-value self-send from the burn address with a small explicit gas
+    cap (so nodes that default the cap to the block limit don't price the
+    probe beyond the burn address's balance) answers cleanly on every
+    live mainnet endpoint."""
+    return _probe_method(url, "eth_createAccessList", [
+        {"from": _DEAD, "to": _DEAD, "gas": "0x186a0"}, "latest",
+    ], timeout)
 
 
 def lookup(

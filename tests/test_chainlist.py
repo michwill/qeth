@@ -4,7 +4,7 @@ RPC-picker's capability indication. Network is mocked — no live calls."""
 import json
 import urllib.error
 
-from qeth.chainlist import probe_simulate_v1
+from qeth.chainlist import probe_access_list, probe_simulate_v1
 
 
 def _resp(obj):
@@ -75,6 +75,47 @@ class _Body:
     def close(self): pass
 
 
+class TestProbeAccessList:
+    URL = "https://rpc.example/eth"
+
+    def test_supported_returns_true(self, monkeypatch):
+        _patch_urlopen(monkeypatch, lambda req, timeout=None: _resp(
+            {"jsonrpc": "2.0", "id": 1,
+             "result": {"accessList": [], "gasUsed": "0x5208"}}))
+        assert probe_access_list(self.URL) is True
+
+    def test_method_not_found_returns_false(self, monkeypatch):
+        _patch_urlopen(monkeypatch, lambda req, timeout=None: _resp(
+            {"error": {"code": -32601, "message": "method not found"}}))
+        assert probe_access_list(self.URL) is False
+
+    def test_rate_limit_is_unknown_not_false(self, monkeypatch):
+        _patch_urlopen(monkeypatch, lambda req, timeout=None: _resp(
+            {"error": {"code": -32005, "message": "rate limit exceeded"}}))
+        assert probe_access_list(self.URL) is None
+
+    def test_probe_sends_no_fee_fields(self, monkeypatch):
+        """The probe call must carry NO gasPrice/maxFeePerGas: an explicit
+        0 is rejected post-London ("gasprice must be non-zero after london
+        fork") and a priced probe trips balance validation on some nodes —
+        both would misread as 'unsupported'. An explicit small gas cap is
+        required for the same reason (nodes default the cap to the block
+        limit and price THAT)."""
+        captured = {}
+
+        def capture(req, timeout=None):
+            captured.update(json.loads(req.data))
+            return _resp({"result": {"accessList": [], "gasUsed": "0x0"}})
+
+        _patch_urlopen(monkeypatch, capture)
+        assert probe_access_list(self.URL) is True
+        call = captured["params"][0]
+        assert "gasPrice" not in call
+        assert "maxFeePerGas" not in call
+        assert "value" not in call          # zero-value: no balance needed
+        assert int(call["gas"], 16) <= 200_000   # small explicit cap
+
+
 class TestPickerIndication:
     def test_format_row_tags_simv1(self):
         from qeth.chain_rpc_dialog import ChainRpcDialog
@@ -87,10 +128,17 @@ class TestPickerIndication:
         b = f("https://x", True, 42.0, False)
         assert a.index("https://x") == b.index("https://x")
 
-    def test_simv1_endpoints_sort_first(self, qtbot, tmp_qeth):
-        from qeth.chain_rpc_dialog import ChainRpcDialog
+    def test_simv1_endpoints_sort_first(self, qtbot, tmp_qeth, monkeypatch):
+        from qeth.chain_rpc_dialog import ChainRpcDialog, _ChainlistLoader
         from qeth.chains import DEFAULT_CHAINS
         from PySide6.QtCore import Qt
+        # Stop the dialog's constructor from spawning the live-probe thread:
+        # this test drives the sort/render path directly via _results +
+        # _on_probing_done. The loader is DETACHED (parented to the
+        # QApplication so the dialog can close instantly), so a real probe
+        # run would hit the network for all 16 RPCs and — still in flight at
+        # interpreter shutdown — hang the process joining it. No-op start().
+        monkeypatch.setattr(_ChainlistLoader, "start", lambda self: None)
         dlg = ChainRpcDialog(DEFAULT_CHAINS[0])
         qtbot.addWidget(dlg)
         # A fast endpoint without simV1 and a slower one with it: the
