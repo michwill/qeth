@@ -14,12 +14,12 @@ are two kinds:
   theme (qt6ct / Kvantum / KDE Breeze) applies. Preferred where available.
 - **Portable — Flatpak / AppImage.** Bundle their own Qt; run on any distro.
 
-Examples below use `0.11.4` — substitute the version you downloaded.
+Examples below use `0.12.0` — substitute the version you downloaded.
 
 ### Fedora (and RHEL / Alma / Rocky family)
 
 ```sh
-sudo dnf install ./qeth-0.11.4-1.fc44.x86_64.rpm
+sudo dnf install ./qeth-0.12.0-1.fc44.x86_64.rpm
 ```
 
 Uses the distro's PySide6 + most of the eth stack; vendors only what Fedora
@@ -35,7 +35,7 @@ python3.11 ([why](dist/deb/README.md)). One-time PPA setup, then install:
 ```sh
 sudo add-apt-repository -y ppa:deadsnakes/ppa
 sudo apt update
-sudo apt install -y ./qeth_0.11.4_amd64.deb
+sudo apt install -y ./qeth_0.12.0_amd64.deb
 ```
 
 `apt` pulls `python3.11` from deadsnakes and the system Qt 6 libraries
@@ -44,7 +44,7 @@ automatically. (A future Mint/Ubuntu LTS that ships PySide6 won't need the PPA.)
 ### Any distro — Flatpak
 
 ```sh
-flatpak install --user ./qeth-0.11.4.flatpak
+flatpak install --user ./qeth-0.12.0.flatpak
 flatpak run io.github.michwill.qeth
 ```
 
@@ -55,8 +55,8 @@ applies its own theming tweaks instead.
 ### Any distro — AppImage
 
 ```sh
-chmod +x qeth-0.11.4-x86_64.AppImage
-./qeth-0.11.4-x86_64.AppImage
+chmod +x qeth-0.12.0-x86_64.AppImage
+./qeth-0.12.0-x86_64.AppImage
 ```
 
 Self-contained — runs on any reasonably recent x86-64 Linux (glibc ≥ 2.34).
@@ -70,6 +70,29 @@ uv run python -m qeth
 ```
 
 (Falls back to `uv pip install -e '.[bundled]'` if you have no system PySide6.)
+
+## Verified transaction previews (optional)
+
+The Send / signing dialogs preview the events a transaction will emit before
+you sign. By default this runs against your RPC endpoint. If a
+[**Helios**](https://github.com/a16z/helios) light client is installed, qeth
+routes the preview through it instead, so every piece of chain state the
+transaction touches is **proof-verified** against sync-committee-verified roots
+— a compromised RPC can no longer fake a benign-looking preview. Verified
+previews show a green **✓ verified** badge.
+
+It's entirely optional and auto-detected — install Helios however you like and
+qeth finds it on `PATH` or in `~/.helios/bin`:
+
+```sh
+curl https://raw.githubusercontent.com/a16z/helios/master/heliosup/install | bash
+heliosup
+```
+
+Supported on Ethereum, Optimism, Base and Linea (the chains Helios verifies).
+Set `QETH_HELIOS=0` to disable. Note: the **Flatpak** is sandboxed and can't
+reach a host Helios binary, so verified mode isn't available there yet — use the
+`.deb` / `.rpm` / AppImage for it.
 
 ## Notes
 

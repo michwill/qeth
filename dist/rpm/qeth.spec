@@ -1,5 +1,5 @@
 Name:           qeth
-Version:        0.11.4
+Version:        0.12.0
 Release:        1%{?dist}
 Summary:        Qt Ethereum wallet with Ledger support and a Frame-compatible JSON-RPC server
 
@@ -110,6 +110,18 @@ install -Dm0644 qeth/assets/logos/qeth-icon-rounded.svg \
 %{_datadir}/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
 
 %changelog
+* Sat Jun 13 2026 Michael Egorov <michwill@yieldbasis.com> - 0.12.0-1
+- Transaction event previews now run on a pure-Python py-evm engine (replaces
+  the pyrevm fork) — so the preview works in every package, on every Python,
+  not just dev checkouts.
+- Verified previews via Helios: when a `helios` light client is installed, the
+  preview routes through it, proof-verifying every touched state slot against
+  sync-committee roots (a compromised RPC can't fake it). Shows a "verified"
+  badge. Ethereum/OP/Base/Linea; auto-detected; QETH_HELIOS=0 to disable.
+- A complex verified preview (e.g. a DeFi withdrawal) lands in ~1.5s via a
+  prestateTracer-based prefetch; an animated spinner shows progress.
+- TAC chain: token balances, history and contract identity via its Blockscout.
+
 * Fri Jun 12 2026 Michael Egorov <michwill@yieldbasis.com> - 0.11.4-1
 - Gas dialog: tiny Gnosis/L2 fees survive the fee spinboxes (precision widens
   to 1 wei) instead of quantizing to a 0 tip the chain rejects ("FeeTooLow").
