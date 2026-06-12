@@ -1726,6 +1726,37 @@ class TestReceiptTransferScan:
         tokens_plugin.note_receipt_logs(ETH, None)
         assert tokens_plugin._receipt_contracts == {}
 
+    def test_logless_receipt_from_our_wallet_refreshes_displayed_view(
+        self, tokens_plugin, monkeypatch,
+    ):
+        """A confirmed tx changed the sender's NATIVE balance by
+        construction (gas + value) even when it emitted no Transfer
+        events — a plain send, or custom events only (TAC bridge /
+        system-contract calls). The displayed view must refresh
+        immediately, not wait for the 60 s sweep (the only floor on
+        chains with no working ws)."""
+        from types import SimpleNamespace
+        tokens_plugin._store.add_account({
+            "address": self.ME, "source": "hot", "label": "Me",
+        })
+        tokens_plugin.host = SimpleNamespace(
+            selected_address=self.ME,
+            current_chain=lambda: ETH,
+        )
+        called = []
+        monkeypatch.setattr(tokens_plugin, "_invalidate_view_and_refresh",
+                            lambda: called.append(True))
+        tokens_plugin.note_receipt_logs(
+            ETH, {"from": self.ME.lower(), "to": self.UNI_ROUTER.lower(),
+                  "logs": []})
+        assert called == [True]
+        # …but a logless receipt between strangers must not refresh.
+        called.clear()
+        tokens_plugin.note_receipt_logs(
+            ETH, {"from": "0x" + "11" * 20, "to": "0x" + "22" * 20,
+                  "logs": []})
+        assert called == []
+
     def test_handles_attributedict_receipt_from_web3py(self, tokens_plugin):
         # web3.py 7 returns receipts as AttributeDict which is a
         # Mapping but NOT a dict subclass. The earlier
