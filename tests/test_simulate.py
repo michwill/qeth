@@ -164,19 +164,17 @@ def test_rpc_reader_prefetch_seeds_the_memo(monkeypatch):
             assert method == "eth_createAccessList"
             return hint
 
-    batch_seen = {}
+    seen = []
 
     def fake_urlopen(req, timeout=None):
-        payload = json.loads(req.data)
-        batch_seen["n"] = len(payload)
-        out = []
-        for item in payload:
-            m = item["method"]
-            res = ("0x2386f26fc10000" if m == "eth_getBalance"
-                   else "0x1" if m == "eth_getTransactionCount"
-                   else "0x6001" if m == "eth_getCode"
-                   else "0x" + "00" * 31 + "2a")
-            out.append({"jsonrpc": "2.0", "id": item["id"], "result": res})
+        item = json.loads(req.data)   # one request per POST (no batch
+        seen.append(item["method"])   # arrays — DRPC caps them at 3)
+        m = item["method"]
+        res = ("0x2386f26fc10000" if m == "eth_getBalance"
+               else "0x1" if m == "eth_getTransactionCount"
+               else "0x6001" if m == "eth_getCode"
+               else "0x" + "00" * 31 + "2a")
+        out = {"jsonrpc": "2.0", "id": item["id"], "result": res}
 
         class _R:
             def read(self): return json.dumps(out).encode()
@@ -191,7 +189,7 @@ def test_rpc_reader_prefetch_seeds_the_memo(monkeypatch):
         SimpleNamespace(chain_id=1, rpc_url="https://rpc.example"), "0x10")
     reader.prefetch(from_addr=FROM, to_addr=TOKEN, data="0xa9059cbb", value=0)
     # sender (3) + token (3, deduped with the hint's entry) + 1 slot = 7
-    assert batch_seen["n"] == 7
+    assert len(seen) == 7
 
     _Client.calls.clear()
     bal, nonce, code = reader.get_account(TOKEN)

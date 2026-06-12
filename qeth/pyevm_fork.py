@@ -199,17 +199,25 @@ class RpcStateReader(StateReader):
         entries = res.get("accessList") if hasattr(res, "get") else None
         return list(entries) if isinstance(entries, (list, tuple)) else []
 
+    # Concurrent fetch width. Benchmarked against DRPC (21 getProofs, 91
+    # slots): 20-wide concurrency = 0.20s vs 1.69s serial — round-trips
+    # dominate, the node parallelizes server-side. A JSON-RPC *batch
+    # array* is NOT an option: DRPC rejects batches of more than 3
+    # requests outright (helios's loopback server would accept one, but
+    # the direct unverified path shares this code).
+    _SEED_CONCURRENCY = 20
+
     def _batch_seed(self, entries: "list[dict]", from_addr: str,
                     to_addr: str) -> int:
-        """One batched JSON-RPC request seeding the memo with the account
-        triple for every hinted address (+ the sender and target, which
-        geth-style nodes omit from access lists as always-warm) and every
-        hinted storage slot. Responses map back by request id."""
+        """Seed the memo with the account triple for every hinted address
+        (+ the sender and target, which geth-style nodes omit from access
+        lists as always-warm) and every hinted storage slot — fetched as
+        concurrent individual requests (see _SEED_CONCURRENCY)."""
         import json as _json
         import urllib.request as _u
+        from concurrent.futures import ThreadPoolExecutor
         from . import USER_AGENT
 
-        payload: list[dict] = []
         keys: list[tuple] = []
         queued: set[tuple] = set()
 
@@ -220,8 +228,6 @@ class RpcStateReader(StateReader):
                 return
             queued.add(key)
             keys.append(key)
-            payload.append({"jsonrpc": "2.0", "id": len(keys) - 1,
-                            "method": method, "params": params})
 
         addresses = [to_checksum_address(from_addr),
                      to_checksum_address(to_addr)]
@@ -245,24 +251,31 @@ class RpcStateReader(StateReader):
                 # memo key matches: hex(int) has no leading zeros.
                 add("eth_getStorageAt",
                     [addr, hex(int(slot_hex, 16)), self._block_id])
-        if not payload:
+        if not keys:
             return 0
-        req = _u.Request(
-            self._chain.rpc_url, data=_json.dumps(payload).encode(),
-            method="POST",
-            headers={"User-Agent": USER_AGENT,
-                     "Content-Type": "application/json"})
-        with _u.urlopen(req, timeout=30) as r:
-            responses = _json.loads(r.read())
-        seeded = 0
-        for resp in responses if isinstance(responses, list) else []:
-            if not isinstance(resp, dict) or "result" not in resp:
-                continue
-            idx = resp.get("id")
-            if isinstance(idx, int) and 0 <= idx < len(keys):
-                self._memo[keys[idx]] = resp["result"]
-                seeded += 1
-        return seeded
+
+        def fetch(key: tuple) -> int:
+            method, params = key
+            body = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                                "params": list(params)}).encode()
+            req = _u.Request(
+                self._chain.rpc_url, data=body, method="POST",
+                headers={"User-Agent": USER_AGENT,
+                         "Content-Type": "application/json"})
+            try:
+                with _u.urlopen(req, timeout=30) as r:
+                    resp = _json.loads(r.read())
+            except Exception:
+                return 0   # this key stays lazy
+            if isinstance(resp, dict) and "result" in resp:
+                # Disjoint keys; CPython dict writes are atomic under
+                # the GIL — no lock needed.
+                self._memo[key] = resp["result"]
+                return 1
+            return 0
+
+        with ThreadPoolExecutor(max_workers=self._SEED_CONCURRENCY) as ex:
+            return sum(ex.map(fetch, keys))
 
 
 def _fork_account_db_class() -> type:
