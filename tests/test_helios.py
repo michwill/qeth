@@ -56,9 +56,30 @@ def test_found_on_path(monkeypatch):
 
 def test_heliosup_fallback_when_not_on_path(monkeypatch):
     monkeypatch.setenv("QETH_HELIOS", "1")
+    monkeypatch.delenv("QETH_HELIOS_BIN", raising=False)
     monkeypatch.setattr(hl.shutil, "which", lambda name: None)
     monkeypatch.setattr(hl.os, "access", lambda p, m: p == hl._HELIOSUP_BIN)
     assert hl.helios_binary() == hl._HELIOSUP_BIN
+
+
+def test_explicit_bin_env_wins(monkeypatch):
+    """QETH_HELIOS_BIN (set by the verify-variant launchers) takes
+    precedence over PATH — and over a sandbox where PATH has nothing."""
+    monkeypatch.setenv("QETH_HELIOS", "1")
+    monkeypatch.setenv("QETH_HELIOS_BIN", "/app/bin/helios")
+    monkeypatch.setattr(hl.os, "access",
+                        lambda p, m: p == "/app/bin/helios")
+    monkeypatch.setattr(hl.shutil, "which", lambda name: "/usr/bin/helios")
+    assert hl.helios_binary() == "/app/bin/helios"
+
+
+def test_explicit_bin_missing_falls_through(monkeypatch):
+    # A stale/empty QETH_HELIOS_BIN must not shadow a real PATH helios.
+    monkeypatch.setenv("QETH_HELIOS", "1")
+    monkeypatch.setenv("QETH_HELIOS_BIN", "/nope/helios")
+    monkeypatch.setattr(hl.os, "access", lambda p, m: False)
+    monkeypatch.setattr(hl.shutil, "which", lambda name: "/usr/bin/helios")
+    assert hl.helios_binary() == "/usr/bin/helios"
 
 
 def test_network_map_covers_helios_chains_only():

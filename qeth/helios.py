@@ -66,10 +66,21 @@ _POLL_INTERVAL_S = 0.5
 
 def helios_binary() -> Optional[str]:
     """Path to a usable helios binary, or None (not installed, or the
-    feature is disabled via ``QETH_HELIOS=0``)."""
+    feature is disabled via ``QETH_HELIOS=0``).
+
+    Resolution order:
+      1. ``QETH_HELIOS_BIN`` — an explicit path. The "verify" package
+         variants bundle helios and point their launcher at it (the
+         only way verified mode reaches a sandboxed Flatpak), and it's
+         a clean override for anyone with a helios in a custom spot.
+      2. ``helios`` on ``PATH``.
+      3. the heliosup default install (``~/.helios/bin/helios``)."""
     if os.environ.get("QETH_HELIOS", "1").strip().lower() in (
             "0", "false", "no", "off", ""):
         return None
+    explicit = os.environ.get("QETH_HELIOS_BIN", "").strip()
+    if explicit and os.access(explicit, os.X_OK):
+        return explicit
     found = shutil.which("helios")
     if found:
         return found
