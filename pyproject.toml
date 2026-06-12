@@ -88,6 +88,7 @@ files = [
     "qeth/contract_identity.py",
     "qeth/simulate.py",
     "qeth/pyevm_fork.py",
+    "qeth/helios.py",
     "qeth/activity_cache.py",
     "qeth/transactions.py",
     "qeth/transactions_cache.py",

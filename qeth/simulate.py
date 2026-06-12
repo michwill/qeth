@@ -376,6 +376,22 @@ def simulate_logs(chain, from_addr: str, to_addr, data, value,
         return None   # contract creation — not previewed
     import time as _time
     deadline = _time.monotonic() + budget_s if budget_s else None
+    if fork_reader is None:
+        # Verified mode: when a Helios sidecar can serve this chain,
+        # prefer the local fork over PROOF-VERIFIED state to the
+        # (unverified) eth_simulateV1 fast path — a compromised RPC
+        # could otherwise serve a benign-looking preview for a
+        # malicious tx, and the preview is exactly the signing-time
+        # defense. Slower (per-slot proof fetches), but the remote
+        # node can no longer lie about what this tx does.
+        from .helios import verified_chain
+        helios_chain = verified_chain(chain)
+        if helios_chain is not None:
+            log.info("simulating on helios-verified state (%s)",
+                     helios_chain.rpc_url)
+            return _simulate_via_fork(
+                helios_chain, from_addr, to_addr, data, value,
+                retries=retries, sleep=sleep, deadline=deadline)
     if fork_reader is None and _SIMV1_SUPPORT.get(chain.rpc_url) is not False:
         try:
             logs = _simulate_via_rpc(chain, from_addr, to_addr, data, value,
