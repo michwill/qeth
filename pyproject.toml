@@ -111,6 +111,7 @@ files = [
     "qeth/plugins/sign_message.py",
     "qeth/icons.py",
     "qeth/tray.py",
+    "qeth/notify.py",
     "qeth/ledger.py",
     "qeth/signing.py",
     "qeth/alerts.py",

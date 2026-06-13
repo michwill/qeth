@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .icons import ChainIconCache, bundled_chain_icon
+from .notify import DesktopNotifier
 from .plugin import Slot
 from .plugins.tokens import TokensPlugin
 from .plugins.transactions import (
@@ -53,8 +54,11 @@ class MainWindow(QMainWindow):
         self.store = store
         self.rpc = rpc
         # Tray controller (set by the entry point after install_tray); the
-        # sink for desktop notifications. None when there's no system tray.
+        # fallback sink for desktop notifications. None when there's no tray.
         self._tray = None
+        # Primary notification path: the freedesktop service (renders our
+        # custom icon, and needs no tray). See qeth.notify.
+        self._notifier = DesktopNotifier()
         self.setWindowTitle("qeth — Ethereum wallet")
         self.resize(1060, 720)
         # Override QMainWindow's inflated minimumSizeHint (it reports
@@ -539,13 +543,19 @@ class MainWindow(QMainWindow):
     def notify(self, title: str, body: str, icon=None) -> None:
         """Raise a sent/received desktop notification (host protocol, called
         by the Tokens / Transactions plugins). ``icon`` is the composed
-        token/coin + direction badge. No-op when notifications are disabled in
-        the store or there's no tray to deliver them. Failures are swallowed —
-        a notification is never worth crashing a handler."""
-        if not self.store.notifications_enabled or self._tray is None:
+        token/coin + direction badge. Prefers the freedesktop notification
+        service (which actually renders the custom icon — Qt's tray drops it
+        on xfce4-notifyd) and falls back to the tray. No-op when notifications
+        are disabled. Failures are swallowed — never worth crashing a
+        handler."""
+        if not self.store.notifications_enabled:
             return
         try:
-            self._tray.show_message(title, body, icon)
+            pixmap = icon.pixmap(128, 128) if icon is not None else None
+            if self._notifier.send(title, body, pixmap):
+                return
+            if self._tray is not None:
+                self._tray.show_message(title, body, icon)
         except Exception:
             import logging
             logging.getLogger("qeth.ui").exception("notification failed")
