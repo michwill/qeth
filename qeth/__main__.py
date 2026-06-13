@@ -168,6 +168,7 @@ def main() -> int:
     # so Python doesn't GC the controller; Qt's parent ownership
     # ties its lifetime to the window.
     _tray = install_tray(app, win)  # noqa: F841 — kept-alive ref
+    win.set_tray(_tray)             # the desktop-notification sink (or None)
     try:
         return app.exec()
     finally:

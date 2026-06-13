@@ -55,6 +55,37 @@ def short_addr(addr: str | None) -> str:
     return f"{addr[:6]}…{addr[-4:]}"
 
 
+def transfer_notice(
+    outgoing: bool, amount: str, symbol: str, *,
+    counterparty: "str | None" = None, chain_name: "str | None" = None,
+) -> "tuple[str, str]":
+    """Build the (title, body) for a sent/received desktop notification.
+
+    ``↑ Sent`` / ``↓ Received`` carries the direction (a theme-neutral glyph
+    — no colour to clash with the notification theme). ``amount`` is the
+    already-formatted quantity; pass ``""`` when it's unknown (a brand-new
+    token with no cached decimals) and the title shows just the symbol.
+
+    Examples::
+
+        transfer_notice(False, "5", "USDC", counterparty="0xabc…",
+                        chain_name="Ethereum")
+            -> ("↓ Received 5 USDC", "from 0xabc… · Ethereum")
+        transfer_notice(True, "1.5", "ETH", chain_name="Ethereum")
+            -> ("↑ Sent 1.5 ETH", "Ethereum")
+    """
+    glyph = "↑" if outgoing else "↓"
+    verb = "Sent" if outgoing else "Received"
+    qty = f"{amount} {symbol}".strip() if amount else symbol
+    title = f"{glyph} {verb} {qty}".rstrip()
+    parts: list[str] = []
+    if counterparty:
+        parts.append(f"{'to' if outgoing else 'from'} {short_addr(counterparty)}")
+    if chain_name:
+        parts.append(chain_name)
+    return title, " · ".join(parts)
+
+
 def format_datetime(ts: int) -> str:
     """Format a unix timestamp as the locale-preferred date + time.
 

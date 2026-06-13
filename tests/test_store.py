@@ -9,6 +9,10 @@ from qeth.store import Store, _merge_chain
 
 
 class TestRoundTrip:
+    def test_notifications_enabled_defaults_on(self, tmp_qeth):
+        assert Store().notifications_enabled is True
+        assert Store.load().notifications_enabled is True
+
     def test_load_with_no_config_yields_defaults(self, tmp_qeth):
         s = Store.load()
         assert s.accounts == []
@@ -31,9 +35,11 @@ class TestRoundTrip:
         s1.force_show_token(10, "0xFEED00000000000000000000000000000000FEED")
         s1.window_geometry = "deadbeef"
         s1.splitter_state_main = "01020304"
+        s1.notifications_enabled = False
         s1.save()
 
         s2 = Store.load()
+        assert s2.notifications_enabled is False
         assert s2.accounts == s1.accounts
         assert s2.default_account == "0xAAA"
         assert s2.current_chain_id == 10

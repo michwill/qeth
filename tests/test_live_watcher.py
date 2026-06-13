@@ -293,6 +293,50 @@ def test_handle_log_emits_balance_dirty(qapp):
     assert got == [("0xacc", "0xTok"), ("0xacc", "0xTok")]
 
 
+def _padded(addr: str) -> str:
+    return "0x" + "00" * 12 + addr[2:]
+
+
+def test_handle_log_decodes_transfer_seen_both_directions(qapp):
+    from qeth.live_watcher import TRANSFER_TOPIC0
+    w = _watcher()
+    seen: list = []
+    w.transfer_seen.connect(
+        lambda c, a, tok, cp, out, val: seen.append((tok, cp, out, val)))
+    chain = _chain(100)
+    acct = "0x" + "ac" * 20
+    other = "0x" + "11" * 20
+
+    # other -> acct : incoming, counterparty is the sender
+    w._handle_log(chain, acct, {
+        "address": "0xTok",
+        "topics": [TRANSFER_TOPIC0, _padded(other), _padded(acct)],
+        "data": hex(1000),
+    })
+    # acct -> other : outgoing, counterparty is the recipient
+    w._handle_log(chain, acct, {
+        "address": "0xTok",
+        "topics": [TRANSFER_TOPIC0, _padded(acct), _padded(other)],
+        "data": hex(42),
+    })
+    assert seen == [
+        ("0xTok", other, False, 1000),
+        ("0xTok", other, True, 42),
+    ]
+
+
+def test_handle_log_without_topics_skips_transfer_seen(qapp):
+    """A malformed/short log still drives the balance re-read but emits no
+    transfer notification (no direction/value to show)."""
+    w = _watcher()
+    dirty: list = []
+    seen: list = []
+    w.balance_dirty.connect(lambda c, a, t: dirty.append(t))
+    w.transfer_seen.connect(lambda *a: seen.append(a))
+    w._handle_log(_chain(100), "0xacc", {"address": "0xTok"})   # no topics
+    assert dirty == ["0xTok"] and seen == []
+
+
 def test_emit_native_emits_balance_from_hex(qapp):
     """Native balance read over the ws → native_balance(chain, acct, wei),
     hex normalised to int (the inbound-ETH path Transfer logs miss)."""

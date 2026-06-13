@@ -100,6 +100,11 @@ class LiveWatcher(QThread):
     still_pending = Signal(object, str)      # (chain, hash) — probe saw it open
     balance_dirty = Signal(object, str, str)  # (chain, account, token_address)
     native_balance = Signal(object, str, object)  # (chain, account, wei)
+    # (chain, account, token, counterparty, outgoing, raw_value) — a Transfer
+    # touching the account, decoded for a sent/received desktop notification.
+    # The value is the log's own (display only); balance_dirty drives the
+    # authoritative balance re-read.
+    transfer_seen = Signal(object, str, str, str, bool, object)
 
     _POLL_S = 1.0          # supervisor reconcile / stop-poll cadence
     _MAX_BACKOFF_S = 30.0  # reconnect backoff ceiling
@@ -288,14 +293,51 @@ class LiveWatcher(QThread):
             [TRANSFER_TOPIC0, padded, None],   # from = account (outgoing)
         ]
 
+    @staticmethod
+    def _log_hexstr(v: Any) -> str:
+        """A log topic / data field as a 0x-prefixed lowercase hex string.
+        web3 hands these back as ``HexBytes`` (``.hex()`` → bare hex) from
+        some providers and plain ``0x``-strings from others; normalise both."""
+        if hasattr(v, "hex"):
+            h = v.hex()
+            return (h if h.startswith("0x") else "0x" + h).lower()
+        return str(v).lower()
+
+    @classmethod
+    def _addr_from_topic(cls, topic: Any) -> str:
+        """The 20-byte address packed in the low bytes of a 32-byte topic."""
+        return "0x" + cls._log_hexstr(topic)[-40:]
+
+    @classmethod
+    def _int_from_data(cls, data: Any) -> int:
+        h = cls._log_hexstr(data)
+        return int(h, 16) if h not in ("", "0x") else 0
+
     def _handle_log(self, chain: "Chain", account: str, log: Any) -> None:
         """A Transfer touching the account → the token's balance changed.
         Emit ``balance_dirty`` so the consumer re-reads ``balanceOf`` — we
         never trust the log's value, so a removed (reorg) log is treated the
-        same: re-read gives the truth."""
-        token = log.get("address") if hasattr(log, "get") else log["address"]
-        if token:
-            self.balance_dirty.emit(chain, account, str(token))
+        same: re-read gives the truth. Also emit ``transfer_seen`` with the
+        decoded direction + value for a desktop notification (value display-
+        only; a malformed log degrades to just the balance re-read)."""
+        get = log.get if hasattr(log, "get") else log.__getitem__
+        token = get("address")
+        if not token:
+            return
+        self.balance_dirty.emit(chain, account, str(token))
+        try:
+            topics = get("topics") or []
+            if len(topics) < 3:
+                return
+            frm = self._addr_from_topic(topics[1])
+            to = self._addr_from_topic(topics[2])
+            outgoing = frm == account.lower()
+            counterparty = to if outgoing else frm
+            value = self._int_from_data(get("data"))
+            self.transfer_seen.emit(
+                chain, account, str(token), counterparty, outgoing, value)
+        except Exception:
+            pass
 
     async def _emit_native(self, chain: "Chain", account: str, w3: Any) -> None:
         """Read ``account``'s native balance over the live ws and emit it.

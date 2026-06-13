@@ -5,8 +5,38 @@ from decimal import Decimal
 import pytest
 
 from qeth.formatting import (
-    format_balance, format_datetime, format_usd, short_addr,
+    format_balance, format_datetime, format_usd, short_addr, transfer_notice,
 )
+
+
+# --- transfer_notice -------------------------------------------------------
+
+class TestTransferNotice:
+    def test_received_token_with_counterparty(self):
+        title, body = transfer_notice(
+            False, "5", "USDC",
+            counterparty="0x1234567890abcdef1234567890abcdef12345678",
+            chain_name="Ethereum")
+        assert title == "↓ Received 5 USDC"
+        assert body == "from 0x1234…5678 · Ethereum"
+
+    def test_sent_native_uses_up_glyph_and_to(self):
+        title, body = transfer_notice(
+            True, "1.5", "ETH",
+            counterparty="0xabcabcabcabcabcabcabcabcabcabcabcabcabca",
+            chain_name="Ethereum")
+        assert title == "↑ Sent 1.5 ETH"
+        assert body.startswith("to 0xabca…") and body.endswith("· Ethereum")
+
+    def test_unknown_token_omits_amount(self):
+        title, body = transfer_notice(
+            False, "", "a token", chain_name="Gnosis")
+        assert title == "↓ Received a token"
+        assert body == "Gnosis"
+
+    def test_no_counterparty_body_is_chain_only(self):
+        _, body = transfer_notice(False, "2", "POL", chain_name="Polygon")
+        assert body == "Polygon"
 
 
 # --- format_balance --------------------------------------------------------

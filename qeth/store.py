@@ -77,6 +77,9 @@ class Store:
         # transactions plugins prefer Etherscan over Blockscout for
         # discovery; empty means "Blockscout only".
         self.etherscan_api_key: Optional[str] = None
+        # Desktop notifications for sent/received ETH + tokens (tray
+        # showMessage). On by default; toggled from the tray menu.
+        self.notifications_enabled: bool = True
 
     @classmethod
     def load(cls) -> "Store":
@@ -125,6 +128,8 @@ class Store:
             etherscan_key = data.get("etherscan_api_key")
             if isinstance(etherscan_key, str) and etherscan_key.strip():
                 s.etherscan_api_key = etherscan_key.strip()
+            if "notifications_enabled" in data:
+                s.notifications_enabled = bool(data["notifications_enabled"])
         return s
 
     def save(self) -> None:
@@ -147,6 +152,7 @@ class Store:
                 "splitter_state_left": self.splitter_state_left,
                 "header_states": dict(self.header_states),
                 "etherscan_api_key": self.etherscan_api_key,
+                "notifications_enabled": self.notifications_enabled,
             }
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write must not torch the accounts list.

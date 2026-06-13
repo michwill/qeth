@@ -39,6 +39,7 @@ from ..alerts import warn
 from ..chain import EthClient, wei_to_ether
 from ..formatting import format_balance as _format_balance
 from ..formatting import format_usd as _format_usd
+from ..formatting import transfer_notice
 from ..icons import IconCache, bundled_native_icon
 from ..plugin import Plugin
 from ..prices import DefiLlamaPrices, Price, PriceSource
@@ -287,6 +288,10 @@ class TokensPlugin(Plugin):
         # Chains with a live ws connection (LiveWatcher link_state, relayed) —
         # drives the sweep-interval throttle.
         self._ws_live_chains: set[int] = set()
+        # Last native balance seen per (chain_id, addr_lower) from the ws poll,
+        # to detect an *increase* (= ETH received) for a desktop notification.
+        # First sighting only seeds the baseline (no notification).
+        self._last_native_seen: dict[tuple[int, str], int] = {}
         self._discovery_in_flight: set[tuple[int, str]] = set()
         # Per (chain_id, addr_lower): contracts pulled from a
         # confirmed tx receipt's Transfer logs since the last
@@ -451,6 +456,10 @@ class TokensPlugin(Plugin):
     # --- lifecycle hooks ----------------------------------------------------
 
     def on_account_changed(self, address: Optional[str]) -> None:
+        # New viewing session → re-seed the native-receive baseline, so
+        # returning to an account doesn't fire a misleading "received" for the
+        # delta accumulated while it was off-screen (and unpolled).
+        self._last_native_seen.clear()
         if address is None:
             if self._panel is not None:
                 self._panel.clear()
@@ -459,6 +468,7 @@ class TokensPlugin(Plugin):
         self._refresh(address)
 
     def on_chain_changed(self) -> None:
+        self._last_native_seen.clear()   # re-seed baseline; see on_account_changed
         if self.host is None:
             return
         addr = self.host.selected_address
@@ -511,6 +521,51 @@ class TokensPlugin(Plugin):
             return
         self._on_balance_refresh(chain.chain_id, native_wei, {})
         self._touch_cached_native(chain.chain_id, account, native_wei)
+        self._notify_native_delta(chain, account, int(native_wei))
+
+    def _notify_native_delta(self, chain, account: str, native_wei: int) -> None:
+        """Desktop-notify an ETH receive, inferred from a rise in the native
+        balance between ws polls (a plain ETH receive fires no log, so this is
+        the only live signal for it). First sighting seeds the baseline only;
+        a *decrease* is our own send/gas (notified from the confirmed tx, not
+        here). The amount is exact unless we also spent gas in the same window."""
+        key = (chain.chain_id, account.lower())
+        prev = self._last_native_seen.get(key)
+        self._last_native_seen[key] = native_wei
+        if prev is None or native_wei <= prev:
+            return
+        amount = _format_balance(wei_to_ether(native_wei - prev))
+        title, body = transfer_notice(
+            False, amount, chain.symbol, chain_name=chain.name)
+        self._notify(title, body)
+
+    def on_transfer_seen(
+        self, chain, account: str, token: str, counterparty: str,
+        outgoing: bool, raw_value,
+    ) -> None:
+        """A ws ERC-20 Transfer touching the on-screen account (LiveWatcher,
+        relayed). Format the amount from the token's cached symbol/decimals and
+        raise a sent/received desktop notification. Metadata is a sync in-memory
+        cache (safe on the main thread); an unknown token degrades to a symbol-
+        less, amount-less 'Received a token' rather than a wrong number."""
+        meta = self._token_metadata.get(chain.chain_id, token.lower())
+        if meta and meta.get("symbol"):
+            symbol = str(meta["symbol"])
+            decimals = int(meta.get("decimals") or 18)
+            amount = _format_balance(Decimal(int(raw_value)) / (Decimal(10) ** decimals))
+        else:
+            symbol = "a token"
+            amount = ""          # no decimals → no trustworthy quantity
+        title, body = transfer_notice(
+            outgoing, amount, symbol,
+            counterparty=counterparty, chain_name=chain.name)
+        self._notify(title, body)
+
+    def _notify(self, title: str, body: str) -> None:
+        host = self.host
+        notify = getattr(host, "notify", None) if host is not None else None
+        if callable(notify):
+            notify(title, body)
 
     def _touch_cached_native(self, chain_id: int, address: str, native_wei) -> None:
         """Persist only the native balance to the wallet cache, leaving tokens

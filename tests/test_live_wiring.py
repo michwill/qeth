@@ -110,6 +110,83 @@ def test_update_live_account_and_balance_dirty_relay(qtbot, monkeypatch):
     plugin._on_native_balance(gnosis, "0xabc", 5 * 10**18)
     tokens.on_native_balance.assert_called_once_with(gnosis, "0xabc", 5 * 10**18)
 
+    plugin._on_transfer_seen(gnosis, "0xabc", "0xtok", "0xcp", False, 7)
+    tokens.on_transfer_seen.assert_called_once_with(
+        gnosis, "0xabc", "0xtok", "0xcp", False, 7)
+
+
+def _chain_ns(chain_id=1, symbol="ETH", name="Ethereum"):
+    return SimpleNamespace(chain_id=chain_id, symbol=symbol, name=name)
+
+
+def test_on_transfer_seen_notifies_with_symbol_and_amount(qtbot, monkeypatch):
+    """A known token formats amount via its decimals; an unknown token
+    degrades to an amount-less 'a token' rather than a wrong number."""
+    from qeth.plugins.tokens import TokensPlugin
+    tp = TokensPlugin(Mock())
+    tp.host = Mock()
+    monkeypatch.setattr(
+        tp._token_metadata, "get",
+        lambda cid, c: {"symbol": "USDC", "decimals": 6}
+        if c == "0xtok" else None)
+
+    # known token: 2_500_000 / 10**6 = 2.5 USDC, received
+    tp.on_transfer_seen(_chain_ns(), "0xme", "0xtok", "0xfrom", False, 2_500_000)
+    title, body = tp.host.notify.call_args.args
+    assert title == "↓ Received 2.5 USDC"
+    assert body.startswith("from 0xfrom") or "0xfrom" in body
+
+    # unknown token: no decimals → no quantity
+    tp.host.notify.reset_mock()
+    tp.on_transfer_seen(_chain_ns(), "0xme", "0xunk", "0xto", True, 999)
+    title, _ = tp.host.notify.call_args.args
+    assert title == "↑ Sent a token"
+
+
+def test_on_native_balance_notifies_received_on_increase(qtbot, monkeypatch):
+    from qeth.plugins.tokens import TokensPlugin
+    tp = TokensPlugin(Mock())
+    tp.host = Mock()
+    tp._displayed_view = (1, "0xme")
+    monkeypatch.setattr(tp, "_on_balance_refresh", lambda *a: None)
+    monkeypatch.setattr(tp, "_touch_cached_native", lambda *a: None)
+    ch = _chain_ns()
+
+    # first sight seeds baseline — no notification
+    tp.on_native_balance(ch, "0xme", 10 * 10**18)
+    assert tp.host.notify.call_count == 0
+
+    # increase by 2 ETH → notify received
+    tp.on_native_balance(ch, "0xme", 12 * 10**18)
+    title, _ = tp.host.notify.call_args.args
+    assert title == "↓ Received 2 ETH"
+
+    # decrease (our own send/gas) → no received notification
+    tp.host.notify.reset_mock()
+    tp.on_native_balance(ch, "0xme", 11 * 10**18)
+    assert tp.host.notify.call_count == 0
+
+
+def test_maybe_notify_native_sent(qtbot):
+    """A confirmed native send of ours notifies; zero-value calls and reverts
+    don't."""
+    plugin = TransactionsPlugin(disk_cache=Mock())
+    plugin.host = Mock()
+    ch = _chain_ns(symbol="xDAI", name="Gnosis")
+
+    sent = SimpleNamespace(value_wei=3 * 10**18, success=True, to_addr="0xdest")
+    plugin._maybe_notify_native_sent(ch, sent)
+    title, body = plugin.host.notify.call_args.args
+    assert title == "↑ Sent 3 xDAI"
+    assert "Gnosis" in body
+
+    plugin.host.notify.reset_mock()
+    plugin._maybe_notify_native_sent(
+        ch, SimpleNamespace(value_wei=0, success=True, to_addr="0xc"))
+    plugin._maybe_notify_native_sent(
+        ch, SimpleNamespace(value_wei=5, success=False, to_addr="0xc"))
+    assert plugin.host.notify.call_count == 0
+
 
 def test_tokens_on_native_balance_applies_only_for_current_view(qtbot, monkeypatch):
     """on_native_balance applies a lightweight native-only refresh + cache

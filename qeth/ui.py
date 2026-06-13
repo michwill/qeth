@@ -52,6 +52,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = store
         self.rpc = rpc
+        # Tray controller (set by the entry point after install_tray); the
+        # sink for desktop notifications. None when there's no system tray.
+        self._tray = None
         self.setWindowTitle("qeth — Ethereum wallet")
         self.resize(1060, 720)
         # Override QMainWindow's inflated minimumSizeHint (it reports
@@ -526,6 +529,25 @@ class MainWindow(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.start()
         return worker
+
+    def set_tray(self, tray) -> None:
+        """Adopt the tray controller (the desktop-notification sink). Called
+        by the entry point once the tray is installed; ``None`` when the
+        platform has no system tray."""
+        self._tray = tray
+
+    def notify(self, title: str, body: str) -> None:
+        """Raise a sent/received desktop notification (host protocol, called
+        by the Tokens / Transactions plugins). No-op when notifications are
+        disabled in the store or there's no tray to deliver them. Failures
+        are swallowed — a notification is never worth crashing a handler."""
+        if not self.store.notifications_enabled or self._tray is None:
+            return
+        try:
+            self._tray.show_message(title, body)
+        except Exception:
+            import logging
+            logging.getLogger("qeth.ui").exception("notification failed")
 
     def status_message(self, text: str, timeout_ms: int = 3000) -> None:
         """Show a transient message in the status bar, replacing the idle

@@ -65,6 +65,7 @@ from ..contract_identity import (
 from ..chain import EthClient, wei_to_ether
 from ..live_watcher import LiveWatcher, PendingTx
 from ..signing import ReplacementFloor, SignerError, SigningRequest
+from ..formatting import format_balance, transfer_notice
 from ..formatting import format_datetime as _format_datetime
 from ..plugin import Plugin
 from ..transactions import (
@@ -979,6 +980,7 @@ class TransactionsPlugin(Plugin):
             self._live_watcher.link_state.connect(self._on_ws_link_state)
             self._live_watcher.balance_dirty.connect(self._on_balance_dirty)
             self._live_watcher.native_balance.connect(self._on_native_balance)
+            self._live_watcher.transfer_seen.connect(self._on_transfer_seen)
             self._update_live_account()
             app = QApplication.instance()
             if app is not None:
@@ -1092,6 +1094,21 @@ class TransactionsPlugin(Plugin):
                 tokens.on_native_balance(chain, account, native_wei)
             except Exception:
                 log.exception("on_native_balance failed")
+
+    def _on_transfer_seen(
+        self, chain, account: str, token: str, counterparty: str,
+        outgoing: bool, raw_value,
+    ) -> None:
+        """A ws Transfer touching the account, decoded (LiveWatcher). Relay to
+        TokensPlugin, which formats the amount with the token's symbol/decimals
+        and raises the sent/received desktop notification."""
+        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        if tokens is not None and hasattr(tokens, "on_transfer_seen"):
+            try:
+                tokens.on_transfer_seen(
+                    chain, account, token, counterparty, outgoing, raw_value)
+            except Exception:
+                log.exception("on_transfer_seen failed")
 
     def _abi_read_storage(self, chain_id: int, address: str, slot: str):
         """``eth_getStorageAt`` for the ABI source's proxy-slot probing.
@@ -1269,7 +1286,26 @@ class TransactionsPlugin(Plugin):
                 # index the transfers (or an app restart).
                 logs = receipt.get("logs") if hasattr(receipt, "get") else None
                 self.note_transfer_legs(chain_id, tx_hash, logs, key[1])
+                self._maybe_notify_native_sent(chain, txs[i])
                 return
+
+    def _maybe_notify_native_sent(self, chain, tx) -> None:
+        """Desktop-notify a confirmed native (ETH/xDAI/…) send of ours. Token
+        sends are notified from the ws Transfer-log path; native value carries
+        no log, so it rides the confirmed tx (which has value_wei + recipient).
+        Skips zero-value calls (plain contract interactions) and reverts."""
+        if int(getattr(tx, "value_wei", 0) or 0) <= 0 or not getattr(
+                tx, "success", False):
+            return
+        host = self.host
+        notify = getattr(host, "notify", None) if host is not None else None
+        if not callable(notify):
+            return
+        amount = format_balance(wei_to_ether(int(tx.value_wei)))
+        title, body = transfer_notice(
+            True, amount, chain.symbol,
+            counterparty=tx.to_addr, chain_name=chain.name)
+        notify(title, body)
 
     def _on_tx_still_pending(self, _chain, tx_hash: str) -> None:
         """A probe saw the tx still open — a contradicting reading, so cancel

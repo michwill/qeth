@@ -47,6 +47,14 @@ class _TrayController(QObject):
         self._show_act = menu.addAction("Show", self._show)
         self._hide_act = menu.addAction("Hide", self._hide)
         menu.addSeparator()
+        # Checkable toggle for the sent/received desktop notifications, backed
+        # by the store flag (persisted). The tray is where notifications live,
+        # so this is the natural home for the switch.
+        self._notify_act = menu.addAction("Transaction notifications")
+        self._notify_act.setCheckable(True)
+        self._notify_act.setChecked(self._notifications_enabled())
+        self._notify_act.toggled.connect(self._on_notify_toggled)
+        menu.addSeparator()
         menu.addAction("Exit", app.quit)
         # Refresh enable/disable just before the menu paints —
         # avoids having to subscribe to every window state change.
@@ -56,6 +64,30 @@ class _TrayController(QObject):
         self.tray.show()
 
         window.installEventFilter(self)
+
+    # --- notifications ----------------------------------------
+
+    def show_message(self, title: str, body: str, msecs: int = 6000) -> None:
+        """Raise a native desktop notification via the tray. On Linux this
+        routes to the freedesktop notification daemon; the glyph in ``title``
+        ('↑'/'↓') carries the send/receive direction."""
+        self.tray.showMessage(
+            title, body, QSystemTrayIcon.MessageIcon.Information, msecs)
+
+    def _store(self):
+        return getattr(self._win, "store", None)
+
+    def _notifications_enabled(self) -> bool:
+        store = self._store()
+        return bool(getattr(store, "notifications_enabled", True)) \
+            if store is not None else True
+
+    def _on_notify_toggled(self, on: bool) -> None:
+        store = self._store()
+        if store is None:
+            return
+        store.notifications_enabled = on
+        store.save()
 
     # --- Qt overrides -----------------------------------------
 
