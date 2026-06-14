@@ -20,7 +20,8 @@ from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication, QHeaderView, QInputDialog, QMenu, QPushButton, QSizePolicy,
-    QStyle, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..ens_app import (
@@ -76,6 +77,26 @@ def _icon(theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
     if isinstance(app, QApplication):
         return app.style().standardIcon(fallback)
     return QIcon()
+
+
+class _RightIconDelegate(QStyledItemDelegate):
+    """Paint a cell's icon flush against the right edge (the default delegate
+    left-aligns the decoration). Used for the status column so it hugs the right
+    and the address column keeps the rest of the width."""
+
+    def paint(self, painter, option, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        ic = opt.icon
+        opt.icon = QIcon()                  # suppress the default left draw
+        opt.text = ""
+        super().paint(painter, opt, index)  # background / selection only
+        if not ic.isNull():
+            sz = opt.decorationSize
+            r = option.rect
+            x = r.right() - sz.width() - 2
+            y = r.top() + (r.height() - sz.height()) // 2
+            ic.paint(painter, x, y, sz.width(), sz.height())
 
 
 def _record_rows(rec: EnsRecords) -> "list[tuple[str, str, str]]":
@@ -194,10 +215,18 @@ class EnsPanel(QWidget):
         # wallet address list) instead of pre-shortening to 0x…tail.
         self.tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         hdr = self.tree.header()
+        hdr.setStretchLastSection(False)      # the address stretches, not status
+        hdr.setMinimumSectionSize(16)         # let the address squeeze small
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # address
+        # Status: a minimal, right-hugging icon column — fixed to the icon width
+        # so the address gets every other pixel and squeezes first.
         hdr.setSectionResizeMode(
-            self._STATUS_COL, QHeaderView.ResizeMode.ResizeToContents)
+            self._STATUS_COL, QHeaderView.ResizeMode.Fixed)
+        hdr.resizeSection(self._STATUS_COL, 22)
+        self.tree.setItemDelegateForColumn(
+            self._STATUS_COL, _RightIconDelegate(self.tree))
         self.tree.itemExpanded.connect(self._on_expanded)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_menu)
