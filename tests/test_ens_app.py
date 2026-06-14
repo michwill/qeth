@@ -362,15 +362,35 @@ def test_verify_names_retries_transient_empty(monkeypatch):
 
     def fake_read(client, names):
         calls["n"] += 1
-        if calls["n"] < 2:
+        if calls["n"] < 2:                       # read didn't land (owner_known False)
             return {n.lower(): ea.OwnershipCheck() for n in names}
-        return {n.lower(): ea.OwnershipCheck(controller="0xC") for n in names}
+        return {n.lower(): ea.OwnershipCheck(controller="0xC", owner_known=True)
+                for n in names}
 
     monkeypatch.setattr(ea, "_read_name_states", fake_read)
     states, verified = ea.verify_names(object(), ["vitalik.eth"])
     assert verified is True
     assert states["vitalik.eth"].controller == "0xC"
     assert calls["n"] == 2                      # retried once, then succeeded
+
+
+def test_verify_names_retries_partial_landing(monkeypatch):
+    # One name lands, another doesn't (a blipped batch) → retry until BOTH land.
+    _stub_sidecar(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_read(client, names):
+        calls["n"] += 1
+        landed = calls["n"] >= 2
+        return {
+            "a.eth": ea.OwnershipCheck(controller="0xA", owner_known=True),
+            "b.eth": ea.OwnershipCheck(controller="0xB", owner_known=landed),
+        }
+
+    monkeypatch.setattr(ea, "_read_name_states", fake_read)
+    states, _ = ea.verify_names(object(), ["a.eth", "b.eth"])
+    assert calls["n"] == 2                       # retried until b.eth landed
+    assert all(st.owner_known for st in states.values())
 
 
 def test_verify_names_gives_up_after_retries(monkeypatch):

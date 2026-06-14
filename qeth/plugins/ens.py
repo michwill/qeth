@@ -34,6 +34,7 @@ from ..plugin import Plugin
 log = logging.getLogger("qeth.plugins.ens")
 
 ENS_CHAIN_ID = 1                       # ENS lives on Ethereum mainnet
+_OWNERSHIP_WAIT_S = 25.0                # cold-sidecar grace for the ownership pass
 _NAME_ROLE = Qt.ItemDataRole.UserRole          # stores the EnsName on a row
 _LOADED_ROLE = Qt.ItemDataRole.UserRole + 1    # records-loaded flag
 _VALUE_ROLE = Qt.ItemDataRole.UserRole + 2     # copyable value on a record row
@@ -556,7 +557,11 @@ class EnsPlugin(Plugin):
         chain = self._mainnet()
         if chain is None or not names:
             return
-        worker = EnsVerifyWorker(chain, address, names)
+        # Generous wait: ownership verification gates dropping indexer lies, so
+        # on a cold restart it's worth blocking (in this worker thread) for the
+        # just-prewarmed sidecar to finish syncing rather than returning
+        # unverified and leaving a lie on screen until the next load.
+        worker = EnsVerifyWorker(chain, address, names, wait_s=_OWNERSHIP_WAIT_S)
         worker.ready.connect(self._on_verified)
         self._start(worker)
 

@@ -435,12 +435,14 @@ def verify_names(
     client, verified = verified_client(chain, wait_s=wait_s, fallback=False)
     if client is None:
         return {}, False
-    # A just-synced sidecar can briefly fail the eth_call ("header for hash not
-    # found") while the execution RPC catches up, which surfaces as an all-empty
-    # read. Since BENS only handed us names this address owns, at least one
-    # controller must come back — so an entirely empty result means the transient
-    # bit, not the truth. Retry a few times before giving up (rows then just stay
-    # unbadged; the guard in the UI never shows a false ⚠).
+    # A just-synced sidecar can briefly fail an eth_call ("header for hash not
+    # found") while the execution RPC catches up. The reads are batched into
+    # several aggregate3 calls, so a transient can hit SOME batches and not
+    # others — leaving those names with owner_known False (read didn't land).
+    # Retry until EVERY name's ownership read lands, so a name isn't silently
+    # left un-dropped/un-badged just because its batch blipped. After the budget
+    # is spent we accept the partial result (those names stay unknown → kept,
+    # never a false drop). An empty result (total failure) also retries.
     states: "dict[str, OwnershipCheck]" = {}
     for attempt in range(_VERIFY_RETRIES):
         try:
@@ -448,7 +450,7 @@ def verify_names(
         except Exception:
             log.debug("ENS verify_names read failed", exc_info=True)
             states = {}
-        if any(st.controller for st in states.values()):
+        if states and all(st.owner_known for st in states.values()):
             return states, verified
         if attempt < _VERIFY_RETRIES - 1:
             time.sleep(_VERIFY_RETRY_DELAY_S)
