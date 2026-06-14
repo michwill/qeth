@@ -16,12 +16,14 @@ import logging
 import time
 from typing import Optional
 
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QIcon
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QDesktopServices, QIcon, QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication, QHeaderView, QInputDialog, QMenu, QPushButton, QSizePolicy,
-    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..ens_app import (
@@ -105,20 +107,85 @@ def _icon(theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
     return QIcon()
 
 
-class _RightIconDelegate(QStyledItemDelegate):
-    """Paint a cell's icon flush against the right edge (the default delegate
-    left-aligns the decoration). Used for the status column so it hugs the right
-    and the address column keeps the rest of the width."""
+_TABLE_ROW_H = 0
+
+
+def _table_row_height() -> int:
+    """The style's natural QTableView row height. A QTreeView's rows come out
+    shorter under most styles, so the ENS tree looked cramped next to the
+    token/tx tables; the delegate raises rows to this. Cached (style is fixed)."""
+    global _TABLE_ROW_H
+    if not _TABLE_ROW_H:
+        ref = QTableWidget(0, 0)
+        _TABLE_ROW_H = ref.verticalHeader().defaultSectionSize()
+        ref.deleteLater()
+    return _TABLE_ROW_H
+
+
+class _EnsItemDelegate(QStyledItemDelegate):
+    """Make the ENS tree look like the wallet / token / tx lists: table-height
+    rows, focus-aware selection (full highlight when focused, a quieter blend
+    when not — so an inactive panel recedes), and no hover/focus-rect tint.
+
+    Self-contained on purpose: the main window's delegate reads wallet-only
+    roles (and paints account pills), and its label role collides with this
+    tree's _LOADED_ROLE."""
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        size.setHeight(max(size.height(), _table_row_height()))
+        return size
+
+    def _selection_fill(self, option) -> "Optional[QColor]":
+        if not (option.state & QStyle.StateFlag.State_Selected):
+            return None
+        view = self.parent()
+        focused = isinstance(view, QWidget) and view.hasFocus()
+        hl = option.palette.color(QPalette.ColorRole.Highlight)
+        if focused:
+            return hl
+        base = option.palette.color(QPalette.ColorRole.Base)
+        return QColor((hl.red() * 11 + base.red() * 9) // 20,
+                      (hl.green() * 11 + base.green() * 9) // 20,
+                      (hl.blue() * 11 + base.blue() * 9) // 20)
+
+    def _row_fill_rect(self, option, index):
+        # On the tree column, extend the fill left over the indent so the
+        # selection reaches the edge (a no-op on the other columns).
+        if index.column() == 0:
+            return option.rect.adjusted(-option.rect.left(), 0, 0, 0)
+        return option.rect
 
     def paint(self, painter, option, index) -> None:
         opt = QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        ic = opt.icon
-        opt.icon = QIcon()                  # suppress the default left draw
-        opt.text = ""
-        super().paint(painter, opt, index)  # background / selection only
-        if not ic.isNull():
-            sz = opt.decorationSize
+        opt.state &= ~QStyle.StateFlag.State_MouseOver   # no hover tint
+        opt.state &= ~QStyle.StateFlag.State_HasFocus    # no dotted focus rect
+        fill = self._selection_fill(option)
+        if fill is not None:
+            painter.fillRect(self._row_fill_rect(option, index), fill)
+            tc = option.palette.color(
+                QPalette.ColorRole.HighlightedText if fill.lightness() < 140
+                else QPalette.ColorRole.Text)
+            opt.state &= ~QStyle.StateFlag.State_Selected   # bg already painted
+            for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText):
+                opt.palette.setColor(role, tc)
+            for role in (QPalette.ColorRole.Base, QPalette.ColorRole.AlternateBase):
+                opt.palette.setColor(role, fill)
+        super().paint(painter, opt, index)
+
+
+class _RightIconDelegate(_EnsItemDelegate):
+    """Status column: the focus-aware selection background (from the base) plus
+    the status icon painted flush against the right edge (the default delegate
+    left-aligns the decoration) so the address column keeps the rest."""
+
+    def paint(self, painter, option, index) -> None:
+        fill = self._selection_fill(option)
+        if fill is not None:
+            painter.fillRect(option.rect, fill)
+        ic = index.data(Qt.ItemDataRole.DecorationRole)
+        if isinstance(ic, QIcon) and not ic.isNull():
+            sz = option.decorationSize
             r = option.rect
             x = r.right() - sz.width() - 2
             y = r.top() + (r.height() - sz.height()) // 2
@@ -251,8 +318,14 @@ class EnsPanel(QWidget):
         hdr.setSectionResizeMode(
             self._STATUS_COL, QHeaderView.ResizeMode.Fixed)
         hdr.resizeSection(self._STATUS_COL, 22)
+        # Consistent look with the other tabs: table-height rows, focus-aware
+        # selection, no hover tint — via a delegate on every column (the status
+        # column's variant also right-aligns its icon). A focus repaint on the
+        # tree keeps the focused/unfocused selection swap immediate.
+        self.tree.setItemDelegate(_EnsItemDelegate(self.tree))
         self.tree.setItemDelegateForColumn(
             self._STATUS_COL, _RightIconDelegate(self.tree))
+        self.tree.installEventFilter(self)
         # Click headers to sort by name / expiry (either direction); the
         # Expires column sorts by real timestamp via _SortItem. Default: name A→Z.
         self.tree.setSortingEnabled(True)
@@ -424,6 +497,14 @@ class EnsPanel(QWidget):
         self._items_by_name.pop(name_l, None)
 
     # --- interaction ------------------------------------------------------
+
+    def eventFilter(self, obj, event) -> bool:
+        # Repaint on focus change so the focused↔unfocused selection swap
+        # (hand-painted by the delegate) shows immediately, not on next nudge.
+        if obj is self.tree and event.type() in (
+                QEvent.Type.FocusIn, QEvent.Type.FocusOut):
+            self.tree.viewport().update()
+        return super().eventFilter(obj, event)
 
     def _on_expanded(self, item: QTreeWidgetItem) -> None:
         n = item.data(0, _NAME_ROLE)
