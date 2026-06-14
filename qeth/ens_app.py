@@ -137,6 +137,7 @@ class OwnershipCheck:
     controller: Optional[str] = None
     registrant: Optional[str] = None
     resolved_address: Optional[str] = None
+    resolver: Optional[str] = None      # registry.resolver(node) — for records
     wrapped: bool = False               # held by the ENS NameWrapper
 
     def owned_by(self, address: str) -> bool:
@@ -463,6 +464,7 @@ def _read_name_states(client, names: "list[str]") -> "dict[str, OwnershipCheck]"
         st.controller = controller
         st.registrant = registrant
         if resolver_p[n].success and resolver_p[n].value:
+            st.resolver = resolver_p[n].value
             resolvers[n] = resolver_p[n].value
 
     if resolvers:
@@ -492,6 +494,7 @@ def _decode_abi_string(raw) -> Optional[str]:
 
 def _read_records_via_client(
     client, name: str, *, text_keys: tuple = TEXT_KEYS, block: str = "finalized",
+    resolver: Optional[str] = None,
 ) -> EnsRecords:
     """Read a name's resolver records in TWO multicalls, not ~20 round-trips.
 
@@ -500,14 +503,21 @@ def _read_records_via_client(
     even for a name with no records. Here: round 1 looks up the resolver once;
     round 2 batches every ``text(node,key)`` + ``contenthash(node)`` into a
     single ``aggregate3``. A name with no resolver costs one call; no records,
-    two."""
+    two.
+
+    ``resolver`` pre-supplies the (per-name) resolver address — when a caller
+    already knows it (the ownership pass reads it), round 1 is skipped and the
+    whole read is a single round-trip. The resolver is per-name and mutable, so
+    a pre-supplied one can be stale; the caller (``read_records``) re-reads on an
+    empty result to self-correct."""
     from eth_abi import encode as abi_encode
     rec = EnsRecords()
     node = namehash(name)
-    with client.multicall(block=block) as mc:
-        resolver_p = mc.add(ENS_REGISTRY, _SEL_RESOLVER + node,
-                            decoder=_decode_addr_word)
-    resolver = resolver_p.value if resolver_p.success else None
+    if resolver is None:
+        with client.multicall(block=block) as mc:
+            resolver_p = mc.add(ENS_REGISTRY, _SEL_RESOLVER + node,
+                                decoder=_decode_addr_word)
+        resolver = resolver_p.value if resolver_p.success else None
     if not resolver:
         return rec
     text_p: dict = {}
@@ -528,16 +538,26 @@ def _read_records_via_client(
 
 def read_records(
     chain: "Chain", name: str, *, text_keys: tuple = TEXT_KEYS,
+    client=None, resolver: Optional[str] = None,
 ) -> EnsRecords:
-    """Fast, UNVERIFIED record read — two multicalls against the chain's normal
-    RPC at ``latest``. This is the first-paint path: it shows records in ~1.5 s
-    instead of waiting several seconds for the verified read to proof-fetch
-    every touched slot through Helios. The ✓ comes later via
-    ``verified_read_records``."""
+    """Fast, UNVERIFIED record read — multicalls against the chain's normal RPC
+    at ``latest``. The first-paint path: shows records in ~1 s instead of
+    waiting on the verified read to proof-fetch every slot through Helios; the ✓
+    comes later via ``verified_read_records``.
+
+    ``client`` reuses a warm ``EthClient`` (keep-alive connection) across expands
+    instead of paying a fresh TLS handshake each time. ``resolver`` pre-supplies
+    the name's resolver to skip the lookup round-trip; if that (possibly stale)
+    resolver yields nothing, we re-read without it to self-correct."""
     from .chain import EthClient
+    cl = client if client is not None else EthClient(chain)
     try:
-        return _read_records_via_client(EthClient(chain), name,
-                                        text_keys=text_keys, block="latest")
+        rec = _read_records_via_client(cl, name, text_keys=text_keys,
+                                       block="latest", resolver=resolver)
+        if resolver is not None and not rec.texts and not rec.contenthash:
+            rec = _read_records_via_client(cl, name, text_keys=text_keys,
+                                           block="latest")   # resolver re-read
+        return rec
     except Exception:
         log.debug("ENS read_records failed", exc_info=True)
         return EnsRecords()

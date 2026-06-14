@@ -285,6 +285,39 @@ def test_read_records_via_client_no_resolver_is_empty():
     assert rec.texts == {} and rec.contenthash is None
 
 
+def test_read_records_skips_resolver_lookup_when_supplied():
+    RESOLVER = "0x" + "ab" * 20
+    seen = []
+
+    def resp(target, sel):
+        seen.append(sel)
+        if sel == ea._SEL_TEXT:
+            return True, "hi"
+        return False, None
+
+    rec = ea._read_records_via_client(
+        _FakeClient(resp), "vitalik.eth", resolver=RESOLVER)
+    assert rec.texts                                  # records came back
+    assert ea._SEL_RESOLVER not in seen               # round 1 was skipped
+
+
+def test_read_records_self_heals_stale_resolver():
+    # A pre-supplied (stale) resolver returns nothing → read_records re-reads
+    # without it, picks up the real resolver, and recovers the records.
+    RIGHT = "0x" + "ab" * 20
+
+    def resp(target, sel):
+        if sel == ea._SEL_RESOLVER:
+            return True, RIGHT
+        if sel == ea._SEL_TEXT and target == RIGHT:
+            return True, "hi"
+        return False, None                            # stale resolver → empty
+
+    rec = ea.read_records(object(), "x.eth",
+                          client=_FakeClient(resp), resolver="0x" + "99" * 20)
+    assert rec.texts and all(v == "hi" for v in rec.texts.values())
+
+
 def test_verify_names_no_helios_returns_unverified(monkeypatch):
     # No sidecar → the verified-only path (fallback=False) yields nothing.
     monkeypatch.setattr("qeth.verified.verified_chain", lambda *a, **k: None)

@@ -122,14 +122,19 @@ class EnsRecordsWorker(QThread):
     ready = Signal(str, object, bool)        # (name, EnsRecords, verified)
 
     def __init__(self, chain, name: str, parent=None,
-                 *, wait_s: float = VERIFY_WAIT_S):
+                 *, wait_s: float = VERIFY_WAIT_S, client=None,
+                 resolver: "Optional[str]" = None):
         super().__init__(parent)
         self._chain = chain
         self._name = name
         self._wait_s = wait_s
+        self._client = client          # warm EthClient reused across expands
+        self._resolver = resolver      # cached per-name resolver (skips a round)
 
     def run(self) -> None:
-        self.ready.emit(self._name, read_records(self._chain, self._name), False)
+        rec = read_records(self._chain, self._name,
+                           client=self._client, resolver=self._resolver)
+        self.ready.emit(self._name, rec, False)
         vrec, verified = verified_read_records(
             self._chain, self._name, wait_s=self._wait_s)
         if verified:
@@ -338,6 +343,12 @@ class EnsPlugin(Plugin):
         # In-memory records cache (name → (records, verified)) layered over the
         # disk cache, so re-expanding a name is instant within a session too.
         self._rec_cache: "dict[str, tuple[EnsRecords, bool]]" = {}
+        # Per-name resolver (from the ownership pass) — lets a record read skip
+        # its resolver-lookup round-trip. Refreshed every load (self-heals a
+        # re-pointed resolver). And a warm EthClient reused across record reads
+        # so each expand doesn't pay a fresh TLS handshake.
+        self._resolver_cache: "dict[str, str]" = {}
+        self._read_client = None
 
     # --- plugin contract --------------------------------------------------
 
@@ -444,6 +455,9 @@ class EnsPlugin(Plugin):
             return
         if host is not None and host.selected_address != address:
             return                                  # view moved on
+        for name_l, st in states.items():
+            if st.resolver:
+                self._resolver_cache[name_l] = st.resolver
         self._panel.mark_verified(states, address)
 
     # --- records (lazy) ---------------------------------------------------
@@ -462,7 +476,12 @@ class EnsPlugin(Plugin):
         chain = self._mainnet()
         if chain is None:
             return
-        worker = EnsRecordsWorker(chain, name)
+        if self._read_client is None:
+            from ..chain import EthClient
+            self._read_client = EthClient(chain)
+        worker = EnsRecordsWorker(
+            chain, name, client=self._read_client,
+            resolver=self._resolver_cache.get(name.lower()))
         worker.ready.connect(self._on_records_ready)
         self._start(worker)
 
