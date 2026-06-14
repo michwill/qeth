@@ -169,12 +169,22 @@ class OwnershipCheck:
     resolved_address: Optional[str] = None
     resolver: Optional[str] = None      # registry.resolver(node) — for records
     wrapped: bool = False               # held by the ENS NameWrapper
+    # True when the ownership read DEFINITIVELY landed — so a None controller
+    # means "the node has no owner / doesn't exist" (a droppable indexer lie),
+    # not "the read failed" (unknown, keep). False on a failed/transient read.
+    owner_known: bool = False
 
     def owned_by(self, address: str) -> bool:
         """True when ``address`` is the controller or the registrant."""
         a = address.lower()
         return ((self.controller or "").lower() == a
                 or (self.registrant or "").lower() == a)
+
+    def disowned_by(self, address: str) -> bool:
+        """True when the chain DEFINITIVELY says ``address`` is neither the
+        controller nor the registrant — a different owner, or no owner at all
+        (the node doesn't exist). Distinct from an unknown/failed read."""
+        return self.owner_known and not self.owned_by(address)
 
 
 # --- expiry ---------------------------------------------------------------
@@ -493,6 +503,13 @@ def _read_name_states(client, names: "list[str]") -> "dict[str, OwnershipCheck]"
                 registrant = wrapped_owner
         st.controller = controller
         st.registrant = registrant
+        # The ownership answer is definitive iff the registry.owner read landed
+        # — and, when wrapped, the NameWrapper.ownerOf read too (else a failed
+        # wrapper read would look like "no owner" and wrongly drop the name).
+        owner_known = owner_p[n].success
+        if st.wrapped:
+            owner_known = owner_known and wrapped_p[n].success
+        st.owner_known = owner_known
         if resolver_p[n].success and resolver_p[n].value:
             st.resolver = resolver_p[n].value
             resolvers[n] = resolver_p[n].value

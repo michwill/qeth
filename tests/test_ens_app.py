@@ -198,6 +198,17 @@ def test_ownership_check_owned_by():
     assert not st.owned_by("0xccc")
 
 
+def test_ownership_check_disowned_by():
+    # different owner, read landed → disowned
+    assert ea.OwnershipCheck(controller="0xOther", owner_known=True).disowned_by("0xme")
+    # no owner (doesn't exist), read landed → disowned
+    assert ea.OwnershipCheck(controller=None, owner_known=True).disowned_by("0xme")
+    # read failed → NOT disowned (unknown, keep)
+    assert not ea.OwnershipCheck(controller=None, owner_known=False).disowned_by("0xme")
+    # you own it → never disowned
+    assert not ea.OwnershipCheck(controller="0xme", owner_known=True).disowned_by("0xME")
+
+
 class _FakePending:
     def __init__(self, success, value):
         self.success, self.value = success, value

@@ -48,6 +48,11 @@ _OWNED_TIP = (
     "Ownership proof-verified on-chain via a Helios light client — your "
     "address is the controller or registrant of this name."
 )
+_CONTROL_TIP = (
+    "You control this subdomain (proof-verified) — its parent owner delegated "
+    "it to you and can reassign it unless the relevant NameWrapper fuses are "
+    "burned. A subdomain has no registrar NFT of its own."
+)
 _RESOLVED_TIP = "Resolved address proof-verified on-chain via a Helios light client."
 _MISMATCH_TIP = (
     "⚠ The indexer's address differs from the proof-verified resolution — "
@@ -331,8 +336,10 @@ class EnsPanel(QWidget):
                 continue
             n = item.data(0, _NAME_ROLE)
             is_custom = isinstance(n, EnsName) and n.source == "custom"
-            known = st.controller is not None or st.registrant is not None
-            if known and not st.owned_by(address) and not is_custom:
+            # The chain definitively says this address owns neither role (a
+            # different owner, OR no owner — the node doesn't exist): an indexer
+            # lie. Drop it. Pinned names are exempt; a failed read isn't a drop.
+            if st.disowned_by(address) and not is_custom:
                 self._remove_item(item, name_l)
                 removed.append(name_l)
                 continue
@@ -355,7 +362,10 @@ class EnsPanel(QWidget):
             if mismatch:
                 self._set_status(item, "warn", _MISMATCH_TIP)
             elif owned:
-                tip = _OWNED_TIP + (_WRAPPED_NOTE if st.wrapped else "")
+                is_sub = isinstance(n, EnsName) and n.is_subdomain
+                tip = _CONTROL_TIP if is_sub else _OWNED_TIP
+                if st.wrapped:
+                    tip += _WRAPPED_NOTE
                 if st.resolved_address:
                     tip += "\n" + _RESOLVED_TIP
                 self._set_status(item, "ok", tip)

@@ -164,14 +164,54 @@ class TestEnsPanel:
             build_tree([EnsName("alice.eth"), EnsName("mine.eth")]), NOW)
         # chain says someone else owns alice.eth → it's an indexer lie → dropped
         removed = panel.mark_verified({
-            "alice.eth": OwnershipCheck(controller=other),
-            "mine.eth": OwnershipCheck(controller=me),
+            "alice.eth": OwnershipCheck(controller=other, owner_known=True),
+            "mine.eth": OwnershipCheck(controller=me, owner_known=True),
         }, me)
         assert removed == ["alice.eth"]
         labels = [panel.tree.topLevelItem(i).text(0)
                   for i in range(panel.tree.topLevelItemCount())]
         assert not any(l.startswith("alice.eth") for l in labels)
         assert any(l.startswith("mine.eth") for l in labels)
+
+    def test_mark_verified_drops_nonexistent_name(self, qtbot):
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("ghost.eth")]), NOW)
+        # read landed (owner_known) but the node has no owner → doesn't exist
+        removed = panel.mark_verified(
+            {"ghost.eth": OwnershipCheck(controller=None, owner_known=True)}, me)
+        assert removed == ["ghost.eth"]
+        assert panel.tree.topLevelItemCount() == 0
+
+    def test_failed_read_does_not_drop(self, qtbot):
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("maybe.eth")]), NOW)
+        # owner_known False (transient/failed read) → keep, never drop
+        removed = panel.mark_verified(
+            {"maybe.eth": OwnershipCheck(controller=None, owner_known=False)}, me)
+        assert removed == []
+        assert panel.tree.topLevelItemCount() == 1
+
+    def test_subdomain_owned_uses_control_tooltip(self, qtbot):
+        from qeth.plugins.ens import _CONTROL_TIP
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([
+            EnsName("vitalik.eth"), EnsName("dao.vitalik.eth")]), NOW)
+        panel.mark_verified({
+            "vitalik.eth": OwnershipCheck(controller=me, owner_known=True),
+            "dao.vitalik.eth": OwnershipCheck(controller=me, owner_known=True),
+        }, me)
+        col = panel._STATUS_COL
+        sub = panel._items_by_name["dao.vitalik.eth"]
+        assert _CONTROL_TIP in sub.toolTip(col)
+        # the 2LD uses the ownership (not subdomain-control) tooltip
+        top = panel._items_by_name["vitalik.eth"]
+        assert _CONTROL_TIP not in top.toolTip(col)
 
     def test_mark_verified_keeps_pinned_unowned_name(self, qtbot):
         panel = EnsPanel()
@@ -277,8 +317,8 @@ class TestEnsPlugin:
         plugin._render(names)
         # verify proves alice.eth belongs to someone else → dropped + remembered
         plugin._on_verified(me, {
-            "alice.eth": OwnershipCheck(controller=other),
-            "mine.eth": OwnershipCheck(controller=me),
+            "alice.eth": OwnershipCheck(controller=other, owner_known=True),
+            "mine.eth": OwnershipCheck(controller=me, owner_known=True),
         }, True)
         assert "alice.eth" in plugin._denied
         # a refresh that re-lists alice.eth must not bring it back
