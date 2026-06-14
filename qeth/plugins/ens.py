@@ -258,14 +258,7 @@ class EnsPlugin(Plugin):
 
     def action_widgets(self) -> "list[QWidget]":
         if self._add_btn is None:
-            # Themed "+" icon, matching the Tokens pane's add button.
-            app = QApplication.instance()
-            fallback = QIcon()
-            if isinstance(app, QApplication):
-                fallback = app.style().standardIcon(
-                    QStyle.StandardPixmap.SP_FileDialogNewFolder)
-            self._add_btn = QPushButton()
-            self._add_btn.setIcon(QIcon.fromTheme("list-add", fallback))
+            self._add_btn = QPushButton("+")
             self._add_btn.setToolTip("Pin an ENS name to always show")
             self._add_btn.clicked.connect(self._on_add_custom)
         assert self._add_btn is not None
