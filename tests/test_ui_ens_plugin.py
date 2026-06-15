@@ -708,3 +708,23 @@ class TestResolvedAddressFollowsRecords:
         plugin._on_records_requested("curvelend.eth", force=True)
         plugin._on_records_ready("curvelend.eth", EnsRecords(), False, True)
         assert self._row_addr(plugin) == ""
+
+    def test_lagging_verified_read_does_not_revert_to_old(self, qtbot, tmp_qeth):
+        # The bug: after a setAddr confirms, the fast RPC read shows the NEW
+        # address, but Helios's verified head still trails the execution RPC and
+        # proves the OLD value — which must NOT overwrite the fresh one.
+        plugin = self._plugin(qtbot)
+        new_rec = EnsRecords(addresses={"60": self.NEW})
+        old_rec = EnsRecords(addresses={"60": self.OLD})
+        # fast RPC head read: the new value
+        plugin._on_records_ready("curvelend.eth", new_rec, False, True)
+        assert self._row_addr(plugin) == self.NEW
+        assert plugin._rec_cache["curvelend.eth"] == (new_rec, False)
+        # lagging Helios proof of the OLD value must be ignored
+        plugin._on_records_ready("curvelend.eth", old_rec, True, True)
+        assert self._row_addr(plugin) == self.NEW
+        assert plugin._rec_cache["curvelend.eth"] == (new_rec, False)
+        # once Helios catches up and proves the NEW value, it earns the ✓
+        plugin._on_records_ready("curvelend.eth", new_rec, True, True)
+        assert self._row_addr(plugin) == self.NEW
+        assert plugin._rec_cache["curvelend.eth"] == (new_rec, True)

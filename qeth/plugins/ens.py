@@ -39,6 +39,13 @@ log = logging.getLogger("qeth.plugins.ens")
 
 ENS_CHAIN_ID = 1                       # ENS lives on Ethereum mainnet
 _OWNERSHIP_WAIT_S = 25.0                # cold-sidecar grace for the ownership pass
+# After a write confirms we re-read at the chain head. The fast RPC read already
+# reflects the new value, but Helios's *verified* head lags the execution RPC by
+# a few slots, so its first proof can still show the OLD value. On a post-write
+# (forced) refresh, retry the verified read until it agrees with the freshly-read
+# value — so the ✓ lands on the new value instead of repainting the old one.
+_VERIFY_CATCHUP_TRIES = 8
+_VERIFY_CATCHUP_DELAY_S = 4.0
 _NAME_ROLE = Qt.ItemDataRole.UserRole          # stores the EnsName on a row
 _LOADED_ROLE = Qt.ItemDataRole.UserRole + 1    # records-loaded flag
 _VALUE_ROLE = Qt.ItemDataRole.UserRole + 2     # copyable value on a record row
@@ -267,22 +274,35 @@ class EnsRecordsWorker(QThread):
 
     def __init__(self, chain, name: str, parent=None,
                  *, wait_s: float = VERIFY_WAIT_S, client=None,
-                 resolver: "Optional[str]" = None):
+                 resolver: "Optional[str]" = None, catchup: bool = False):
         super().__init__(parent)
         self._chain = chain
         self._name = name
         self._wait_s = wait_s
         self._client = client          # warm EthClient reused across expands
         self._resolver = resolver      # cached per-name resolver (skips a round)
+        # Forced (post-write) re-read: wait for Helios's verified head to catch
+        # up to the value the fast read already saw, so the ✓ lands on the NEW
+        # value rather than the sidecar's momentarily-stale older one.
+        self._catchup = catchup
 
     def run(self) -> None:
         rec, ok = read_records(self._chain, self._name,
                                client=self._client, resolver=self._resolver)
         self.ready.emit(self._name, rec, False, ok)
-        vrec, verified = verified_read_records(
-            self._chain, self._name, wait_s=self._wait_s)
-        if verified:                   # verified ⇒ the read landed (ok)
-            self.ready.emit(self._name, vrec, True, True)
+        tries = _VERIFY_CATCHUP_TRIES if self._catchup else 1
+        for attempt in range(tries):
+            vrec, verified = verified_read_records(
+                self._chain, self._name,
+                wait_s=self._wait_s if attempt == 0 else 0.0)
+            if not verified:           # no sidecar / can't prove → stop trying
+                return
+            # Emit once Helios agrees with the head read (or the read didn't
+            # land so there's nothing to match, or we're out of catch-up budget).
+            if not ok or vrec == rec or attempt == tries - 1:
+                self.ready.emit(self._name, vrec, True, True)
+                return
+            self.msleep(int(_VERIFY_CATCHUP_DELAY_S * 1000))
 
 
 class EnsVerifyWorker(QThread):
@@ -935,7 +955,7 @@ class EnsPlugin(Plugin):
             self._read_client = EthClient(chain)
         worker = EnsRecordsWorker(
             chain, name, client=self._read_client,
-            resolver=self._resolver_cache.get(nl))
+            resolver=self._resolver_cache.get(nl), catchup=force)
         worker.ready.connect(self._on_records_ready)
         self._start(worker)
 
@@ -948,11 +968,18 @@ class EnsPlugin(Plugin):
             return
         nl = name.lower()
         # The worker emits the fast unverified read first, then (if a sidecar
-        # could prove it) the Helios read — both at the chain head. Don't let the
-        # late unverified phase of a refresh clobber a verified result with a
-        # worse one; otherwise newest wins.
+        # could prove it) the Helios read — both at the chain head.
         prev = self._rec_cache.get(nl)
+        # Don't let the late unverified phase of a refresh clobber a verified
+        # result with a worse one; otherwise newest wins.
         if prev is not None and prev[1] and not verified:
+            return
+        # Don't let a LAGGING verified read regress the value: Helios's verified
+        # head can trail the execution RPC by a few slots, so right after a
+        # change its proof may still show the OLD value. The fast RPC read (which
+        # the chain head already reflects) is the freshest truth — keep it, and
+        # let the ✓ land later when Helios's proof finally agrees.
+        if verified and prev is not None and not prev[1] and prev[0] != rec:
             return
         self._rec_cache[nl] = (rec, verified)
         self._cache.save_records(ENS_CHAIN_ID, name, rec, verified)
