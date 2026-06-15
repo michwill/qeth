@@ -296,37 +296,74 @@ def test_read_records_via_client_batches():
             return True, "ipfs://bafy"
         return False, None
 
-    rec, ok = ea._read_records_via_client(_FakeClient(resp), "vitalik.eth")
-    assert ok is True
+    rec, ok, ext, res = ea._read_records_via_client(
+        _FakeClient(resp), "vitalik.eth")
+    assert ok is True and ext is False
     assert rec.contenthash == "ipfs://bafy"
     assert rec.texts and all(v == "hello" for v in rec.texts.values())
 
 
 def test_read_records_no_resolver_is_landed_empty():
     # registry.resolver read LANDS but returns zero → no records, ok=True.
-    rec, ok = ea._read_records_via_client(
+    rec, ok, ext, res = ea._read_records_via_client(
         _FakeClient(lambda t, s: (True, None)), "x.eth")
     assert ok is True and rec.texts == {} and rec.contenthash is None
 
 
 def test_read_records_resolver_glitch_is_not_ok():
     # resolver lookup read FAILED (multicall slot) → ok=False (don't trust it).
-    rec, ok = ea._read_records_via_client(
+    rec, ok, ext, res = ea._read_records_via_client(
         _FakeClient(lambda t, s: (False, None)), "x.eth")
     assert ok is False and rec.texts == {}
 
 
 def test_read_records_round2_glitch_is_not_ok():
-    # resolver found, but the whole round-2 batch failed → ok=False.
+    # resolver found, not extended, but the whole round-2 batch failed → ok=False.
     RESOLVER = "0x" + "ab" * 20
 
     def resp(target, sel):
         if sel == ea._SEL_RESOLVER:
             return True, RESOLVER
-        return False, None                            # all text/content fail
+        return False, None                            # all text/content/supports fail
 
-    rec, ok = ea._read_records_via_client(_FakeClient(resp), "x.eth")
-    assert ok is False
+    rec, ok, ext, res = ea._read_records_via_client(_FakeClient(resp), "x.eth")
+    assert ok is False and ext is False
+
+
+def test_read_records_extended_resolver_is_ccip():
+    # ExtendedResolver: supportsInterface True, on-chain text/content revert →
+    # ok=True (expected), extended=True (caller follows CCIP).
+    RESOLVER = "0x" + "ab" * 20
+
+    def resp(target, sel):
+        if sel == ea._SEL_RESOLVER:
+            return True, RESOLVER
+        if sel == ea._SEL_SUPPORTS:
+            return True, 1                            # IExtendedResolver
+        return False, None                            # text/content revert (CCIP)
+
+    rec, ok, ext, res = ea._read_records_via_client(_FakeClient(resp), "uni.eth")
+    assert ok is True and ext is True and res == RESOLVER
+    assert rec.texts == {} and rec.contenthash is None
+
+
+def test_read_records_ccip_follows_gateway():
+    from eth_abi import encode as abi_encode
+
+    class _FakeEth:
+        def call(self, tx, block=None, ccip_read_enabled=None):
+            from eth_abi import decode as abi_decode
+            data = bytes.fromhex(tx["data"][2:])
+            _dnsname, inner = abi_decode(["bytes", "bytes"], data[4:])
+            if inner[:4] == ea._SEL_TEXT:
+                return abi_encode(["bytes"], [abi_encode(["string"], ["gw-value"])])
+            return abi_encode(["bytes"], [abi_encode(["bytes"], [b""])])
+
+    class _FakeW3:
+        eth = _FakeEth()
+
+    rec = ea._read_records_ccip(_FakeW3(), "0x" + "ab" * 20, "uni.eth")
+    assert rec.texts and all(v == "gw-value" for v in rec.texts.values())
 
 
 def test_read_records_skips_resolver_lookup_when_supplied():
@@ -339,7 +376,7 @@ def test_read_records_skips_resolver_lookup_when_supplied():
             return True, "hi"
         return False, None
 
-    rec, ok = ea._read_records_via_client(
+    rec, ok, ext, res = ea._read_records_via_client(
         _FakeClient(resp), "vitalik.eth", resolver=RESOLVER)
     assert ok is True and rec.texts                   # records came back
     assert ea._SEL_RESOLVER not in seen               # round 1 was skipped

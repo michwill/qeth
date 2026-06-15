@@ -77,6 +77,11 @@ _SEL_ADDR = bytes.fromhex("3b3b57de")       # resolver.addr(bytes32) — legacy
 _SEL_ADDR_COIN = bytes.fromhex("f1cb7e06")  # resolver.addr(bytes32,uint256)
 _SEL_TEXT = bytes.fromhex("59d1d43c")       # resolver.text(bytes32,string)
 _SEL_CONTENTHASH = bytes.fromhex("bc1c58d1")  # resolver.contenthash(bytes32)
+_SEL_SUPPORTS = bytes.fromhex("01ffc9a7")   # supportsInterface(bytes4)
+_SEL_RESOLVE = bytes.fromhex("9061b923")    # resolve(bytes,bytes) — IExtendedResolver
+# ENSIP-10 IExtendedResolver interface id (== the resolve() selector). A resolver
+# that supports it answers via resolve()/CCIP rather than plain text()/addr().
+_IFACE_EXTENDED = bytes.fromhex("9061b923")
 _ETH_COIN_TYPE = 60                         # ENSIP-9 coin type for ETH
 
 
@@ -537,24 +542,77 @@ def _decode_abi_string(raw) -> Optional[str]:
     return s or None
 
 
+def _decode_bool(raw) -> bool:
+    b = bytes(raw) if not isinstance(raw, (bytes, bytearray)) else raw
+    return len(b) >= 32 and int.from_bytes(b[:32], "big") == 1
+
+
+def _dns_encode(name: str) -> bytes:
+    """DNS wire format of a name (length-prefixed labels + 0x00) — the form
+    ENSIP-10 ``resolve(name, data)`` expects."""
+    out = b""
+    for label in name.split("."):
+        b = label.encode("utf-8")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _read_records_ccip(
+    w3, resolver: str, name: str, *, text_keys: tuple = TEXT_KEYS,
+) -> EnsRecords:
+    """Follow CCIP-Read (EIP-3668) for an offchain / ExtendedResolver name: call
+    ``resolver.resolve(dnsname, inner)`` with ``ccip_read_enabled`` so web3 walks
+    the OffchainLookup to the gateway and returns the signed answer. The result
+    is UNVERIFIABLE on-chain (a gateway can't be proof-checked), so callers must
+    mark it unverified. Best-effort per record; a slow/missing gateway just
+    yields fewer records, never raises out."""
+    from eth_abi import decode as abi_decode, encode as abi_encode
+    rec = EnsRecords()
+    node = namehash(name)
+    dnsname = _dns_encode(name)
+
+    def _resolve(inner: bytes) -> bytes:
+        data = _SEL_RESOLVE + abi_encode(["bytes", "bytes"], [dnsname, inner])
+        raw = w3.eth.call({"to": resolver, "data": "0x" + data.hex()},
+                          "latest", ccip_read_enabled=True)
+        return abi_decode(["bytes"], bytes(raw))[0]   # inner call's return data
+
+    for key in text_keys:
+        try:
+            inner = _SEL_TEXT + abi_encode(["bytes32", "string"], [node, key])
+            res = _resolve(inner)
+            val = abi_decode(["string"], res)[0] if res else ""
+            if val:
+                rec.texts[key] = str(val)
+        except Exception:
+            pass
+    try:
+        payload = abi_decode(["bytes"], _resolve(_SEL_CONTENTHASH + node))[0]
+        if payload:
+            rec.contenthash = decode_contenthash("0x" + payload.hex())
+    except Exception:
+        pass
+    return rec
+
+
 def _read_records_via_client(
     client, name: str, *, text_keys: tuple = TEXT_KEYS, block: str = "finalized",
     resolver: Optional[str] = None,
-) -> "Tuple[EnsRecords, bool]":
-    """Read a name's resolver records in TWO multicalls → ``(records, ok)``.
+) -> "Tuple[EnsRecords, bool, bool, Optional[str]]":
+    """Read a name's resolver records on-chain → ``(records, ok, extended,
+    resolver)``.
 
-    ``ok`` is False when a read DIDN'T LAND (a transient multicall failure —
-    e.g. a just-synced sidecar's "header for hash not found") vs True for a read
-    that landed (even with no records). The caller must distinguish them: an
-    empty result with ``ok`` False is a glitch, NOT "this name has no records",
-    so it must never overwrite records already on screen.
+    - ``ok`` False = a read DIDN'T LAND (a transient multicall failure, e.g. a
+      just-synced sidecar's "header for hash not found"). An empty result with
+      ``ok`` False is a glitch, NOT "no records", so it must never overwrite
+      records on screen.
+    - ``extended`` True = the resolver is an ENSIP-10 ``IExtendedResolver``
+      (CCIP/offchain). Its on-chain ``text()``/``contenthash()`` revert by
+      design, so an empty on-chain read is EXPECTED (``ok`` True) and the caller
+      should follow the gateway via ``_read_records_ccip`` (unverified).
 
-    web3's ``w3.ens.get_text`` re-resolves the resolver and round-trips per key
-    (~20 sequential calls); here round 1 looks up the resolver once and round 2
-    batches every ``text(node,key)`` + ``contenthash(node)`` into one
-    ``aggregate3``. ``resolver`` pre-supplies the (per-name, mutable) resolver to
-    skip round 1; ``read_records`` re-reads without it on an empty result to
-    self-correct a stale one."""
+    Round 1 looks up the resolver; round 2 batches ``supportsInterface`` +
+    every ``text(node,key)`` + ``contenthash(node)`` into one ``aggregate3``."""
     from eth_abi import encode as abi_encode
     rec = EnsRecords()
     node = namehash(name)
@@ -563,26 +621,31 @@ def _read_records_via_client(
             resolver_p = mc.add(ENS_REGISTRY, _SEL_RESOLVER + node,
                                 decoder=_decode_addr_word)
         if not resolver_p.success:
-            return rec, False               # resolver lookup glitched
-        resolver = resolver_p.value         # None ⇒ zero ⇒ no resolver
+            return rec, False, False, None      # resolver lookup glitched
+        resolver = resolver_p.value             # None ⇒ zero ⇒ no resolver
     if not resolver:
-        return rec, True                    # landed: name has no resolver
+        return rec, True, False, None           # landed: name has no resolver
     text_p: dict = {}
+    iface = _IFACE_EXTENDED + b"\x00" * 28      # supportsInterface(bytes4) arg
     with client.multicall(block=block) as mc:
+        supports_p = mc.add(resolver, _SEL_SUPPORTS + iface, decoder=_decode_bool)
         for key in text_keys:
             data = _SEL_TEXT + abi_encode(["bytes32", "string"], [node, key])
             text_p[key] = mc.add(resolver, data, decoder=_decode_abi_string)
         content_p = mc.add(
             resolver, _SEL_CONTENTHASH + node,
             decoder=lambda raw: decode_contenthash(_abi_bytes(raw)))
-    if not any(p.success for p in (*text_p.values(), content_p)):
-        return rec, False                   # round-2 batch glitched entirely
-    for key, p in text_p.items():
-        if p.success and p.value:
-            rec.texts[key] = str(p.value)
-    if content_p.success and content_p.value:
-        rec.contenthash = content_p.value
-    return rec, True
+    extended = bool(supports_p.success and supports_p.value)
+    if any(p.success for p in (*text_p.values(), content_p)):
+        for key, p in text_p.items():
+            if p.success and p.value:
+                rec.texts[key] = str(p.value)
+        if content_p.success and content_p.value:
+            rec.contenthash = content_p.value
+        return rec, True, extended, resolver
+    if extended:
+        return rec, True, extended, resolver    # CCIP: on-chain empty expected
+    return rec, False, extended, resolver        # glitch — neither landed
 
 
 def read_records(
@@ -600,12 +663,21 @@ def read_records(
     from .chain import EthClient
     cl = client if client is not None else EthClient(chain)
     try:
-        rec, ok = _read_records_via_client(cl, name, text_keys=text_keys,
-                                           block="latest", resolver=resolver)
-        if (resolver is not None and ok
+        rec, ok, extended, res = _read_records_via_client(
+            cl, name, text_keys=text_keys, block="latest", resolver=resolver)
+        if (resolver is not None and ok and not extended
                 and not rec.texts and not rec.contenthash):
-            rec, ok = _read_records_via_client(cl, name, text_keys=text_keys,
-                                               block="latest")   # resolver re-read
+            # a stale pre-supplied resolver landed empty → re-read without it
+            rec, ok, extended, res = _read_records_via_client(
+                cl, name, text_keys=text_keys, block="latest")
+        if extended and res and not rec.texts and not rec.contenthash:
+            # offchain (CCIP): follow the gateway. Unverifiable, but it beats a
+            # row stuck "loading". A gateway failure just leaves it empty.
+            try:
+                rec = _read_records_ccip(cl.w3, res, name, text_keys=text_keys)
+            except Exception:
+                log.debug("ENS CCIP follow failed", exc_info=True)
+            ok = True
         return rec, ok
     except Exception:
         log.debug("ENS read_records failed", exc_info=True)
@@ -617,16 +689,18 @@ def verified_read_records(
     wait_s: float = VERIFY_WAIT_S, text_keys: tuple = TEXT_KEYS,
 ) -> "Tuple[EnsRecords, bool]":
     """Verified-ONLY record read → ``(records, verified)``. ``verified`` is True
-    only when a Helios sidecar proved the reads AND they LANDED — a glitch
-    (``ok`` False) returns ``(EnsRecords(), False)`` so the worker skips the
-    upgrade emit and a transient never wipes the records already shown."""
+    only when a Helios sidecar proved on-chain reads that LANDED. A glitch
+    (``ok`` False) OR an offchain/CCIP resolver (``extended`` — gateway answers
+    can't be proof-checked) returns ``(EnsRecords(), False)`` so the worker skips
+    the upgrade emit; the unverified ``read_records`` keeps what it showed."""
     from .verified import verified_client
     client, verified = verified_client(chain, wait_s=wait_s, fallback=False)
     if client is None or not verified:
         return EnsRecords(), False
     try:
-        rec, ok = _read_records_via_client(client, name, text_keys=text_keys)
-        return (rec, True) if ok else (EnsRecords(), False)
+        rec, ok, extended, _ = _read_records_via_client(
+            client, name, text_keys=text_keys)
+        return (rec, True) if (ok and not extended) else (EnsRecords(), False)
     except Exception:
         log.debug("ENS verified_read_records failed", exc_info=True)
         return EnsRecords(), False
