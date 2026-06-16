@@ -150,10 +150,11 @@ class BlockscoutAbiSource:
 
         if not merged:
             # Nothing verified at this address, and no implementations
-            # contributed either. Distinguish "v2 was OK but contract
-            # is unverified" from transient failure: v2 returning a
-            # well-formed payload with is_verified=False is reliable.
-            return False if verified is False else False
+            # contributed either — no usable ABI. We cache this as the
+            # negative sentinel, but it's no longer permanent: AbiCache
+            # expires negatives (see _NEGATIVE_TTL) so a contract that
+            # gets verified after we first saw it is refetched later.
+            return False
         return _dedup_by_selector(merged)
 
     # --- chain-native proxy resolution (v2-unavailable fallback) ---------

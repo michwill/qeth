@@ -1,8 +1,9 @@
 """Tests for qeth.abi_cache — disk persistence for contract ABIs."""
 
 import json
+import time
 
-from qeth.abi_cache import AbiCache
+from qeth.abi_cache import AbiCache, _NEGATIVE_TTL
 
 
 ABI_SAMPLE = [
@@ -36,9 +37,33 @@ def test_save_load_round_trip_for_verified_abi(tmp_qeth):
 def test_save_load_round_trip_for_unverified_sentinel(tmp_qeth):
     cache = AbiCache()
     cache.save(1, ADDR, False)
-    # Sentinel comes back as the literal False — distinguishable from
-    # None (cache miss), so callers can skip refetching.
+    # A fresh sentinel comes back as the literal False — distinguishable
+    # from None (cache miss), so callers skip refetching within the TTL.
     assert cache.load(1, ADDR) is False
+
+
+def test_unverified_sentinel_expires_after_ttl(tmp_qeth):
+    """A negative result older than the TTL reads back as None so the
+    next access refetches — a contract verified since we cached the
+    negative gets picked up instead of staying undecodable forever."""
+    cache = AbiCache()
+    p = cache._path(1, ADDR)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    stale_ts = time.time() - _NEGATIVE_TTL - 1
+    p.write_text(json.dumps({"unverified": True, "ts": stale_ts}))
+    assert cache.load(1, ADDR) is None
+
+
+def test_legacy_unverified_sentinel_without_ts_is_refetched(tmp_qeth):
+    """The user's existing cache holds negatives written before the TTL
+    landed — ``{"unverified": true}`` with no timestamp. Treat those as
+    expired (None) so they're refetched once and migrated to the
+    timestamped form on save."""
+    cache = AbiCache()
+    p = cache._path(1, ADDR)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"unverified": True}))   # legacy, no "ts"
+    assert cache.load(1, ADDR) is None
 
 
 def test_corrupt_file_returns_none(tmp_qeth):

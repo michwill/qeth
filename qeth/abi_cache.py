@@ -8,17 +8,28 @@ sentinel entry so we don't refetch hopelessly.
 Layout mirrors qeth.transactions_cache:
     CACHE_DIR / <chain_id> / <address_lower>.json
 File content is either the ABI (a JSON list of fragments) or
-``{"unverified": true}`` for contracts Blockscout knows about but
-has no source for.
+``{"unverified": true, "ts": <epoch>}`` for contracts Blockscout
+knows about but has no source for. The negative sentinel carries a
+timestamp and expires (see ``_NEGATIVE_TTL``): a contract that was
+unverified when we first saw it often gets verified later, so we
+refetch a stale negative rather than mark it undecodable forever.
+Positive ABI entries never expire — a verified ABI doesn't un-verify.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Optional, Union
 
 from .fsatomic import atomic_write_text
+
+# How long to trust a cached "unverified" result before refetching.
+# Bounds staleness for the deploy-then-verify-later lifecycle without
+# re-hitting the explorer for genuinely-unverified contracts every
+# session. Legacy negatives (no "ts") are treated as already expired.
+_NEGATIVE_TTL = 14 * 24 * 3600  # 14 days, in seconds
 
 # An ABI is a JSON list of fragment dicts. We don't tighten the type
 # further here — web3.py validates shape when we try to decode.
@@ -100,7 +111,12 @@ class AbiCache:
         #   - dict with "abi": [...] (new) or bare list (legacy) → ABI
         if isinstance(data, dict):
             if data.get("unverified"):
-                return False
+                ts = data.get("ts")
+                if isinstance(ts, (int, float)) and time.time() - ts < _NEGATIVE_TTL:
+                    return False
+                # Stale (or legacy un-timestamped) negative: refetch so a
+                # contract verified since we last looked gets picked up.
+                return None
             abi = data.get("abi") if isinstance(data.get("abi"), list) else None
         elif isinstance(data, list):
             abi = data
@@ -127,7 +143,7 @@ class AbiCache:
         p = self._path(chain_id, address)
         p.parent.mkdir(parents=True, exist_ok=True)
         if abi is False:
-            payload: object = {"unverified": True}
+            payload: object = {"unverified": True, "ts": time.time()}
         elif isinstance(abi, list):
             payload = {"abi": abi}
         else:
