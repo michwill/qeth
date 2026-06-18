@@ -42,6 +42,7 @@ simulate = ["py-evm>=0.10"]
 dev = [
     "mypy>=2.1.0",
     "ruff>=0.14",       # lint gate (tests/test_lint.py)
+    "ty>=0.0.50",       # type checker (preview); run via scripts/check.sh
     "pytest>=8",
     "pytest-qt>=4.4",
     # The simulate extra, mirrored here so the fork-engine tests always
