@@ -13,7 +13,8 @@ user's Qt theme applies.
 - `qeth/async_chain.py` — async transport (`AsyncWeb3` over a `WebSocketProvider` or async-http failover stack) for the live watcher; mirrors `chain.py`'s UA / failover / PoA plumbing. `ws_urls_for(chain)` resolves explicit `Chain.ws_url` → inherited default → derived `https→wss`.
 - `qeth/live_watcher.py` — the WebSocket live-update watcher: a `QThread` running one asyncio loop that subscribes per active chain to `newHeads` (→ pending-tx confirmation, the async port of `PendingProbeWorker`) and the on-screen account's ERC-20 `Transfer` logs (→ live token balances). **On by default**; `QETH_LIVE_WS=0` disables it. A pure accelerator over the always-on polling floor. Design + rationale in `docs/ws-subscriptions.md`.
 - `qeth/chains.py` — `Chain` dataclass (incl. `ws_url` for the live watcher) + `DEFAULT_CHAINS` (Ethereum, OP, Polygon, Arb, Base, all on DRPC)
-- `qeth/ledger.py` — Ledger account discovery via `ledgereth`, runs in a `QThread`
+- `qeth/ledger.py` — Ledger signing + account discovery via `ledgereth`. Driven from QThread workers, but **all** ledgereth/hidapi calls route through `ledger_hid.py` (never touch HID from a worker directly — see the thread-safety convention below).
+- `qeth/ledger_hid.py` — single-thread Ledger/HID execution service. Funnels every ledgereth call (discovery, signing, the availability probe) through one process-lifetime thread via `run_ledger_hid_job()`, and clears ledgereth's dongle cache after each job. hidapi's macOS backend ties the HID handle to the thread that opened it, so this is load-bearing on macOS.
 - `qeth/tokens.py` — token discovery sources (currently Blockscout); `TokenSource` abstract base
 - `qeth/tokenlists.py` — curated token whitelists from Uniswap / CoinGecko / Curve / 1inch, merged + disk-cached at `~/.qeth/tokenlists/`
 - `qeth/contract_identity.py` — "what is this contract": name/verified (Etherscan v2 `getsourcecode`) + deployer/date (`getcontractcreation`) + public name-tags for the address and its deployer (Blockscout OLI metadata service — free; "AladdinDAO: Deployer", "Binance: Hot Wallet"), permanently disk-cached at `~/.qeth/contract_id/`. `describe_identity()` renders a multi-line badge: headline (name-tag › ContractName › ⚠ unverified) / provenance (deployed-date · deployer-label-or-cluster) / familiarity ("you've interacted N×" from the local tx cache, ⚠ on first). Shown on the Contract: row of the details + signing + send dialogs.
@@ -42,6 +43,34 @@ to regenerate after editing dependencies in `pyproject.toml`.
 plugin, so the user's qt6ct/Breeze/Kvantum setup is silently ignored.
 System Qt has the plugin and everything renders correctly. Fallback
 for systems without system PySide6: `uv pip install -e '.[bundled]'`.
+
+**Caveat it creates:** because the venv inherits the system site-packages,
+a module qeth imports but doesn't *declare* can be silently satisfied by a
+distro package — and break on a self-contained / non-Linux install. This
+already bit `cryptography` (Frame-import only; now the `frame` extra +
+guarded import). When adding an import, declare it (core dep or an extra);
+don't lean on system-site-packages.
+
+### Static checks / gates
+
+`uv run pytest` enforces, over the whole package:
+
+- **mypy** (types) — `tests/test_typing.py`, config in `[tool.mypy]`.
+- **ruff** (lint) — `tests/test_lint.py`, ruleset in `[tool.ruff.lint]`:
+  `E9` + `F` (pyflakes) + `RUF012` + `UP` (py310 annotation modernization).
+  `E402` (lazy imports are intentional) and `UP031` are deliberately off.
+  ruff is a standalone binary (no `python -m ruff`) — the gate resolves it
+  via `shutil.which`.
+
+`scripts/check.sh` runs ruff + mypy + **ty** (Astral's preview type checker)
+in one shot. ty is **not** a gate (it's 0.0.x); run it for extra signal.
+It doesn't follow `include-system-site-packages` into the system PySide6, so
+the script injects that path (derived from PySide6's location) — without it
+ty floods ~100 phantom unresolved-import errors. The package is ty-clean
+when checked that way. mypy, ruff, and ty are all **dev-only** deps
+(`[dependency-groups] dev`), so a runtime/`--no-dev` install pulls none of
+them. Optional features that need a heavy dep go behind an extra mirrored
+into `dev` (`simulate` → py-evm, `frame` → cryptography) so their tests run.
 
 ## Conventions
 
@@ -89,6 +118,20 @@ previous worker; if it's still running, Qt's QThread destructor
 `abort()`s the whole process. Track workers in a `set[QThread]` and
 let them self-evict via the `finished` signal (`MainWindow._start_worker`
 in this codebase is the pattern).
+
+### Ledger / hidapi: one thread, always
+
+hidapi (the USB-HID layer `ledgereth` sits on) is **not** thread-safe — its
+macOS backend ties the open handle to the thread's CoreFoundation run-loop,
+so a handle opened on one transient Qt worker and touched from another
+corrupts state and hangs/crashes. **Never call `ledgereth` (or `init_dongle`)
+from a worker thread directly.** Route every Ledger op through the
+single-thread service: `run_ledger_hid_job(fn)` (`qeth/ledger_hid.py`) runs
+`fn` serialized on one process-lifetime thread and blocks for the result.
+Discovery batches paths into one job; signing does the device-holds check +
+the sign in one job (shared dongle). The service clears ledgereth's dongle
+cache after every job, so the old per-call cache-clearing is centralized
+there — don't re-add it at call sites.
 
 ### Type checking: mypy enforced over the whole package
 

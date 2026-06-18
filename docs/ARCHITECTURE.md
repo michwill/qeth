@@ -25,12 +25,18 @@ Everything on-chain flows through one **sync client** (`EthClient`, web3.py
 under the hood) and a set of **pluggable HTTP data sources** (token discovery,
 prices, risk, tx history, ABIs) that each tolerate their own failures.
 
-Three threads matter:
+Four threads matter:
 
 - **Qt main thread** — all UI, all signal/slot delivery, all dialog handling.
 - **Worker QThreads** — every blocking network/RPC call (discovery, balances,
   receipts, signing). Tracked in a `set` and self-evicting (§7).
 - **`qeth-rpc` asyncio thread** — the aiohttp JSON-RPC server (§6).
+- **`qeth-ledger-hid` thread** — one process-lifetime thread that runs **all**
+  ledgereth/hidapi work, serialized (`qeth/ledger_hid.py`). hidapi isn't
+  thread-safe (its macOS backend ties the handle to the opening thread's
+  run-loop), so the signing/discovery workers don't touch HID directly — they
+  submit a closure via `run_ledger_hid_job()` and block on its `Future`. The
+  service clears ledgereth's dongle cache after every job.
 
 The RPC thread and the UI thread never touch each other's state directly; they
 hand off through the `SignerBridge` (a `QObject` + `concurrent.futures.Future`,
