@@ -355,6 +355,20 @@ class PendingTxWatcher(QObject):
 log = logging.getLogger("qeth.plugin.transactions")
 
 
+def _make_identity_get_code(store):
+    """A keyless ``eth_getCode`` probe for ContractIdentitySource, resolving
+    chain_id → the store's Chain → EthClient. Lets an EOA recipient be
+    identified with no Etherscan key (the key is only needed for a contract's
+    name/verified/deployer). Returns the code hex, or None when the chain
+    is unknown or the read fails (the source then leaves the row bare)."""
+    def _get_code(chain_id: int, address: str) -> Optional[str]:
+        chain = next((c for c in store.chains if c.chain_id == chain_id), None)
+        if chain is None:
+            return None
+        return EthClient(chain).rpc("eth_getCode", [address, "latest"])
+    return _get_code
+
+
 def _build_pending_snapshot(
     cache: "dict[tuple[int, str], list]",
     chain_lookup: "Callable[[int], Any]",
@@ -887,7 +901,9 @@ class TransactionsPlugin(Plugin):
         # Etherscan-v2 key as the ABI source; immutable facts → cached
         # permanently on disk. None when there's no store/key (tests).
         self._identity_source: Optional[ContractIdentitySource] = (
-            ContractIdentitySource(lambda: store.etherscan_api_key)
+            ContractIdentitySource(
+                lambda: store.etherscan_api_key,
+                get_code=_make_identity_get_code(store))
             if store is not None else None
         )
         self._identity_cache = ContractIdentityCache()

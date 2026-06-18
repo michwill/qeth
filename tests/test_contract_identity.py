@@ -122,7 +122,48 @@ def test_source_unverified_keeps_provenance():
     assert idy.deployer == DEPLOYER          # provenance survives
 
 
+def test_keyless_eoa_resolves_without_api_key():
+    # No Etherscan key: an EOA recipient is still identified via eth_getCode
+    # (keyless) + the keyless Blockscout label. This is the fresh-machine
+    # case — the recipient row must resolve so familiarity can show.
+    label_payload = {"addresses": {ADDR: {"tags": [
+        {"tagType": "name", "name": "Binance: Hot Wallet", "ordinal": 5},
+    ]}}}
+
+    def transport(url, timeout):  # only LABELS_BASE is hit on the keyless path
+        return json.dumps(label_payload).encode()
+    src = ContractIdentitySource(
+        lambda: None, transport=transport,
+        get_code=lambda cid, addr: "0x")          # EOA → no bytecode
+    idy = src.fetch(1, ADDR)
+    assert idy is not None
+    assert idy.is_contract is False
+    assert idy.name_tag == "Binance: Hot Wallet"
+
+
+def test_keyless_contract_stays_bare():
+    # Without a key we can't usefully identify a CONTRACT (no name/verified/
+    # deployer), so leave the row bare rather than cache a half-identity.
+    src = ContractIdentitySource(
+        lambda: None,
+        get_code=lambda cid, addr: "0x60806040")   # bytecode → a contract
+    assert src.fetch(1, ADDR) is None
+
+
+def test_keyless_without_get_code_is_none():
+    # No key and no eth_getCode probe wired → nothing to go on.
+    assert ContractIdentitySource(lambda: None).fetch(1, ADDR) is None
+
+
+def test_keyless_get_code_failure_is_none():
+    def boom(cid, addr):
+        raise RuntimeError("rpc down")
+    src = ContractIdentitySource(lambda: None, get_code=boom)
+    assert src.fetch(1, ADDR) is None
+
+
 def test_source_unsupported_chain_or_no_key():
+    # Unsupported chain + no get_code wired → still None (keyless can't probe).
     assert ContractIdentitySource(lambda: "KEY").fetch(987654, ADDR) is None
     assert ContractIdentitySource(lambda: None).supports(1) is False
 

@@ -166,11 +166,16 @@ class ContractIdentitySource:
     endpoint/key plumbing as the ABI source."""
 
     def __init__(self, get_api_key: Callable[[], Optional[str]],
-                 timeout: float = 15.0, transport=None):
+                 timeout: float = 15.0, transport=None,
+                 get_code: Optional[Callable[[int, str], Optional[str]]] = None):
         self._get_api_key = get_api_key
         self.timeout = timeout
         self._transport = transport or _urllib_transport
         self._supported = ETHERSCAN_V2_CHAINS
+        # Keyless EOA-vs-contract probe (``eth_getCode`` via the chain RPC).
+        # Lets an EOA recipient be identified with no Etherscan key — the
+        # key is only needed for a *contract's* name/verified/deployer.
+        self._get_code = get_code
 
     def supports(self, chain_id: int) -> bool:
         return chain_id in self._supported and bool(self._get_api_key())
@@ -214,7 +219,9 @@ class ContractIdentitySource:
         retry). A definitive "not a contract" comes back as a populated
         ``ContractIdentity(is_contract=False)``, which IS cached."""
         if not self.supports(chain_id):
-            return None
+            # No Etherscan key (or a non-Etherscan-v2 chain): we can still
+            # recognise an EOA recipient without one. See _fetch_keyless.
+            return self._fetch_keyless(chain_id, address)
         # Creation record: authoritative on contract-vs-EOA, plus deployer
         # and deployment time in one call.
         try:
@@ -265,6 +272,31 @@ class ContractIdentitySource:
             deployer=deployer, deployed_at=deployed_at,
             name_tag=labels.get(address.lower()),
             deployer_label=labels.get(deployer.lower()) if deployer else None)
+
+    def _fetch_keyless(self, chain_id: int,
+                       address: str) -> Optional[ContractIdentity]:
+        """Identify an address with no Etherscan key. ``eth_getCode``
+        (keyless, cheap, not CU-limited) tells EOA-vs-contract, and
+        Blockscout supplies the public label (also keyless). An EOA is
+        FULLY resolved this way — identical to the keyed EOA result — so it's
+        safe to cache. A contract still needs the explorer for
+        name/verified/deployer, so leave it bare (return None, uncached)
+        until a key is configured rather than persist a half-identity."""
+        if self._get_code is None:
+            return None
+        try:
+            code = self._get_code(chain_id, address)
+        except Exception:
+            return None
+        if code is None:
+            return None
+        stripped = code[2:] if code.startswith("0x") else code
+        if stripped.strip("0"):          # any non-zero bytecode → a contract
+            return None
+        labels = self.fetch_labels(chain_id, [address])
+        return ContractIdentity(
+            address=address, is_contract=False,
+            name_tag=labels.get(address.lower()))
 
 
 @dataclass
