@@ -67,7 +67,7 @@ def _logo_data_uri():
 
 
 def _read(name):
-    with open(os.path.join(_DIR, name), "r", encoding="utf-8") as f:
+    with open(os.path.join(_DIR, name), encoding="utf-8") as f:
         return f.read()
 
 
@@ -76,7 +76,7 @@ class QethConnectorPlugin(Falkon.PluginInterface, QtCore.QObject):
         # The native bridge is a single shared object registered onto
         # every page's web channel. Parent it to keep it alive for the
         # plugin's lifetime.
-        self._bridge = QethBridge(parent=self)
+        self._bridge: QethBridge | None = QethBridge(parent=self)
         Falkon.ExternalJsObject.registerExtraObject(_BRIDGE_ID, self._bridge)
         self._install_scripts()
 

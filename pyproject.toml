@@ -98,6 +98,9 @@ qt_api = "pyside6"
 
 [tool.mypy]
 python_version = "3.10"
+# Resolve the out-of-tree Falkon connector (its own `qeth_connector` package)
+# and the root-level `Falkon.pyi` stub for the browser-plugin API.
+mypy_path = ["integrations/falkon", "."]
 # Enforced scope: the WHOLE package — the Qt-free core AND the PySide6 UI
 # layer — fully type-checked, with NO per-module error-code exemptions. The
 # flat→scoped Qt-enum migration is complete (always Qt.AlignmentFlag.AlignLeft,
@@ -158,6 +161,9 @@ files = [
     "qeth/ens.py",
     "qeth/chain_rpc_dialog.py",
     "qeth/toptokens.py",
+    # The Falkon browser-connector plugin (out-of-tree package; uses the
+    # root Falkon.pyi stub). Same scoped-Qt-enum rules apply.
+    "integrations/falkon/qeth_connector",
 ]
 warn_redundant_casts = true
 warn_unused_ignores = true

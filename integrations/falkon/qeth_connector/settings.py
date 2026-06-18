@@ -80,8 +80,9 @@ class StatusDialog(QDialog):
         header.setSpacing(14)
         self._icon = QLabel()
         self._icon.setFixedWidth(48)
-        self._icon.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        header.addWidget(self._icon, 0, Qt.AlignTop)
+        self._icon.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        header.addWidget(self._icon, 0, Qt.AlignmentFlag.AlignTop)
 
         text_col = QVBoxLayout()
         text_col.setSpacing(6)
@@ -92,17 +93,19 @@ class StatusDialog(QDialog):
         self._status.setFont(sf)
         self._status.setWordWrap(True)
         self._detail = QLabel()
-        self._detail.setTextFormat(Qt.RichText)
+        self._detail.setTextFormat(Qt.TextFormat.RichText)
         self._detail.setWordWrap(True)
-        self._detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         text_col.addWidget(self._status)
         text_col.addWidget(self._detail)
         text_col.addStretch(1)
         header.addLayout(text_col, 1)
         outer.addLayout(header)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        self._recheck = buttons.addButton("Recheck", QDialogButtonBox.ActionRole)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self._recheck = buttons.addButton(
+            "Recheck", QDialogButtonBox.ButtonRole.ActionRole)
         self._recheck.clicked.connect(self._probe)
         buttons.rejected.connect(self.reject)
 
@@ -227,7 +230,9 @@ class StatusDialog(QDialog):
         # it to fit. Grow-only, so a user who enlarged it keeps their size
         # on Recheck. activate() forces the layout to recompute first so
         # sizeHint reflects the new (wrapped) detail height.
-        self.layout().activate()
+        layout = self.layout()
+        assert layout is not None
+        layout.activate()
         hint = self.sizeHint()
         self.resize(max(self.width(), hint.width()),
                     max(self.height(), hint.height()))
