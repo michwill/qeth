@@ -528,3 +528,107 @@ def test_budget_threads_a_deadline_into_the_fork(monkeypatch):
     simulate_logs(CHAIN, FROM, USDC, "0x", 0, budget_s=12.0)
     assert seen["deadline"] is not None        # a concrete monotonic deadline
     sim._SIMV1_SUPPORT.clear()
+
+
+# --- verified-fork block backoff (dodges the head-boundary proof mismatch) ---
+
+class _RecordingEthClient:
+    """Stands in for EthClient: serves eth_blockNumber and a block dict,
+    recording which block tag _latest_block asked eth_getBlockByNumber for."""
+    head = 1000
+
+    def __init__(self, chain):
+        self.requested_tag = None
+
+    def rpc(self, method, params):
+        if method == "eth_blockNumber":
+            return hex(self.head)
+        if method == "eth_getBlockByNumber":
+            self.requested_tag = params[0]
+            num = self.head if params[0] == "latest" else int(params[0], 16)
+            return {"number": hex(num), "timestamp": "0x100",
+                    "baseFeePerGas": "0x7", "gasLimit": "0x1c9c380",
+                    "miner": "0x" + "11" * 20}
+        raise AssertionError(f"unexpected rpc {method}")
+
+
+def _patch_client(monkeypatch):
+    import qeth.chain as chain_mod
+    holder = {}
+    def factory(chain):
+        holder["client"] = _RecordingEthClient(chain)
+        return holder["client"]
+    monkeypatch.setattr(chain_mod, "EthClient", factory)
+    return holder
+
+
+def test_latest_block_no_lag_uses_latest(monkeypatch):
+    holder = _patch_client(monkeypatch)
+    blk = sim._latest_block(CHAIN)              # lag defaults to 0
+    assert blk["number"] == 1000
+    assert holder["client"].requested_tag == "latest"
+
+
+def test_latest_block_forks_lag_blocks_behind_head(monkeypatch):
+    holder = _patch_client(monkeypatch)
+    blk = sim._latest_block(CHAIN, lag=5)
+    assert blk["number"] == 995               # 1000 - 5
+    assert holder["client"].requested_tag == hex(995)
+
+
+def test_floor_clamps_the_backoff_forward_to_include_our_tx(monkeypatch):
+    """If the wallet's last tx is newer than (head - lag), fork at that tx's
+    block instead — otherwise the preview would miss our own approval."""
+    holder = _patch_client(monkeypatch)
+    # head 1000, lag 5 would fork at 995, but our last tx is at 998.
+    blk = sim._latest_block(CHAIN, lag=5, floor_block=998)
+    assert blk["number"] == 998
+    assert holder["client"].requested_tag == hex(998)
+
+
+def test_floor_below_the_backoff_target_is_a_noop(monkeypatch):
+    """An old last-tx doesn't pull the fork forward — the full lag margin is
+    kept for proof convergence."""
+    holder = _patch_client(monkeypatch)
+    blk = sim._latest_block(CHAIN, lag=5, floor_block=990)
+    assert blk["number"] == 995               # head - lag wins
+    assert holder["client"].requested_tag == hex(995)
+
+
+def test_floor_never_forks_past_the_head(monkeypatch):
+    """A floor at/above the head clamps to the head, not beyond — forking at
+    the head is the unavoidable edge when our tx is the newest block."""
+    holder = _patch_client(monkeypatch)
+    blk = sim._latest_block(CHAIN, lag=5, floor_block=10_000)
+    assert blk["number"] == 1000              # min(floor, head)
+    assert holder["client"].requested_tag == hex(1000)
+
+
+def test_latest_block_lag_below_genesis_falls_back_to_latest(monkeypatch):
+    """A lag deeper than the chain's height (a brand-new testnet) must not
+    request a negative block — fall back to latest."""
+    holder = _patch_client(monkeypatch)
+    _RecordingEthClient.head = 3
+    try:
+        sim._latest_block(CHAIN, lag=10)
+        assert holder["client"].requested_tag == "latest"
+    finally:
+        _RecordingEthClient.head = 1000
+
+
+def test_verified_branch_passes_per_chain_lag_to_the_fork(monkeypatch):
+    """The verified simulation path forks behind the head by the chain's
+    configured lag (mainnet here) — the actual fix for the -32000 proof
+    mismatch at the bleeding edge."""
+    seen = {}
+    def fake_fork(*a, **k):
+        seen["fork_lag"] = k.get("fork_lag")
+        return ["ok"]
+    import qeth.helios as helios_mod
+    monkeypatch.setattr(sim, "_simulate_via_fork", fake_fork)
+    monkeypatch.setattr(sim, "fork_available", lambda: True)
+    # verified_chain is imported locally inside simulate_logs (from .helios),
+    # so patch it at the source module, not on sim.
+    monkeypatch.setattr(helios_mod, "verified_chain", lambda chain: chain)
+    simulate_logs(CHAIN, FROM, USDC, "0x1234", 0)
+    assert seen["fork_lag"] == sim._VERIFIED_FORK_LAG[1]

@@ -271,13 +271,49 @@ def _hexint(v):
     return int(v, 16)
 
 
-def _latest_block(chain) -> "dict | None":
-    """Latest block's env-relevant fields (ints / address / bytes) so the
-    fork runs in a realistic block context. Raises on RPC failure — the
-    retry loop handles transient rate-limits; other errors abort the
-    preview (an env-less fork falsely reverts time-math contracts)."""
+# Blocks to fork BEHIND the head for a verified (Helios) simulation. The
+# proof-verification failures we see ("root hash mismatch in account proof
+# trie") are a bleeding-edge artifact: behind a load balancer the backend
+# that answers eth_getProof can be a block or two off from the head Helios
+# verified, so its proof hashes to a different state root. A handful of
+# blocks back, the backends have converged and the proof matches. Sized in
+# WALL-CLOCK (~15-25s) per chain, not a fixed block count — small enough to
+# not fork before a just-landed tx (an approve-then-swap in the same
+# session), large enough to clear the disagreement window. Latest, not
+# finalized: finalized (~13 min on mainnet) is far too stale for a preview.
+_VERIFIED_FORK_LAG: dict[int, int] = {
+    1:     2,     # mainnet, ~12s blocks  → ~24s
+    10:    10,    # OP,      ~2s blocks   → ~20s
+    8453:  10,    # Base,    ~2s blocks   → ~20s
+    59144: 8,     # Linea,   ~2-3s blocks → ~16-24s
+}
+_DEFAULT_FORK_LAG = 3
+
+
+def _latest_block(chain, lag: int = 0, floor_block=None) -> "dict | None":
+    """Env-relevant fields (ints / address / bytes) of the head block — or,
+    when ``lag`` > 0, of the block ``lag`` behind it — so the fork runs in a
+    realistic block context. The lag is how a verified simulation dodges the
+    head-boundary proof mismatch (see ``_VERIFIED_FORK_LAG``); ``floor_block``
+    (this wallet's latest confirmed tx) clamps the backoff forward so the
+    preview never forks before the user's own recent state. Raises on RPC
+    failure — the retry loop handles transient rate-limits; other errors
+    abort the preview (an env-less fork falsely reverts time-math contracts)."""
     from .chain import EthClient
-    blk = EthClient(chain).rpc("eth_getBlockByNumber", ["latest", False])
+    client = EthClient(chain)
+    tag = "latest"
+    if lag > 0:
+        head = _hexint(client.rpc("eth_blockNumber", [])) or 0
+        target = head - lag
+        if floor_block is not None:
+            # Never fork BEFORE this wallet's own latest confirmed tx, or the
+            # preview misses it — an approval done moments ago would make the
+            # follow-up swap falsely revert. Clamp toward the head (and never
+            # past it, in case the floor is somehow stale-ahead).
+            target = max(target, min(floor_block, head))
+        if target > 0:                       # guard a very young chain / test net
+            tag = hex(target)
+    blk = client.rpc("eth_getBlockByNumber", [tag, False])
     if not blk:
         return None
     mix = blk.get("mixHash")
@@ -295,13 +331,16 @@ def _latest_block(chain) -> "dict | None":
 
 def _simulate_via_fork(chain, from_addr, to_addr, data, value,
                        *, fork_reader=None, fork_block=None, hint_url=None,
+                       fork_lag=0, floor_block=None,
                        retries=4, sleep=None, deadline=None):
     """Local py-evm fork (``qeth.pyevm_fork``). ``fork_reader`` is the
     test seam: a fake ``StateReader`` makes the run hermetic (the real
     pure-Python engine executes against injected state, no network) —
-    ``fork_block`` then defaults to a neutral env. Retries transient
-    rate-limits with backoff up to ``deadline`` then gives up; a genuine
-    revert fails fast (logged with the decoded reason).
+    ``fork_block`` then defaults to a neutral env. ``fork_lag`` forks that
+    many blocks behind the head (used in verified mode to dodge the
+    head-boundary proof mismatch — see ``_VERIFIED_FORK_LAG``). Retries
+    transient rate-limits with backoff up to ``deadline`` then gives up; a
+    genuine revert fails fast (logged with the decoded reason).
 
     State is fetched slot-by-slot through the reader, so on a throttled
     endpoint *one* attempt can still take tens of seconds — the deadline
@@ -319,7 +358,7 @@ def _simulate_via_fork(chain, from_addr, to_addr, data, value,
     for attempt in range(retries):
         try:
             block = (fork_block or _TEST_BLOCK) if injected \
-                else _latest_block(chain)
+                else _latest_block(chain, lag=fork_lag, floor_block=floor_block)
             if block is None:
                 log.warning("no block env available; skipping the preview")
                 return None
@@ -367,7 +406,7 @@ _TIME_BUDGET_S = 40.0
 
 
 def simulate_logs(chain, from_addr: str, to_addr, data, value,
-                  *, fork_reader=None, fork_block=None,
+                  *, fork_reader=None, fork_block=None, floor_block=None,
                   retries=4, sleep=None, budget_s=_TIME_BUDGET_S):
     """Simulate the tx and return its event logs as ``decode_event``-ready
     dicts ``[{"address", "topics", "data"}, …]``, or ``None`` (logged) when
@@ -408,6 +447,13 @@ def simulate_logs(chain, from_addr: str, to_addr, data, value,
                 # not the Helios shadow (slow iterative proving). Keys
                 # only — values are re-proven through Helios.
                 hint_url=chain.rpc_url,
+                # Fork a few blocks behind the head so the RPC backends have
+                # converged on the state Helios verified — otherwise the
+                # bleeding-edge eth_getProof fails root verification (-32000).
+                # floor_block clamps that backoff so we never fork before the
+                # wallet's own latest tx (don't hide our just-sent approval).
+                fork_lag=_VERIFIED_FORK_LAG.get(chain.chain_id, _DEFAULT_FORK_LAG),
+                floor_block=floor_block,
                 retries=retries, sleep=sleep, deadline=deadline)
             # Mark success (incl. an empty log list) as verified; None /
             # SimulationNote pass through unchanged.

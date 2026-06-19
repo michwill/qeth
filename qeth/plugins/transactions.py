@@ -1052,6 +1052,25 @@ class TransactionsPlugin(Plugin):
         ]
         return max(nonces) + 1 if nonces else None
 
+    def latest_confirmed_block(self, chain_id: int, address: str) -> int | None:
+        """The highest block in which this wallet has a confirmed tx it *sent*
+        on ``chain_id`` — the floor a verified preview must not fork before, so
+        a just-confirmed approval is always present in the simulated state.
+        ``None`` when we've never seen one here (the fork uses its lag alone).
+        Only txs we sent (``from == address``) count: those are the ones whose
+        omission would make a follow-up call falsely revert, and keeping the
+        floor minimal preserves the lag's proof-convergence margin."""
+        addr = address.lower()
+        txs = self._cache.get((chain_id, addr))
+        if txs is None:
+            txs = self._disk_cache.load(chain_id, addr) or []
+        blocks = [
+            t.block_number for t in txs
+            if not t.pending and t.block_number
+            and (t.from_addr or "").lower() == addr
+        ]
+        return max(blocks) if blocks else None
+
     def _rebuild_live_snapshot(self) -> None:
         """Main-thread rebuild of the pending snapshot the LiveWatcher reads,
         assigning a fresh dict (atomic swap → no lock). Cheap no-op when the
@@ -2702,13 +2721,15 @@ class SimulateWorker(QThread):
 
     ready = Signal(object)   # list of log dicts, or None
 
-    def __init__(self, chain, from_addr, to_addr, data, value, parent=None):
+    def __init__(self, chain, from_addr, to_addr, data, value,
+                 floor_block=None, parent=None):
         super().__init__(parent)
         self._args = (chain, from_addr, to_addr, data, value)
+        self._floor_block = floor_block
 
     def run(self) -> None:
         from ..simulate import simulate_logs
-        self.ready.emit(simulate_logs(*self._args))
+        self.ready.emit(simulate_logs(*self._args, floor_block=self._floor_block))
 
 
 class _EventsView(QWidget):
@@ -2972,6 +2993,7 @@ class _EventPreviewMixin:
         _abi_source: AnyAbiSource | None
         _abi_cache: AbiCache
         _start_worker: Any
+        _sim_floor_provider: Callable[[int, str], int | None] | None
 
         def _sim_params(self) -> Any: ...
 
@@ -2984,11 +3006,16 @@ class _EventPreviewMixin:
     # self-evict via the host's worker set.
     SIM_TIMEOUT_MS = 35_000
 
-    def _init_event_preview(self, tabs, *, known_addresses) -> None:
+    def _init_event_preview(self, tabs, *, known_addresses,
+                            sim_floor_provider=None) -> None:
         self._sim_tabs = tabs
         self._sim_key = None
         self._sim_worker: SimulateWorker | None = None
         self._sim_done = True   # no sim in flight
+        # (chain_id, from_addr) -> this wallet's latest confirmed block, so a
+        # verified preview never forks before our own recent tx. None when the
+        # host doesn't wire it (the fork just uses the per-chain lag alone).
+        self._sim_floor_provider = sim_floor_provider
         self._events = _EventsView(
             chain=self.chain, known_addresses=known_addresses,
             token_info=self._token_info, icon_cache=self._icon_cache,
@@ -3041,7 +3068,12 @@ class _EventPreviewMixin:
         self._events.set_busy("simulating…")
         self._sim_done = False
         self._detach_sim()                 # drop any prior in-flight worker
-        worker = SimulateWorker(self.chain, *params)
+        from_addr, to_addr, data, value = params
+        floor_block = None
+        if self._sim_floor_provider is not None:
+            floor_block = self._sim_floor_provider(self.chain.chain_id, from_addr)
+        worker = SimulateWorker(self.chain, from_addr, to_addr, data, value,
+                                floor_block=floor_block)
         self._sim_worker = worker
         worker.ready.connect(
             lambda logs, k=params: self._on_sim_ready(k, logs)
@@ -3962,6 +3994,8 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
                  replace_label: str | None = None,
                  nonce_floor_provider:
                      Callable[[int, str], int | None] | None = None,
+                 sim_floor_provider:
+                     Callable[[int, str], int | None] | None = None,
                  parent=None):
         super().__init__(parent)
         self.req = req
@@ -4200,7 +4234,8 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
         self.confirm_btn.clicked.connect(self.sign_requested.emit)
 
         # --- events preview tab (lazy local simulation) --------------
-        self._init_event_preview(self._tabs, known_addresses=known_addresses)
+        self._init_event_preview(self._tabs, known_addresses=known_addresses,
+                                 sim_floor_provider=sim_floor_provider)
 
         root.addWidget(self.buttons)
 
@@ -4604,6 +4639,8 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
                  tx_cache: TransactionCache | None = None,
                  nonce_floor_provider:
                      Callable[[int, str], int | None] | None = None,
+                 sim_floor_provider:
+                     Callable[[int, str], int | None] | None = None,
                  parent=None):
         super().__init__(parent)
         # Address book = (address, label) of the user's OWN wallets only —
@@ -4895,7 +4932,8 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         self.confirm_btn.clicked.connect(self.sign_requested.emit)
 
         # --- events preview tab (lazy local simulation) --------------
-        self._init_event_preview(self._tabs, known_addresses=known_addresses)
+        self._init_event_preview(self._tabs, known_addresses=known_addresses,
+                                 sim_floor_provider=sim_floor_provider)
 
         root.addWidget(self.buttons)
 

@@ -36,6 +36,47 @@ def test_floor_ignores_other_senders():
     assert _plugin_with_pending(pending).pending_nonce_floor(1, ADDR) is None
 
 
+# --- latest_confirmed_block: the verified-preview fork floor ----------------
+# A verified simulation forks a few blocks behind the head (proof convergence)
+# but must NOT fork before this wallet's own latest tx, or it would hide a
+# just-confirmed approval. This is where that floor block comes from.
+
+from qeth.transactions import Transaction
+
+
+def _tx(block, frm=ADDR, *, pending=False):
+    return Transaction(
+        chain_id=1, hash="0x" + "ab" * 32, block_number=block,
+        timestamp=0, nonce=0, from_addr=frm, to_addr=OTHER, value_wei=0,
+        gas_used=0, gas_price_wei=0, method_id="0x", input_data="0x",
+        success=True, pending=pending,
+    )
+
+
+def _plugin_with_cache(txs):
+    plug = TransactionsPlugin.__new__(TransactionsPlugin)
+    plug._cache = {(1, ADDR): txs}
+    return plug
+
+
+def test_confirmed_block_is_none_with_no_history():
+    assert _plugin_with_cache([]).latest_confirmed_block(1, ADDR) is None
+
+
+def test_confirmed_block_is_highest_we_sent():
+    txs = [_tx(100), _tx(140), _tx(120)]
+    assert _plugin_with_cache(txs).latest_confirmed_block(1, ADDR) == 140
+
+
+def test_confirmed_block_ignores_pending_and_others():
+    txs = [
+        _tx(100),                       # ours, confirmed
+        _tx(0, pending=True),           # ours, pending (block 0)
+        _tx(200, frm=OTHER),            # someone else sent (we're only `to`)
+    ]
+    assert _plugin_with_cache(txs).latest_confirmed_block(1, ADDR) == 100
+
+
 # --- GasSuggestionWorker: applies the floor over the MINED count -----------
 
 class _StubClient:
