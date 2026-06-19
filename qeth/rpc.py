@@ -686,87 +686,15 @@ class RpcServer:
             return await self._proxy(method, params, origin=origin,
                                      broadcast=True)
 
-        if method == "eth_getLogs":
-            # Free RPCs cap the block range (DRPC: "ranges over 10000 blocks
-            # are not supported on freetier"), and failover doesn't help since
-            # the fallbacks cap it too. Split a wide range into chunks instead.
-            return await self._get_logs_chunked(params, origin)
-
+        # eth_getLogs falls through to the plain proxy too. We deliberately
+        # DON'T chunk or pre-cap the range: let the node decide. If any
+        # provider serves the scan, return it; if they all reject it (e.g.
+        # DRPC's free-tier "ranges over 10000 blocks"), the failover-exhausted
+        # error is passed straight to the dapp. The real limit is the result
+        # size, which only the node can judge — second-guessing it by block
+        # range refuses legitimate narrow-filter scans and can't predict a
+        # broad one's blowup anyway.
         return await self._proxy(method, params, origin=origin)
-
-    # Free-tier eth_getLogs range cap. DRPC rejects ranges OVER 10000 blocks,
-    # so a chunk spans at most this many blocks (fromBlock..fromBlock+N-1).
-    _MAX_LOG_BLOCKS = 10000
-    # Cap on chunks per getLogs (≈ _MAX_LOG_BLOCKS × this = 1.5M blocks, a few
-    # months of Ethereum). A wider range — e.g. a dapp scanning 0→latest — is
-    # refused with a clean error rather than fanned into thousands of doomed
-    # sub-requests: no RPC serves a full-chain log scan; that's an indexer's job.
-    _MAX_LOG_CHUNKS = 150
-
-    async def _get_logs_chunked(self, params: list,
-                                origin: str | None) -> Any:
-        """``eth_getLogs`` split transparently into <=``_MAX_LOG_BLOCKS``-block
-        chunks so a range wider than a free RPC allows still returns. Each
-        chunk goes through ``_proxy`` (so failover still applies); the per-chunk
-        log lists are concatenated (chunks are disjoint + ascending, so order
-        is preserved). Falls back to a plain proxy when there's nothing to
-        chunk (a blockHash filter, a narrow range, or an unparseable bound)."""
-        flt = params[0] if params else None
-        if not isinstance(flt, dict) or "blockHash" in flt:
-            return await self._proxy("eth_getLogs", params, origin=origin)
-        try:
-            start = await self._resolve_block(flt.get("fromBlock"), origin)
-            end = await self._resolve_block(flt.get("toBlock"), origin)
-        except (ValueError, TypeError):
-            return await self._proxy("eth_getLogs", params, origin=origin)
-        # span < _MAX_LOG_BLOCKS means at most _MAX_LOG_BLOCKS blocks — within
-        # the cap, so forward unchanged. Also bail on an inverted range.
-        if start > end or (end - start) < self._MAX_LOG_BLOCKS:
-            return await self._proxy("eth_getLogs", params, origin=origin)
-        max_blocks = self._MAX_LOG_BLOCKS * self._MAX_LOG_CHUNKS
-        if (end - start) >= max_blocks:
-            # Too wide to serve. Return a clean, actionable JSON-RPC error
-            # (limit-exceeded) instead of fanning out or forwarding DRPC's
-            # opaque 400 — so the dapp gets a definitive answer and stops
-            # retry-storming an impossible request.
-            log.warning("eth_getLogs range too wide: %d blocks (%d–%d); "
-                        "refusing (max %d)", end - start + 1, start, end,
-                        max_blocks)
-            raise RpcError(
-                -32005,
-                f"eth_getLogs range too wide: {end - start + 1} blocks "
-                f"(max {max_blocks}). Narrow fromBlock/toBlock, or use an "
-                f"indexer for full-history scans.",
-            )
-        out: list = []
-        lo = start
-        while lo <= end:
-            hi = min(end, lo + self._MAX_LOG_BLOCKS - 1)
-            chunk = dict(flt)
-            chunk["fromBlock"] = hex(lo)
-            chunk["toBlock"] = hex(hi)
-            res = await self._proxy("eth_getLogs", [chunk], origin=origin)
-            if isinstance(res, list):
-                out.extend(res)
-            lo = hi + 1
-        return out
-
-    async def _resolve_block(self, tag: Any, origin: str | None) -> int:
-        """A filter's block bound → a concrete block number. Named tags
-        resolve via the upstream (``latest``/``pending``/… → ``eth_blockNumber``,
-        ``earliest`` → 0); ``None`` (absent bound) defaults to ``latest``."""
-        if tag is None or tag == "latest" or tag == "pending":
-            bn = await self._proxy("eth_blockNumber", [], origin=origin)
-            return int(bn, 16)
-        if tag in ("safe", "finalized"):
-            bn = await self._proxy("eth_getBlockByNumber", [tag, False],
-                                   origin=origin)
-            return int(bn["number"], 16)
-        if tag == "earliest":
-            return 0
-        if isinstance(tag, int):
-            return tag
-        return int(tag, 16)   # hex quantity string; raises ValueError if not
 
     async def _confirm_new_chain(self, cid: int, info: dict) -> bool:
         """Ask the user (via the signer bridge) to approve adding a new
