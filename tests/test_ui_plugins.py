@@ -37,6 +37,9 @@ class _StubHost:
     def start_worker(self, worker):
         self.started_workers.append(worker)
 
+    def token_info(self, chain_id, address):
+        return None        # no curated entry — like a non-listed token
+
     def status_message(self, text: str, timeout_ms: int = 3000) -> None:
         self.status_calls.append((text, timeout_ms))
 
@@ -115,6 +118,126 @@ def _tx_send(*, nonce: int):
         value_wei=0, gas_used=0, gas_price_wei=0,
         method_id="", input_data="0x", success=True,
     )
+
+
+class TestCoinsTooltip:
+    """The transactions list's coins column is icon-only; its hover tooltip
+    names the moved assets so USDC is distinguishable from USDT (issue #17)."""
+
+    def _summary(self, out=(), inn=(), show_arrow=True):
+        from qeth.plugins.tx_summary import Coin, TxSummary
+        return TxSummary(
+            "verb",
+            tuple(Coin(s, None) for s in out),
+            tuple(Coin(s, None) for s in inn),
+            show_arrow=show_arrow,
+        )
+
+    def _tt(self, **kw):
+        from qeth.plugins.transactions import TransactionListPanel
+        return TransactionListPanel._coins_tooltip(self._summary(**kw))
+
+    def test_swap_shows_out_arrow_in(self):
+        assert self._tt(out=["USDC"], inn=["DAI"]) == "USDC → DAI"
+
+    def test_send_only_out(self):
+        assert self._tt(out=["USDC"]) == "Sent USDC"
+
+    def test_receive_only_in(self):
+        assert self._tt(inn=["DAI"]) == "Received DAI"
+
+    def test_approval_names_the_token_without_arrow(self):
+        assert self._tt(out=["USDC"], show_arrow=False) == "Approved USDC"
+
+    def test_multiple_assets_are_listed(self):
+        assert self._tt(out=["USDC", "WETH"], inn=["DAI"]) == "USDC, WETH → DAI"
+
+    def test_empty_summary_is_blank(self):
+        assert self._tt() == ""
+
+
+class TestNonListedTokenSymbols:
+    """A token outside every curated list still has an on-chain symbol(); the
+    coins column must show it, not "?". Resolution order: curated list →
+    on-chain metadata cache → symbols harvested from Blockscout tokentx."""
+
+    PEPE = "0x6982508145454ce325ddbe47a25d4ec3d2311933"
+
+    def _plugin(self, qtbot, tmp_qeth):
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        return plugin, host
+
+    def _act(self, symbol):
+        from qeth.tx_activity import Activity, AssetLeg
+        return Activity("swap", out=(AssetLeg(symbol, self.PEPE),), inn=())
+
+    def test_fill_resolves_from_on_chain_metadata_cache(self, qtbot, tmp_qeth):
+        plugin, _ = self._plugin(qtbot, tmp_qeth)
+        plugin._token_meta.put_many(1, {self.PEPE: {"symbol": "PEPE",
+                                                    "name": "Pepe",
+                                                    "decimals": 18}})
+        filled = plugin._fill_symbols(1, self._act("?"))
+        assert filled.out[0].symbol == "PEPE"
+
+    def test_fill_resolves_from_harvested_symbol_cache(self, qtbot, tmp_qeth):
+        plugin, _ = self._plugin(qtbot, tmp_qeth)
+        plugin._symbol_cache[(1, self.PEPE)] = "PEPE"
+        filled = plugin._fill_symbols(1, self._act("?"))
+        assert filled.out[0].symbol == "PEPE"
+
+    def test_fill_leaves_a_known_symbol_untouched(self, qtbot, tmp_qeth):
+        plugin, _ = self._plugin(qtbot, tmp_qeth)
+        act = self._act("USDC")
+        assert plugin._fill_symbols(1, act) is act     # unchanged → same object
+
+    def test_unknown_contracts_lists_only_the_unresolvable(self, qtbot, tmp_qeth):
+        plugin, _ = self._plugin(qtbot, tmp_qeth)
+        plugin._symbol_cache[(1, self.PEPE)] = "PEPE"
+        known = {"h1": self._act("?")}                  # resolvable → not listed
+        assert plugin._unknown_symbol_contracts(1, known) == set()
+        other = "0x" + "11" * 20
+        from qeth.tx_activity import Activity, AssetLeg
+        unknown = {"h2": Activity("swap", out=(AssetLeg("?", other),))}
+        assert plugin._unknown_symbol_contracts(1, unknown) == {other}
+
+    def test_on_chain_meta_caches_harvests_and_repaints(self, qtbot, tmp_qeth):
+        plugin, _ = self._plugin(qtbot, tmp_qeth)
+        key = (1, ADDR.lower())
+        plugin._rendered_for = key
+        # a cached activity stuck on "?" for PEPE
+        plugin._activity_cache.update(1, ADDR.lower(), {"h1": self._act("?")})
+        painted: list = []
+        plugin._panel.set_activities = lambda m: painted.append(m)
+
+        plugin._on_token_meta(1, {self.PEPE: {"symbol": "PEPE", "decimals": 18}})
+
+        # cached + harvested for future receipt/sim legs
+        assert plugin._token_meta.get(1, self.PEPE)["symbol"] == "PEPE"
+        assert plugin._symbol_cache[(1, self.PEPE)] == "PEPE"
+        # repainted, with the ticker now filled in
+        assert painted and painted[0]["h1"].out[0].symbol == "PEPE"
+
+    def test_kick_token_meta_skips_already_cached(self, qtbot, tmp_qeth):
+        plugin, host = self._plugin(qtbot, tmp_qeth)
+        plugin._token_meta.put_many(1, {self.PEPE: {"symbol": "PEPE",
+                                                    "decimals": 18}})
+        plugin._kick_token_meta(1, {self.PEPE})
+        assert host.started_workers == []              # nothing to fetch
+
+    def test_kick_token_meta_starts_a_worker_for_unknown(self, qtbot, tmp_qeth):
+        from qeth.plugins.tokens import MetadataWorker
+        plugin, host = self._plugin(qtbot, tmp_qeth)
+        other = "0x" + "11" * 20
+        plugin._kick_token_meta(1, {other})
+        assert len(host.started_workers) == 1
+        assert isinstance(host.started_workers[0], MetadataWorker)
+        assert other in plugin._meta_inflight          # deduped on re-kick
+        host.started_workers.clear()
+        plugin._kick_token_meta(1, {other})
+        assert host.started_workers == []              # already in flight
 
 
 class TestTransactionsPlugin:

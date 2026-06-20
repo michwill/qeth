@@ -70,6 +70,7 @@ from ..transactions import (
 )
 from ..transactions_cache import TransactionCache, merge_txs
 from ..activity_cache import ActivityCache
+from ..token_metadata import TokenMetadataCache
 from ..tx_activity import (
     Activity, AssetLeg, fetch_activities, transfer_legs_from_logs,
 )
@@ -946,6 +947,13 @@ class TransactionsPlugin(Plugin):
         # leg show the right symbol (e.g. Gnosis "EURe" → "E") even when the
         # curated token lists don't know the token, instead of a bare "?".
         self._symbol_cache: dict[tuple[int, str], str] = {}
+        # On-chain (name, symbol, decimals) cache, shared on disk with the
+        # tokens plugin. The authoritative, token-list-INDEPENDENT symbol
+        # source: a token absent from every curated list still has an on-chain
+        # symbol() — read it here so the coins column shows "PEPE", not "?".
+        # _meta_inflight dedupes the on-chain multicall per contract.
+        self._token_meta = TokenMetadataCache()
+        self._meta_inflight: set[str] = set()
         # Resolved activities persisted to disk — a confirmed tx's verb +
         # coins never change, so a return visit to a chain paints from here
         # instantly instead of refetching (and receipt coins survive a
@@ -1523,12 +1531,15 @@ class TransactionsPlugin(Plugin):
             for leg in (*a.out, *a.inn):
                 if leg.contract and leg.symbol and leg.symbol != "?":
                     self._symbol_cache[(key[0], leg.contract)] = leg.symbol
-        merged = {h: self._with_known_legs(key[0], h, a)
+        merged = {h: self._fill_symbols(key[0], self._with_known_legs(key[0], h, a))
                   for h, a in acts.items()}
         self._activity_cache.update(key[0], key[1], merged)
         if self._panel is not None and self._rendered_for == key:
             self._panel.set_activities(merged)
         self._scan_coinless(key, merged)
+        # Tokens still showing "?" aren't in any list or cache — read their
+        # on-chain symbol() so the coins column names them (repaints on arrival).
+        self._kick_token_meta(key[0], self._unknown_symbol_contracts(key[0], merged))
 
     def _scan_coinless(self, key: tuple[int, str],
                        acts: dict[str, Activity]) -> None:
@@ -1583,6 +1594,105 @@ class TransactionsPlugin(Plugin):
         from dataclasses import replace
         return replace(activity, out=new_out, inn=new_in)
 
+    # --- symbol resolution for non-listed tokens ---------------------------
+
+    def _best_symbol(self, chain_id: int, contract: str) -> str | None:
+        """The real ticker for ``contract``, list-independent: curated token
+        list → on-chain metadata cache → symbols harvested from Blockscout
+        tokentx. None when we genuinely don't know it yet (caller fetches)."""
+        info = self.host.token_info(chain_id, contract) if self.host else None
+        sym = getattr(info, "symbol", None)
+        if sym:
+            return sym
+        meta = self._token_meta.get(chain_id, contract)
+        if meta and meta.get("symbol"):
+            return meta["symbol"]
+        return self._symbol_cache.get((chain_id, contract.lower()))
+
+    def _fill_symbols(self, chain_id: int, activity: Activity) -> Activity:
+        """Rewrite any leg whose symbol is unknown ("?"/empty) with the token's
+        real on-chain symbol when we can resolve it — so a token outside every
+        curated list shows its ticker instead of a bare "?"."""
+        def fix(legs: tuple[AssetLeg, ...]) -> tuple[tuple[AssetLeg, ...], bool]:
+            out: list[AssetLeg] = []
+            changed = False
+            for leg in legs:
+                if leg.contract and leg.symbol in ("", "?"):
+                    s = self._best_symbol(chain_id, leg.contract)
+                    if s and s != leg.symbol:
+                        out.append(AssetLeg(s, leg.contract))
+                        changed = True
+                        continue
+                out.append(leg)
+            return tuple(out), changed
+
+        new_out, c1 = fix(activity.out)
+        new_in, c2 = fix(activity.inn)
+        if not (c1 or c2):
+            return activity
+        from dataclasses import replace
+        return replace(activity, out=new_out, inn=new_in)
+
+    def _unknown_symbol_contracts(self, chain_id: int,
+                                  acts: dict[str, Activity]) -> set[str]:
+        """Contracts still showing "?" after a fill — their on-chain symbol
+        isn't cached anywhere yet, so they're the ones worth a multicall."""
+        out: set[str] = set()
+        for a in acts.values():
+            for leg in (*a.out, *a.inn):
+                if (leg.contract and leg.symbol in ("", "?")
+                        and self._best_symbol(chain_id, leg.contract) is None):
+                    out.add(leg.contract.lower())
+        return out
+
+    def _kick_token_meta(self, chain_id: int, contracts: set[str]) -> None:
+        """Fetch on-chain (symbol, decimals) for unknown-ticker contracts so
+        even tokens we've never held — and old txs whose token was never
+        cached — resolve. Deduped per contract; skips ones already cached."""
+        if self.host is None or not contracts:
+            return
+        chain = self.host.current_chain()
+        if chain.chain_id != chain_id:
+            return
+        todo = [c for c in self._token_meta.missing(chain_id, list(contracts))
+                if c not in self._meta_inflight]
+        if not todo:
+            return
+        self._meta_inflight.update(todo)
+        from .tokens import MetadataWorker
+        worker = MetadataWorker(chain, todo)
+        worker.fetched.connect(self._on_token_meta)
+        worker.failed.connect(
+            lambda _e, cs=todo: self._meta_inflight.difference_update(cs))
+        self.host.start_worker(worker)
+
+    def _on_token_meta(self, chain_id, meta) -> None:
+        """On-chain metadata landed: cache it, harvest the symbols, and repaint
+        just the rows whose coins were waiting on one of these tickers."""
+        chain_id = int(chain_id)
+        meta = meta or {}
+        self._token_meta.put_many(chain_id, meta)
+        fetched = {c.lower() for c in meta}
+        for c, m in meta.items():
+            s = (m or {}).get("symbol")
+            if s:
+                self._symbol_cache[(chain_id, c.lower())] = s
+        self._meta_inflight.difference_update(fetched)
+        if self._panel is None or self._rendered_for is None:
+            return
+        key = self._rendered_for
+        if key[0] != chain_id:
+            return
+        cached = self._activity_cache.load(chain_id, key[1])
+        affected = {
+            h: self._fill_symbols(chain_id, a)
+            for h, a in cached.items()
+            if any(leg.contract in fetched for leg in (*a.out, *a.inn))
+        }
+        if affected:
+            self._activity_cache.update(chain_id, key[1], affected)
+            self._panel.set_activities(affected)
+
     def note_transfer_legs(self, chain_id: int, tx_hash: str,
                            logs: object, viewer: str) -> None:
         """Record the ERC-20 contracts a tx's logs moved through ``viewer``
@@ -1605,10 +1715,13 @@ class TransactionsPlugin(Plugin):
             base = self._activity_cache.load(chain_id, key[1]).get(tx_hash)
         if base is None:
             return
-        merged = {tx_hash: self._with_known_legs(chain_id, tx_hash, base)}
+        merged = {tx_hash: self._fill_symbols(
+            chain_id, self._with_known_legs(chain_id, tx_hash, base))}
         self._activity_cache.update(chain_id, key[1], merged)
         if on_view and panel is not None:
             panel.set_activities(merged)
+        self._kick_token_meta(
+            chain_id, self._unknown_symbol_contracts(chain_id, merged))
 
     def _refresh(self, address: str, force_fetch: bool = False) -> None:
         """Render cached transactions immediately (if any) and kick a
@@ -1670,11 +1783,18 @@ class TransactionsPlugin(Plugin):
             # get a worker. Re-scan any cached-coinless rows by receipt too,
             # so a tokentx miss persisted last session gets a second chance
             # without forcing a full re-resolve.
-            primed = self._activity_cache.load(chain.chain_id, address)
+            primed = {h: self._fill_symbols(chain.chain_id, a)
+                      for h, a in self._activity_cache.load(
+                          chain.chain_id, address).items()}
             self._panel.prime_activities(primed)
             self._scan_coinless(key, primed)
             self._panel.show_transactions(cached[:cap])
             self._rendered_for = key
+            # Old caches (and old txs) may carry "?" for tokens never held —
+            # read their on-chain symbol so they resolve on this visit too.
+            self._kick_token_meta(
+                chain.chain_id, self._unknown_symbol_contracts(
+                    chain.chain_id, primed))
         elif view_changed and (force_fetch or self._is_active()):
             self._displayed_count[key] = 0
             self._panel.show_loading()
@@ -2199,6 +2319,23 @@ class TransactionListPanel(QWidget):
         coins = self.table.item(row, _C_COINS)
         if coins is not None:
             coins.setIcon(self._coins_icon(summary))
+            coins.setToolTip(self._coins_tooltip(summary))
+
+    @staticmethod
+    def _coins_tooltip(summary: TxSummary) -> str:
+        """Name the moved assets for the coins column — it's icon-only, so a
+        hover is the only way to tell USDC from USDT (issue #17)."""
+        out = ", ".join(c.symbol for c in summary.out)
+        inn = ", ".join(c.symbol for c in summary.inn)
+        if not summary.show_arrow:          # approval: the approved token only
+            return f"Approved {out}" if out else ""
+        if out and inn:
+            return f"{out} → {inn}"
+        if out:
+            return f"Sent {out}"
+        if inn:
+            return f"Received {inn}"
+        return ""
 
     def _fit_verb_column(self) -> None:
         """Size the verb column to its text, but never wider than the room
