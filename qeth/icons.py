@@ -150,6 +150,26 @@ def _chain_icon_urls(chain_id: int, name: str | None = None) -> list[str]:
 CIRCULAR_RENDER_SIZE = 64   # Rendered once, scaled down by Qt for display.
 
 
+def smooth_scaled(src: QPixmap, size: int, dpr: float = 1.0) -> QPixmap:
+    """Scale ``src`` to ``size``×``size`` *logical* px with a smooth (bilinear)
+    filter, tagged at ``dpr`` so it stays crisp on HiDPI.
+
+    Use this for any on-screen icon instead of ``QLabel.setScaledContents``
+    (which scales with nearest-neighbour) or a bare ``QPixmap.scaled`` (whose
+    default ``TransformationMode`` is also nearest). Keeps aspect ratio.
+    """
+    if src.isNull() or size <= 0:
+        return src
+    dev = max(1, round(size * dpr))
+    out = src.scaled(
+        dev, dev,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    out.setDevicePixelRatio(dpr)
+    return out
+
+
 def to_circular(src: QPixmap, size: int = CIRCULAR_RENDER_SIZE) -> QPixmap:
     """Return a copy of ``src`` cropped to a circle, anti-aliased.
 

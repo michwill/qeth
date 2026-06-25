@@ -38,8 +38,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence,
-    QPalette, QResizeEvent, QStandardItem, QStandardItemModel, QTextDocument,
-    QTextOption,
+    QPalette, QPixmap, QResizeEvent, QStandardItem, QStandardItemModel,
+    QTextDocument, QTextOption,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCompleter, QDialog, QDialogButtonBox,
@@ -74,7 +74,9 @@ from ..token_metadata import TokenMetadataCache
 from ..tx_activity import (
     Activity, AssetLeg, fetch_activities, transfer_legs_from_logs,
 )
-from ..icons import IconCache, bundled_native_icon, notification_icon
+from ..icons import (
+    IconCache, bundled_native_icon, notification_icon, smooth_scaled,
+)
 from .tx_summary import Coin, TxSummary, coins_icon
 
 
@@ -89,6 +91,18 @@ def _copy_noun(value: str) -> str:
         if len(v) == 66:
             return "Hash"
     return "Link"
+
+
+def _set_coin_pixmap(label: QLabel | None, src: QPixmap, size: int = 20) -> None:
+    """Put ``src`` on a fixed-size icon ``label``, scaled smoothly to ``size``
+    logical px at the label's device pixel ratio.
+
+    Replaces ``QLabel.setScaledContents(True)``, which scales the pixmap with
+    nearest-neighbour and renders coin logos blocky on low-res screens.
+    """
+    if label is None or src.isNull():
+        return
+    label.setPixmap(smooth_scaled(src, size, label.devicePixelRatioF()))
 
 
 def _install_copy_menu(label: QLabel, value: str, url: str | None) -> None:
@@ -3831,7 +3845,6 @@ class TransactionDetailsDialog(QDialog):
             self._to_icon_label = QLabel()
             # Icon dims match what TokenListPanel uses for inline rows.
             self._to_icon_label.setFixedSize(20, 20)
-            self._to_icon_label.setScaledContents(True)
             row.addWidget(self._to_icon_label)
 
             token_url = self._explorer_url(
@@ -3864,7 +3877,7 @@ class TransactionDetailsDialog(QDialog):
             if self._icon_cache is not None:
                 pix = self._icon_cache.get(chain.chain_id, addr)
                 if pix is not None and not pix.isNull():
-                    self._to_icon_label.setPixmap(pix)
+                    _set_coin_pixmap(self._to_icon_label, pix)
                 else:
                     self._icon_cache.icon_ready.connect(self._on_to_icon_ready)
                     self._icon_cache.request(
@@ -3889,7 +3902,7 @@ class TransactionDetailsDialog(QDialog):
             return
         pix = self._icon_cache.get(chain_id, contract)
         if pix is not None and not pix.isNull():
-            self._to_icon_label.setPixmap(pix)
+            _set_coin_pixmap(self._to_icon_label, pix)
 
 
 # --- Sign-transaction dialog + gas-suggestion worker ----------------------
@@ -4719,7 +4732,6 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
             self._to_addr_lower = addr.lower()
             self._to_icon_label = QLabel()
             self._to_icon_label.setFixedSize(20, 20)
-            self._to_icon_label.setScaledContents(True)
             row.addWidget(self._to_icon_label)
 
             token_url = self._explorer_url(
@@ -4752,7 +4764,7 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
             if self._icon_cache is not None:
                 pix = self._icon_cache.get(chain.chain_id, addr)
                 if pix is not None and not pix.isNull():
-                    self._to_icon_label.setPixmap(pix)
+                    _set_coin_pixmap(self._to_icon_label, pix)
                 else:
                     self._icon_cache.icon_ready.connect(self._on_to_icon_ready)
                     self._icon_cache.request(
@@ -4776,7 +4788,7 @@ class SignTransactionDialog(_EventPreviewMixin, QDialog):
             return
         pix = self._icon_cache.get(chain_id, contract)
         if pix is not None and not pix.isNull():
-            self._to_icon_label.setPixmap(pix)
+            _set_coin_pixmap(self._to_icon_label, pix)
 
     def finalised_request(self) -> SigningRequest:
         """Returns the SigningRequest with all gas / fee / nonce
@@ -5210,7 +5222,6 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         self._to_addr_lower = addr.lower()
         self._to_icon_label = QLabel()
         self._to_icon_label.setFixedSize(20, 20)
-        self._to_icon_label.setScaledContents(True)
         row.addWidget(self._to_icon_label)
 
         token_url = self._explorer_url("token", addr, ref_addr=from_cs)
@@ -5239,7 +5250,7 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
         if self._icon_cache is not None:
             pix = self._icon_cache.get(self.chain.chain_id, addr)
             if pix is not None and not pix.isNull():
-                self._to_icon_label.setPixmap(pix)
+                _set_coin_pixmap(self._to_icon_label, pix)
             elif asset.get("logo_uri"):
                 self._icon_cache.icon_ready.connect(self._on_to_icon_ready)
                 self._icon_cache.request(
@@ -5256,7 +5267,7 @@ class SendTokenDialog(_EventPreviewMixin, QDialog):
             return
         pix = self._icon_cache.get(chain_id, contract)
         if pix is not None and not pix.isNull():
-            self._to_icon_label.setPixmap(pix)
+            _set_coin_pixmap(self._to_icon_label, pix)
 
     # --- shared widget helpers (copied from SignTransactionDialog) -
 
