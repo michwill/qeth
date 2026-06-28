@@ -147,10 +147,9 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 pass
-        if self.store.splitter_state_left:
-            self.wallets_plugin.restore_splitter_state(
-                self.store.splitter_state_left
-            )
+        # (The wallets panel's internal splitter was retired when the
+        # bottom details panel became action-row buttons + popups;
+        # splitter_state_left is now vestigial in the config.)
         # Restore each panel's column layout (widths, order, sort
         # indicator) from the per-plugin map in the store.
         for name, plugin in self._header_persisters().items():
@@ -171,7 +170,7 @@ class MainWindow(QMainWindow):
         self.store.set_window_geometry(bytes(self.saveGeometry().toHex().data()).decode())
         self.store.set_splitter_states(
             bytes(self._splitter_outer.saveState().toHex().data()).decode(),
-            self.wallets_plugin.splitter_state(),
+            "",  # wallets panel no longer has an internal splitter
         )
         for name, plugin in self._header_persisters().items():
             state = plugin.header_state()

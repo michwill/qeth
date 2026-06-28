@@ -19,7 +19,7 @@ from qeth.tokens import TokenBalance
 from qeth.plugins.tokens import TokenListPanel
 from qeth.transactions import Transaction
 from qeth.plugins.transactions import TransactionListPanel
-from qeth.plugins.wallets import DetailsPanel
+from qeth.plugins.wallets import AccountInfoDialog
 
 
 ETH = next(c for c in DEFAULT_CHAINS if c.chain_id == 1)
@@ -109,90 +109,33 @@ class TestTrayDehydrate:
         assert calls == ["hide"]
 
 
-# --- DetailsPanel ----------------------------------------------------------
+# --- AccountInfoDialog -----------------------------------------------------
+#
+# The per-account QR + address/path/source/scheme used to sit in a permanent
+# DetailsPanel below the tree; it's now a modal popup opened from the QR
+# button on the action row (label editing / connect / sign moved to their
+# own action-row buttons).
 
-class TestDetailsPanel:
-    def test_show_account_fills_fields(self, qtbot, tmp_qeth):
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        panel.show_account({
+class TestAccountInfoDialog:
+    def test_fields_and_qr_filled(self, qtbot, tmp_qeth):
+        dlg = AccountInfoDialog({
             "address": ADDR, "path": "44'/60'/0'/0/0",
             "source": "ledger", "scheme": "BIP-44",
             "label": "Cold storage",
-        }, is_default=False)
-        assert panel.address_lbl.text() == ADDR
-        assert panel.path_lbl.text() == "44'/60'/0'/0/0"
-        assert panel.source_lbl.text() == "ledger"
-        assert panel.scheme_lbl.text() == "BIP-44"
-        assert panel.label_edit.text() == "Cold storage"
-        # Not the default account → button is enabled and labelled
-        # "Connect to browser" (clicking it makes this address the
-        # one dapps see via the local JSON-RPC server).
-        assert panel.set_default_btn.isEnabled()
-        # Text carries a GNOME-HIG access-key mnemonic (Alt+B).
-        assert panel.set_default_btn.text() == "Connect to &Browser"
+        })
+        qtbot.addWidget(dlg)
+        assert dlg.address_lbl.text() == ADDR
+        assert dlg.path_lbl.text() == "44'/60'/0'/0/0"
+        assert dlg.source_lbl.text() == "ledger"
+        assert dlg.scheme_lbl.text() == "BIP-44"
+        # The receive QR rendered into the fixed-size label.
+        assert not dlg.qr_lbl.pixmap().isNull()
 
-    def test_show_account_marks_default(self, qtbot, tmp_qeth):
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        panel.show_account({
-            "address": ADDR, "source": "ledger",
-        }, is_default=True)
-        assert not panel.set_default_btn.isEnabled()
-        assert "Connected" in panel.set_default_btn.text()
-
-    def test_clear_resets_fields(self, qtbot, tmp_qeth):
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        panel.show_account({"address": ADDR, "source": "ledger"}, is_default=False)
-        panel.clear()
-        for lbl in (panel.address_lbl, panel.path_lbl,
-                    panel.source_lbl, panel.scheme_lbl):
-            assert lbl.text() == "—"
-        assert not panel.set_default_btn.isEnabled()
-
-    def test_set_default_button_emits_signal(self, qtbot, tmp_qeth):
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        panel.show_account({"address": ADDR, "source": "ledger"}, is_default=False)
-        with qtbot.waitSignal(panel.set_default_requested, timeout=500) as blocker:
-            panel.set_default_btn.click()
-        assert blocker.args == [ADDR]
-
-    def test_title_edit_emits_label_changed(self, qtbot, tmp_qeth):
-        """Editing the title and committing (Enter or focus-out)
-        emits ``label_changed(address, new_label)``."""
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        panel.show_account({"address": ADDR, "label": "Old"}, is_default=False)
-        panel.label_edit.setText("New label")
-        with qtbot.waitSignal(panel.label_changed, timeout=500) as blocker:
-            panel._on_label_committed()
-        assert blocker.args == [ADDR, "New label"]
-
-    def test_no_op_title_edit_does_not_emit(self, qtbot, tmp_qeth):
-        """Focusing into the title and back out without changing
-        the text shouldn't fire the signal — otherwise we'd hit the
-        store + rebuild the tree on every selection."""
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        panel.show_account({"address": ADDR, "label": "Same"}, is_default=False)
-        fires: list = []
-        panel.label_changed.connect(lambda a, l: fires.append((a, l)))
-        panel._on_label_committed()
-        assert fires == []
-
-    def test_title_disabled_without_account(self, qtbot, tmp_qeth):
-        """The title is read-only until an account is loaded —
-        otherwise the user could type into the placeholder and we'd
-        have nowhere to persist it."""
-        panel = DetailsPanel()
-        qtbot.addWidget(panel)
-        assert not panel.label_edit.isEnabled()
-        panel.show_account({"address": ADDR, "source": "ledger"}, is_default=False)
-        assert panel.label_edit.isEnabled()
-        panel.clear()
-        assert not panel.label_edit.isEnabled()
+    def test_missing_fields_show_dash(self, qtbot, tmp_qeth):
+        dlg = AccountInfoDialog({"address": ADDR, "source": "ledger"})
+        qtbot.addWidget(dlg)
+        assert dlg.path_lbl.text() == "—"
+        assert dlg.scheme_lbl.text() == "—"
 
 
 # --- TokenListPanel rendering ----------------------------------------------

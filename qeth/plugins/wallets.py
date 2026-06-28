@@ -1,16 +1,14 @@
 """WalletsPlugin — accounts tree + details panel + account actions.
 
 Step 4 of the plugin refactor. Owns:
-- The QTreeWidget listing Ledger / Hot wallet / Watch-only accounts.
-- The DetailsPanel showing the selected account's address, path, QR,
-  and the Set-as-default button.
-- The three account actions (Add / Copy / Remove) and their button
-  row, mounted at the top of the plugin's own widget rather than on
-  the slot's bottom row — they're conceptually part of the Wallets
-  view, not generic plugin actions, and the layout matches the
-  pre-refactor look exactly.
-- The internal vertical splitter between tree and details; its state
-  is persisted via ``splitter_state``/``restore_splitter_state``.
+- The QTreeWidget listing Ledger / Hot wallet / Watch-only accounts,
+  filling the whole panel.
+- The account-action buttons on the bottom row: Add / Copy / Remove
+  plus the per-account Sign / QR / Label / Connect icon buttons.
+  Sign opens the compose/sign flow; QR opens ``AccountInfoDialog``
+  (receive QR + address/path/source/scheme); Label opens an inline
+  text popup; Connect is checkable and mirrors the dapp-facing
+  default. (These replace the old bottom DetailsPanel.)
 
 Wallets is the source of the selection broadcast — when the user
 picks an address, the plugin emits ``selected_address_changed`` and
@@ -32,15 +30,15 @@ import segno
 
 log = logging.getLogger("qeth.plugin.wallets")
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QFont, QIcon, QKeySequence, QPalette, QPixmap,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
-    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMenu, QProgressBar, QPushButton,
-    QSizePolicy, QSpinBox, QSplitter, QStyle, QToolButton, QTreeWidget,
+    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QProgressBar, QPushButton,
+    QSizePolicy, QSpinBox, QStyle, QToolButton, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 from PySide6.QtCore import QThread
@@ -211,12 +209,24 @@ class WalletsPlugin(Plugin):
         # doesn't require a running Qt event loop.
         self._container: QWidget | None = None
         self._tree: QTreeWidget | None = None
+        # Retired: the bottom details panel + its enclosing splitter.
+        # Kept as a None attribute so test/host code that probes for
+        # "is there a details panel" reads False rather than raising.
         self._details = None
-        self._splitter: QSplitter | None = None
         self._account_buttons: list[QPushButton] = []
         self.act_add: QAction | None = None
         self.act_copy: QAction | None = None
         self.act_remove: QAction | None = None
+        # Per-account actions that used to live in the details panel,
+        # now icon buttons on the bottom action row (right of Copy /
+        # Remove). Connect is checkable — its checked state mirrors
+        # "this address is the dapp-facing default".
+        self.act_sign: QAction | None = None
+        self.act_qr: QAction | None = None
+        self.act_label: QAction | None = None
+        self.act_connect: QAction | None = None
+        # The checkable Connect button (synced to the default account).
+        self._connect_btn: QPushButton | None = None
         # ENS workers kicked from post-import label-fill; tracked
         # here so Python's GC doesn't drop them mid-run (Qt's
         # QThread destructor aborts on a still-running thread).
@@ -301,19 +311,6 @@ class WalletsPlugin(Plugin):
                 return True
         return False
 
-    def splitter_state(self) -> str:
-        if self._splitter is None:
-            return ""
-        return bytes(self._splitter.saveState().toHex().data()).decode()
-
-    def restore_splitter_state(self, state_hex: str) -> None:
-        if self._splitter is None or not state_hex:
-            return
-        try:
-            self._splitter.restoreState(QByteArray.fromHex(state_hex.encode()))
-        except Exception:
-            pass
-
     def rebuild_tree(self) -> None:
         """Public re-entry point for MainWindow / host code that
         modifies accounts and needs the tree to reflect that."""
@@ -332,9 +329,6 @@ class WalletsPlugin(Plugin):
         # action_widgets(), so this panel mirrors the tabbed Tokens slot
         # ([tab][list][actions]) and the two lists' tops align.
         self._build_account_actions()
-
-        # Middle: vertical splitter (tree on top, details on bottom).
-        self._splitter = QSplitter(Qt.Orientation.Vertical)
 
         self._tree = _ReorderTree()
         self._tree.setHeaderLabels(["Accounts"])
@@ -390,24 +384,12 @@ class WalletsPlugin(Plugin):
         assert self.act_copy is not None and self.act_remove is not None
         self._tree.addAction(self.act_copy)
         self._tree.addAction(self.act_remove)
-        self._splitter.addWidget(self._tree)
-
-        self._details = DetailsPanel()
-        self._details.set_default_requested.connect(self._set_default)
-        self._details.label_changed.connect(self._on_label_changed)
-        self._details.sign_message_requested.connect(self._on_sign_message)
-        details_wrap = QFrame()
-        details_wrap.setFrameShape(QFrame.Shape.StyledPanel)
-        dlay = QVBoxLayout(details_wrap)
-        # Symmetric bottom margin: without it the last button (Connect to
-        # Browser) sits flush against the framed panel's bottom border.
-        dlay.setContentsMargins(12, 12, 12, 12)
-        dlay.addWidget(self._details)
-        self._splitter.addWidget(details_wrap)
-        self._splitter.setStretchFactor(0, 1)
-        self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([290, 365])
-        v.addWidget(self._splitter, 1)
+        # The per-account details (address / path / QR) and the
+        # Sign / Connect actions used to live in a bottom details
+        # panel inside a vertical splitter. They're now icon buttons
+        # on the bottom action row + popups (Sign / QR-info / Label),
+        # so the tree fills the whole panel.
+        v.addWidget(self._tree, 1)
 
     def _build_account_actions(self) -> None:
         """Build the account-level action buttons (Add / Copy / Remove)
@@ -495,6 +477,53 @@ class WalletsPlugin(Plugin):
         self.act_remove.setShortcut(QKeySequence.StandardKey.Delete)
         self.act_remove.triggered.connect(self._remove_selected_account)
 
+        # Sign / QR / Label / Connect — per-account actions that moved
+        # off the old details panel onto this row. Sign and Connect
+        # need a signing key (disabled for watch-only); QR and Label
+        # work for any selected account.
+        self.act_sign = QAction(
+            _icon("document-edit", "document-sign", "edit-paste",
+                  QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "&Sign Message…",
+        )
+        self.act_sign.setToolTip("Sign a message")
+        self.act_sign.setEnabled(False)
+        self.act_sign.triggered.connect(self._sign_selected)
+
+        self.act_qr = QAction(
+            _icon("view-barcode-qr", "view-barcode", "qrcode",
+                  QStyle.StandardPixmap.SP_FileDialogContentsView),
+            "Show &QR / Info…",
+        )
+        self.act_qr.setToolTip("Show QR code and account details")
+        self.act_qr.setEnabled(False)
+        self.act_qr.triggered.connect(self._show_qr_info)
+
+        # Distinct QStyle fallback (ListView) from Sign's DetailedView and
+        # QR's ContentsView so the three stay tellable apart even on a
+        # bare theme that lacks the named icons.
+        self.act_label = QAction(
+            _icon("tag", "bookmark-new", "edit-rename",
+                  QStyle.StandardPixmap.SP_FileDialogListView),
+            "Edit &Label…",
+        )
+        self.act_label.setToolTip("Edit this account's label")
+        self.act_label.setEnabled(False)
+        self.act_label.triggered.connect(self._edit_label)
+
+        # Globe / browser icon for "make this address visible to dapps
+        # via the local JSON-RPC server". Checkable: pressed when this
+        # account is the dapp-facing default.
+        self.act_connect = QAction(
+            _icon("applications-internet", "internet-web-browser",
+                  QStyle.StandardPixmap.SP_DesktopIcon),
+            "Connect to &Browser",
+        )
+        self.act_connect.setToolTip("Make default for dapps")
+        self.act_connect.setCheckable(True)
+        self.act_connect.setEnabled(False)
+        self.act_connect.triggered.connect(self._toggle_connect)
+
         # Scope the shortcuts to the accounts tree: Ctrl+C / Del act on
         # the selected address only when that panel has focus, so they
         # don't shadow copy/delete in the token or transaction tables.
@@ -526,7 +555,12 @@ class WalletsPlugin(Plugin):
         # followed by small icon-only ones. They still mirror their QActions
         # (which carry the tree's Ctrl+C / Del shortcuts and the enabled
         # state); the label moves to the tooltip since there's no text.
-        for act in (self.act_copy, self.act_remove):
+        # Connect is checkable (pressed = this account is connected to
+        # the browser); the rest are momentary. We keep a ref to the
+        # Connect button so _update_account_buttons can sync its checked
+        # state to the store's default.
+        for act in (self.act_copy, self.act_remove, self.act_sign,
+                    self.act_qr, self.act_label, self.act_connect):
             btn = QPushButton()
             btn.setIcon(act.icon())
             btn.setToolTip(act.toolTip() or act.text().replace("&", ""))
@@ -536,7 +570,16 @@ class WalletsPlugin(Plugin):
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.setEnabled(act.isEnabled())
             act.enabledChanged.connect(btn.setEnabled)
-            btn.clicked.connect(act.trigger)
+            if act is self.act_connect:
+                btn.setCheckable(True)
+                # The click toggles the button; the handler re-asserts
+                # the checked state from the store afterward, so a click
+                # on the already-connected account doesn't visually
+                # un-press it.
+                btn.clicked.connect(lambda _checked: self._toggle_connect())
+                self._connect_btn = btn
+            else:
+                btn.clicked.connect(act.trigger)
             # Keep a Python ref so the C++ widgets survive function exit.
             self._account_buttons.append(btn)
 
@@ -715,26 +758,55 @@ class WalletsPlugin(Plugin):
         self._set_default(address)
 
     def _on_tree_selection(self) -> None:
-        assert (self.act_copy is not None and self.act_remove is not None
-                and self._details is not None)  # built before signals connect
         addrs = self.selected_addresses()
-        # Copy only makes sense for a single address; Remove handles many.
-        self.act_copy.setEnabled(len(addrs) == 1)
-        self.act_remove.setEnabled(len(addrs) >= 1)
+        self._update_account_buttons(addrs)
         if len(addrs) == 1:
             acct = next(
                 (a for a in self._store.accounts if a["address"] == addrs[0]),
                 None,
             )
             if acct:
-                self._details.show_account(
-                    acct,
-                    is_default=(addrs[0] == self._store.default_account),
-                )
                 self.selected_address_changed.emit(addrs[0])
                 return
-        self._details.clear()
         self.selected_address_changed.emit(None)
+
+    def _update_account_buttons(self, addrs: list[str] | None = None) -> None:
+        """Sync the bottom-row action buttons to the current selection.
+
+        Copy works for a single address; Remove for any non-empty
+        selection. Sign / QR / Label / Connect are single-account
+        actions. Sign and Connect additionally need a signing key, so
+        they stay off for watch-only accounts. Connect is checkable —
+        pressed when the selected account is the dapp-facing default."""
+        assert (self.act_copy is not None and self.act_remove is not None
+                and self.act_sign is not None and self.act_qr is not None
+                and self.act_label is not None
+                and self.act_connect is not None)
+        if addrs is None:
+            addrs = self.selected_addresses()
+        single = len(addrs) == 1
+        acct = None
+        if single:
+            acct = next(
+                (a for a in self._store.accounts if a["address"] == addrs[0]),
+                None,
+            )
+        is_watch = acct is not None and acct.get("source") == "watch_only"
+        is_default = single and addrs[0] == self._store.default_account
+        self.act_copy.setEnabled(single)
+        self.act_remove.setEnabled(len(addrs) >= 1)
+        self.act_qr.setEnabled(single)
+        self.act_label.setEnabled(single)
+        self.act_sign.setEnabled(single and not is_watch)
+        self.act_connect.setEnabled(single and not is_watch and not is_default)
+        self.act_connect.setChecked(bool(is_default))
+        if self._connect_btn is not None:
+            self._connect_btn.setChecked(bool(is_default))
+            self._connect_btn.setToolTip(
+                "Watch-only — can't connect" if is_watch
+                else "Connected to browser" if is_default
+                else "Connect to browser (make default for dapps)"
+            )
 
     def _on_tree_context_menu(self, pos) -> None:
         """Tree right-click menu. Mirrors the Add / Copy / Remove
@@ -742,7 +814,7 @@ class WalletsPlugin(Plugin):
         pane below already offers, but having it on the row's right-
         click means the user doesn't have to navigate down."""
         assert (self.act_add is not None and self.act_copy is not None
-                and self.act_remove is not None and self._details is not None
+                and self.act_remove is not None and self.act_connect is not None
                 and self._tree is not None)  # built before signals connect
         addrs = self.selected_addresses()
         menu = QMenu(self._tree)
@@ -756,7 +828,7 @@ class WalletsPlugin(Plugin):
             )
             if not already_default:
                 act_default = menu.addAction(
-                    self._details.set_default_btn.icon(), "Connect to Browser")
+                    self.act_connect.icon(), "Connect to Browser")
                 act_default.triggered.connect(
                     lambda _checked=False, a=addr: self._set_default(a)
                 )
@@ -1076,6 +1148,58 @@ class WalletsPlugin(Plugin):
             if self.host is not None:
                 self.host.status_message("Watch-only address added", 3000)
 
+    def _sign_selected(self) -> None:
+        """Sign button → open the compose/sign flow for the selected
+        account (forwarded to the host)."""
+        addr = self.selected_address
+        if addr:
+            self._on_sign_message(addr)
+
+    def _show_qr_info(self) -> None:
+        """QR button → modal popup with the receive QR plus the
+        account's address / path / source / scheme."""
+        addr = self.selected_address
+        if not addr:
+            return
+        acct = next(
+            (a for a in self._store.accounts if a["address"] == addr), None,
+        )
+        if acct is None:
+            return
+        dlg = AccountInfoDialog(acct, parent=self._container)
+        dlg.exec()
+
+    def _edit_label(self) -> None:
+        """Label button → small text popup to edit the account's
+        label; persists via the same path as the old inline field."""
+        addr = self.selected_address
+        if not addr:
+            return
+        acct = next(
+            (a for a in self._store.accounts if a["address"] == addr), None,
+        )
+        current = (acct.get("label") if acct else "") or ""
+        new, ok = QInputDialog.getText(
+            self._container, "Edit Label",
+            f"Label for {addr}:", text=current,
+        )
+        if ok and new.strip() != current:
+            self._on_label_changed(addr, new.strip())
+
+    def _toggle_connect(self) -> None:
+        """Connect button → make the selected account the dapp-facing
+        default. Clicking the already-connected account is a no-op (we
+        just re-assert the pressed state)."""
+        addr = self.selected_address
+        if not addr:
+            self._update_account_buttons()
+            return
+        default = self._store.default_account
+        if default is not None and addr.lower() == default.lower():
+            self._update_account_buttons()
+            return
+        self._set_default(addr)
+
     def _on_label_changed(self, address: str, label: str) -> None:
         """The details panel reported a label edit. Persist via
         the store, then rebuild the tree so the new label appears
@@ -1104,222 +1228,65 @@ class WalletsPlugin(Plugin):
             opener(address)
 
 
-# --- DetailsPanel + AddLedgerDialog (moved from qeth.ui) -------------------
+# --- AccountInfoDialog + AddLedgerDialog (moved from qeth.ui) --------------
 
-class DetailsPanel(QWidget):
-    """The right-hand details for the selected account. Title is
-    editable inline — typing into it and committing (Enter or
-    focus-out) emits ``label_changed(address, label)`` so the
-    plugin can persist it via the store.
-    """
+class AccountInfoDialog(QDialog):
+    """Modal popup for a single account: the receive QR plus the
+    address / path / source / scheme. Opened from the QR button on
+    the accounts panel's action row (the info used to sit in a
+    permanent details panel below the tree)."""
 
-    # User edited the title field. Carries (address, new_label).
-    # The plugin pipes this to Store.set_label + tree rebuild.
-    label_changed = Signal(str, str)
-
-    set_default_requested = Signal(str)
-    # Emitted when the user clicks "Sign message…" on this account.
-    # The plugin forwards it to the host (MainWindow) which opens
-    # the ComposeMessageDialog → SignMessageDialog flow.
-    sign_message_requested = Signal(str)
-
-    def __init__(self, parent=None):
+    def __init__(self, account: dict, parent=None):
         super().__init__(parent)
+        self.setWindowTitle("Account")
         v = QVBoxLayout(self)
-        # Inner bottom margin stays 0: the framed wrapper (details_wrap)
-        # owns the gap between the buttons and its bottom border, so the
-        # two margins don't stack into an oversized void below the buttons.
-        v.setContentsMargins(9, 9, 9, 0)
-        # Header placeholder shown when no account is selected.
-        # We hide it (and show the form) once show_account runs.
-        self.placeholder_lbl = QLabel("Select an account on the left")
-        v.addWidget(self.placeholder_lbl)
 
         form = QFormLayout()
-        # Label field — same form treatment as the rest of the
-        # rows. Frameless until focus so the read state looks like
-        # a value rather than an empty input box, but the user can
-        # still click into it. editingFinished fires on Enter or
-        # focus-out.
-        self.label_edit = QLineEdit()
-        self.label_edit.setPlaceholderText("(no label)")
-        self.label_edit.setFrame(False)
-        self.label_edit.setEnabled(False)
-        self.label_edit.editingFinished.connect(self._on_label_committed)
-        form.addRow("Label:", self.label_edit)
         mono = QFont("monospace")
-        # Ignored size policy on the long monospace labels: their sizeHint
-        # (full 42-char address etc.) shouldn't pin the panel's minimum
-        # width, otherwise the whole window can't be shrunk down.
-        self.address_lbl = QLabel("—"); self.address_lbl.setFont(mono)
-        self.address_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.address_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.path_lbl = QLabel("—"); self.path_lbl.setFont(mono)
-        self.path_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.source_lbl = QLabel("—")
-        self.scheme_lbl = QLabel("—")
+        self.address_lbl = QLabel(account["address"]); self.address_lbl.setFont(mono)
+        self.address_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.path_lbl = QLabel(account.get("path", "—")); self.path_lbl.setFont(mono)
+        self.source_lbl = QLabel(account.get("source", "—"))
+        self.scheme_lbl = QLabel(account.get("scheme", "—"))
+        label_text = account.get("label") or ""
+        if label_text:
+            form.addRow("Label:", QLabel(label_text))
         form.addRow("Address:", self.address_lbl)
         form.addRow("Path:", self.path_lbl)
         form.addRow("Source:", self.source_lbl)
         form.addRow("Scheme:", self.scheme_lbl)
         v.addLayout(form)
 
-        # Vertical breathing room above + below the QR — without these,
-        # the form rows / button crowd right up against it and the panel
-        # looks squeezed.
         v.addSpacing(12)
         self.qr_lbl = QLabel()
         self.qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qr_lbl.setFixedSize(220, 220)
         v.addWidget(self.qr_lbl, 0, Qt.AlignmentFlag.AlignCenter)
         v.addSpacing(12)
-
-        # Short label + tooltip rather than a wide button — keeps the
-        # panel narrow-shrinkable. Same policy trick on the button itself.
-        # "Connect to browser" makes the action concrete: this is the
-        # address dapps will see via the local JSON-RPC server (Frame
-        # interface), nothing about persistence or "default".
-        self.set_default_btn = QPushButton("Connect to &Browser")
-        # Globe / browser icon for "make this address visible to the
-        # web". Same icon the Transactions list uses for "Open in
-        # block explorer" — reuse keeps the "exposed to the web"
-        # association consistent across the app.
-        _conn_icon = QIcon.fromTheme(
-            "applications-internet",
-            QIcon.fromTheme(
-                "internet-web-browser",
-                QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DesktopIcon),
-            ),
-        )
-        if not _conn_icon.isNull() and _conn_icon.availableSizes():
-            self.set_default_btn.setIcon(_conn_icon)
-        self.set_default_btn.setToolTip("Make default for dapps")
-        self.set_default_btn.setEnabled(False)
-        # Pin the height. With QSizePolicy.Policy.Fixed Qt re-queries sizeHint()
-        # every time the text changes — and "Connected ✓" can come out
-        # a touch shorter than "Connect to browser" depending on the
-        # theme. The snapshot here is taken while the (longer) text is
-        # set, so the disabled state never shrinks.
-        self.set_default_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.set_default_btn.setMinimumHeight(self.set_default_btn.sizeHint().height())
-        self.set_default_btn.clicked.connect(
-            lambda: (self.set_default_requested.emit(self._current)
-                     if self._current else None)
-        )
-
-        # "Sign message…" — opens the compose dialog for the
-        # currently-shown account. Disabled when nothing's
-        # selected or when the account has no signer (watch-only).
-        self.sign_message_btn = QPushButton("Sign &Message…")
-        _sig_icon = QIcon.fromTheme(
-            "document-edit",
-            QIcon.fromTheme(
-                "edit-paste",
-                QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
-            ),
-        )
-        if not _sig_icon.isNull() and _sig_icon.availableSizes():
-            self.sign_message_btn.setIcon(_sig_icon)
-        self.sign_message_btn.setToolTip("Sign a message")
-        self.sign_message_btn.setEnabled(False)
-        self.sign_message_btn.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
-        )
-        self.sign_message_btn.setMinimumHeight(
-            self.sign_message_btn.sizeHint().height()
-        )
-        self.sign_message_btn.clicked.connect(
-            lambda: (self.sign_message_requested.emit(self._current)
-                     if self._current else None)
-        )
-
-        # Stretch pushes the buttons to the very bottom of the panel.
-        v.addStretch(1)
-        v.addWidget(self.sign_message_btn)
-        v.addWidget(self.set_default_btn)
-        self._current: str | None = None
-        # The label we last loaded into the title field; used by
-        # _on_title_committed to detect actual user edits vs the
-        # user focusing in/out without typing.
-        self._loaded_label: str = ""
-
-    def show_account(self, account: dict, is_default: bool) -> None:
-        self._current = account["address"]
-        # Suppress the editingFinished signal we'd otherwise emit
-        # from setText — only programmatic loads, not user edits.
-        self.label_edit.blockSignals(True)
-        self.label_edit.setText(account.get("label") or "")
-        self.label_edit.setEnabled(True)
-        self.label_edit.blockSignals(False)
-        # Track the value we just loaded so _on_label_committed can
-        # tell whether the user actually changed anything.
-        self._loaded_label = account.get("label") or ""
-        self.placeholder_lbl.setVisible(False)
-        self.address_lbl.setText(account["address"])
-        self.path_lbl.setText(account.get("path", "—"))
-        self.source_lbl.setText(account.get("source", "—"))
-        self.scheme_lbl.setText(account.get("scheme", "—"))
-        # Watch-only accounts have no key behind them — connecting
-        # one to the browser would just lead to "No known signer"
-        # popups the moment the dapp tries to sign. Disable the
-        # button + flip the tooltip to explain.
-        is_watch_only = account.get("source") == "watch_only"
-        if is_watch_only:
-            self.set_default_btn.setEnabled(False)
-            self.set_default_btn.setText("Watch-only — Read-only")
-            self.set_default_btn.setToolTip("Watch-only — can't sign")
-        else:
-            self.set_default_btn.setEnabled(not is_default)
-            self.set_default_btn.setText(
-                "Connected to Browser ✓" if is_default
-                else "Connect to &Browser"
-            )
-            self.set_default_btn.setToolTip("Make default for dapps")
-        # Same key-bearing-account check as Connect-to-browser:
-        # watch-only can't sign messages.
-        self.sign_message_btn.setEnabled(not is_watch_only)
         self._render_qr(account["address"])
+
+        btns = QDialogButtonBox()
+        copy_btn = btns.addButton("&Copy Address",
+                                  QDialogButtonBox.ButtonRole.ActionRole)
+        copy_btn.setIcon(QIcon.fromTheme("edit-copy"))
+        close_btn = btns.addButton(QDialogButtonBox.StandardButton.Close)
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(account["address"]))
+        close_btn.clicked.connect(self.accept)
+        v.addWidget(btns)
 
     def _render_qr(self, address: str) -> None:
         buf = io.BytesIO()
         # ethereum: URI per EIP-681 so wallets recognize it as a send intent
-        segno.make(f"ethereum:{address}", error="m").save(buf, kind="png", scale=6, border=2)
+        segno.make(f"ethereum:{address}", error="m").save(
+            buf, kind="png", scale=6, border=2)
         pix = QPixmap()
         pix.loadFromData(buf.getvalue())  # format auto-detected from the PNG header
         self.qr_lbl.setPixmap(pix.scaled(
-            self.qr_lbl.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation
+            self.qr_lbl.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
         ))
-
-    def clear(self) -> None:
-        self._current = None
-        self._loaded_label = ""
-        self.label_edit.blockSignals(True)
-        self.label_edit.setText("")
-        self.label_edit.setEnabled(False)
-        self.label_edit.blockSignals(False)
-        self.placeholder_lbl.setVisible(True)
-        for w in (self.address_lbl, self.path_lbl, self.source_lbl, self.scheme_lbl):
-            w.setText("—")
-        self.qr_lbl.clear()
-        self.set_default_btn.setEnabled(False)
-        self.set_default_btn.setText("Connect to &Browser")
-        self.sign_message_btn.setEnabled(False)
-
-    def _on_label_committed(self) -> None:
-        """Label editingFinished: emit ``label_changed`` so the
-        plugin persists the new label. Guards against firing for
-        no-op edits (the user clicked into the field and back out
-        without typing) and against firing when no account is
-        currently shown."""
-        if self._current is None:
-            return
-        new = self.label_edit.text().strip()
-        if new == self._loaded_label:
-            return
-        # Update the cached value so subsequent focus-out events
-        # in the same session don't re-fire.
-        self._loaded_label = new
-        self.label_changed.emit(self._current, new)
 
 
 # --- Token list panel -------------------------------------------------------

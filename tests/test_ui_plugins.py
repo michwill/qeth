@@ -2349,19 +2349,21 @@ class TestTokensStartupNonBlocking:
 
 
 class TestWalletsPlugin:
-    def test_widget_holds_tree_and_details(self, wallets_plugin):
-        from qeth.plugins.wallets import DetailsPanel
+    def test_widget_holds_tree(self, wallets_plugin):
         from PySide6.QtWidgets import QTreeWidget
+        wallets_plugin.widget()
         assert isinstance(wallets_plugin._tree, QTreeWidget)
-        assert isinstance(wallets_plugin._details, DetailsPanel)
+        # The tree now fills the whole panel — no bottom details panel.
+        assert wallets_plugin._details is None
 
     def test_action_widgets_are_account_buttons(self, wallets_plugin):
-        # Add / Copy / Remove mount on the slot's bottom row (symmetric
-        # with the Tokens panel), so action_widgets() exposes them.
+        # Add / Copy / Remove plus the per-account Sign / QR / Label /
+        # Connect icon buttons mount on the slot's bottom row.
         wallets_plugin.widget()  # ensure the buttons are built
         actions = wallets_plugin.action_widgets()
         assert actions == wallets_plugin._account_buttons
-        assert len(actions) == 3  # Add, Copy, Remove
+        # Add, Copy, Remove, Sign, QR, Label, Connect.
+        assert len(actions) == 7
 
     def test_account_buttons_mirror_action_enabled(self, wallets_plugin):
         # Copy/Remove are QPushButtons (styled like the Tokens Send
@@ -2369,7 +2371,7 @@ class TestWalletsPlugin:
         # enabled state is wired to the action via enabledChanged. Guard
         # that wiring: the buttons must track the actions both ways.
         wallets_plugin.widget()
-        _add, copy_btn, remove_btn = wallets_plugin.action_widgets()
+        _add, copy_btn, remove_btn = wallets_plugin.action_widgets()[:3]
         assert not copy_btn.isEnabled() and not remove_btn.isEnabled()
         wallets_plugin.act_copy.setEnabled(True)
         wallets_plugin.act_remove.setEnabled(True)
@@ -2642,9 +2644,11 @@ class TestWalletsPlugin:
         assert any(g.startswith("Watch only (1)") for g in groups), groups
 
     def test_watch_only_disables_connect_to_browser(self, qtbot, wallets_plugin):
-        """The Connect-to-browser button must be off for watch-only
+        """The Connect-to-browser action must be off for watch-only
         accounts — they have no signing key, so dapps that try to
-        sign from them would fail mid-flow. Better to gate up front."""
+        sign from them would fail mid-flow. Better to gate up front.
+        Sign is gated the same way; QR / Label stay available."""
+        wallets_plugin.widget()
         addr = "0x" + "22" * 20
         wallets_plugin._store.add_account({
             "address": addr, "source": "watch_only", "label": "",
@@ -2652,8 +2656,10 @@ class TestWalletsPlugin:
         wallets_plugin.rebuild_tree()
         # Simulate selecting the watch-only leaf.
         wallets_plugin.select_address(addr)
-        assert not wallets_plugin._details.set_default_btn.isEnabled()
-        assert "Watch-only" in wallets_plugin._details.set_default_btn.text()
+        assert not wallets_plugin.act_connect.isEnabled()
+        assert not wallets_plugin.act_sign.isEnabled()
+        assert wallets_plugin.act_qr.isEnabled()
+        assert wallets_plugin.act_label.isEnabled()
 
     def test_add_hot_wallet_dialog_gating(self, qtbot, tmp_qeth):
         """Walks the Add button's enable/disable through every
@@ -2720,13 +2726,6 @@ class TestWalletsPlugin:
         from qeth.plugins.wallets import AddLedgerDialog
         dlg = AddLedgerDialog(DEFAULT_CHAINS[0])
         qtbot.addWidget(dlg)
-
-    def test_splitter_state_round_trip(self, wallets_plugin):
-        hex_state = wallets_plugin.splitter_state()
-        assert hex_state  # non-empty
-        # Restore is best-effort and doesn't raise on garbage.
-        wallets_plugin.restore_splitter_state("not-valid-hex")
-        wallets_plugin.restore_splitter_state(hex_state)
 
 
 class TestDetailsEventsView:
