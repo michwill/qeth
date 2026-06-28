@@ -512,13 +512,14 @@ class WalletsPlugin(Plugin):
         self.act_label.setEnabled(False)
         self.act_label.triggered.connect(self._edit_label)
 
-        # Network-connect (plug) icon for "make this address visible to
-        # dapps via the local JSON-RPC server" — reads as connecting a
-        # link, not opening a web page. Checkable: pressed when this
-        # account is the dapp-facing default.
+        # Network link icon for "make this address visible to dapps via
+        # the local JSON-RPC server" — reads as connecting a link, not
+        # opening a web page. `network-transmit[-receive]` are freedesktop
+        # status-context names (widely shipped). Checkable: pressed when
+        # this account is the dapp-facing default.
         self.act_connect = QAction(
-            _icon("network-connect", "network-wired",
-                  "network-transmit-receive",
+            _icon("network-transmit", "network-transmit-receive",
+                  "network-wired",
                   QStyle.StandardPixmap.SP_DriveNetIcon),
             "Connect to &Browser",
         )
