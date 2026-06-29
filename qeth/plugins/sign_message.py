@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 
 from ..signing import MessageSigningRequest, TypedDataSigningRequest
 from ..alerts import warn
-from ..dialog import Dialog
+from ..dialog import Dialog, item_spacing
 
 
 class _JsonHighlighter(QSyntaxHighlighter):
@@ -177,9 +177,7 @@ class SignMessageDialog(Dialog):
         self.resize(680, 540)
 
         outer = QVBoxLayout(self)
-        # Outer margins come from the Dialog base (font-derived, uniform).
-        outer.setSpacing(8)
-
+        # Margins + paragraph spacing come from the Dialog base (font-derived).
         header = QFormLayout()
         header.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setHorizontalSpacing(16)
@@ -264,9 +262,7 @@ class ComposeMessageDialog(Dialog):
         self.resize(640, 480)
 
         outer = QVBoxLayout(self)
-        # Outer margins come from the Dialog base (font-derived, uniform).
-        outer.setSpacing(10)
-
+        # Margins + paragraph spacing come from the Dialog base (font-derived).
         intro = QLabel(
             "Paste a plain text message (will be signed via "
             "<b>personal_sign</b>) <br>or an EIP-712 typed-data JSON "
@@ -277,6 +273,10 @@ class ComposeMessageDialog(Dialog):
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
+        # The editor and its live "what kind did we detect" status are one
+        # paragraph (tight); the intro above and buttons below are separate.
+        field = QVBoxLayout()
+        field.setSpacing(item_spacing(self))
         self.body_edit = QPlainTextEdit()
         self.body_edit.setFont(QFont("monospace"))
         self.body_edit.setPlaceholderText(
@@ -285,11 +285,13 @@ class ComposeMessageDialog(Dialog):
             '  "primaryType": "...",\n  "message": {...}\n}'
         )
         self.body_edit.textChanged.connect(self._update_state)
-        outer.addWidget(self.body_edit, 1)
+        field.addWidget(self.body_edit, 1)
 
         self.kind_lbl = QLabel("")
         self.kind_lbl.setStyleSheet("color: gray;")
-        outer.addWidget(self.kind_lbl)
+        self.kind_lbl.setVisible(False)   # empty → zero height (else it adds a
+        field.addWidget(self.kind_lbl)    # stray line between the field & buttons)
+        outer.addLayout(field, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.sign_btn = buttons.addButton("&Sign", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -302,12 +304,14 @@ class ComposeMessageDialog(Dialog):
         text = self.body_edit.toPlainText().strip()
         if not text:
             self.kind_lbl.setText("")
+            self.kind_lbl.setVisible(False)
             self.sign_btn.setEnabled(False)
             return
         if self._looks_like_typed_data(text):
             self.kind_lbl.setText("→ EIP-712 typed data")
         else:
             self.kind_lbl.setText("→ personal_sign (plain text)")
+        self.kind_lbl.setVisible(True)
         self.sign_btn.setEnabled(True)
 
     def _looks_like_typed_data(self, text: str) -> bool:
@@ -363,15 +367,17 @@ class SignatureResultDialog(Dialog):
         self.resize(560, 200)
 
         outer = QVBoxLayout(self)
-        # Outer margins come from the Dialog base (font-derived, uniform).
-        outer.setSpacing(10)
-
-        outer.addWidget(QLabel("Signature (65-byte r || s || v):"))
+        # Margins + paragraph spacing come from the Dialog base (font-derived).
+        # The caption + its field are one paragraph (kept tight together).
+        para = QVBoxLayout()
+        para.setSpacing(item_spacing(self))
+        para.addWidget(QLabel("Signature (65-byte r || s || v):"))
         self.sig_view = QTextEdit()
         self.sig_view.setReadOnly(True)
         self.sig_view.setFont(QFont("monospace"))
         self.sig_view.setPlainText(signature_hex)
-        outer.addWidget(self.sig_view, 1)
+        para.addWidget(self.sig_view, 1)
+        outer.addLayout(para, 1)
 
         btn_row = QHBoxLayout()
         copy_btn = QPushButton("Cop&y")

@@ -718,7 +718,8 @@ class _RecordDialog(Dialog):
                  key: str = "", coin: str = "", value: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Record · {name}")
-        self._form = form = QFormLayout(self)
+        outer = QVBoxLayout(self)
+        self._form = form = QFormLayout()
         self.kind = QComboBox()
         self.kind.addItems(_RECORD_KINDS)
         if preset:
@@ -746,11 +747,12 @@ class _RecordDialog(Dialog):
         form.addRow("Key", self.key)
         form.addRow("Coin", self.coin)
         form.addRow("Value", self.value)
+        outer.addLayout(form)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        outer.addWidget(buttons)
         self.kind.currentTextChanged.connect(self._sync)
         self._sync(self.kind.currentText())
 
@@ -795,7 +797,8 @@ class _RenewDialog(Dialog):
         floor_qd = _qdate_from_ts(floor_ts)
         min_qd = floor_qd.addDays(1)           # strictly forward
         default_qd = floor_qd.addYears(1)      # sensible default: +1y
-        form = QFormLayout(self)
+        outer = QVBoxLayout(self)
+        form = QFormLayout()
         if expiry_ts:
             form.addRow("Current expiry", QLabel(_fmt_expiry(expiry_ts)))
         # A compact date field (type / step the year) above an always-visible
@@ -812,11 +815,12 @@ class _RenewDialog(Dialog):
         form.addRow(self.cal)
         self._cost_lbl = QLabel("Fetching price…")
         form.addRow("Estimated cost", self._cost_lbl)
+        outer.addLayout(form)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        outer.addWidget(buttons)
         self.date.dateChanged.connect(self._on_date_field)
         self.cal.selectionChanged.connect(self._on_calendar)
         self._refresh()
@@ -882,7 +886,8 @@ class _SubnodeDialog(Dialog):
     def __init__(self, parent_name: str, self_addr: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Add subdomain of {parent_name}")
-        form = QFormLayout(self)
+        outer = QVBoxLayout(self)
+        form = QFormLayout()
         self.label = QLineEdit()
         self.label.setPlaceholderText("label  (→ label." + parent_name + ")")
         self.owner = QLineEdit(self_addr or "")
@@ -890,11 +895,12 @@ class _SubnodeDialog(Dialog):
         self.owner.setMinimumWidth(address_field_min_width(self))
         form.addRow("Subdomain", self.label)
         form.addRow("Owner", self.owner)
+        outer.addLayout(form)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        outer.addWidget(buttons)
 
     def values(self) -> tuple[str, str]:
         return self.label.text().strip(), self.owner.text().strip()

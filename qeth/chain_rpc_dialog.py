@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .dialog import Dialog
+from .dialog import Dialog, item_spacing
 
 
 log = logging.getLogger("qeth.chain_rpc_dialog")
@@ -127,13 +127,9 @@ class ChainRpcDialog(Dialog):
         self.resize(640, 540)
 
         outer = QVBoxLayout(self)
-        # Outer margins come from the Dialog base (font-derived, uniform).
-        outer.setSpacing(10)
-
+        # Margins + paragraph spacing come from the Dialog base (font-derived).
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
 
         mono = QFont("monospace")
         self.url_edit = QLineEdit(chain.rpc_url)
@@ -142,7 +138,11 @@ class ChainRpcDialog(Dialog):
         form.addRow("RPC &URL:", self.url_edit)
         outer.addLayout(form)
 
-        outer.addWidget(QLabel(
+        # The caption, the endpoint list, and its status line are one paragraph
+        # (tight); the URL form above and the key form below are separate.
+        picker_para = QVBoxLayout()
+        picker_para.setSpacing(item_spacing(self))
+        picker_para.addWidget(QLabel(
             "Or pick a public endpoint from chainlist.org "
             "(live-probed, fastest first):"
         ))
@@ -152,14 +152,15 @@ class ChainRpcDialog(Dialog):
         self.picker.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.picker.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.picker.itemClicked.connect(self._on_pick)
-        outer.addWidget(self.picker, 1)
+        picker_para.addWidget(self.picker, 1)
 
         self.status_lbl = QLabel("Loading from chainlist.org…")
         self.status_lbl.setStyleSheet("color: gray;")
         # Wrap rather than widen the dialog: a long status line must not
         # dictate the window width.
         self.status_lbl.setWordWrap(True)
-        outer.addWidget(self.status_lbl)
+        picker_para.addWidget(self.status_lbl)
+        outer.addLayout(picker_para, 1)
 
         # Etherscan v2 key: optional, global. Lives below the
         # picker so users see it without scrolling but the chain-

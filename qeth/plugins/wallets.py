@@ -44,7 +44,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QThread
 
 from ..alerts import confirm, error, info, warn
-from ..dialog import Dialog, address_field_min_width, prompt_text
+from ..dialog import (
+    Dialog, address_field_min_width, item_spacing, prompt_text,
+)
 from ..ledger import DiscoveredAccount, LedgerWorker, PATH_SCHEMES
 from ..plugin import Plugin
 
@@ -1261,12 +1263,11 @@ class AccountInfoDialog(Dialog):
         form.addRow("Scheme:", self.scheme_lbl)
         v.addLayout(form)
 
-        v.addSpacing(12)
+        # form / QR / buttons are three paragraphs — the Dialog base spaces them.
         self.qr_lbl = QLabel()
         self.qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qr_lbl.setFixedSize(220, 220)
         v.addWidget(self.qr_lbl, 0, Qt.AlignmentFlag.AlignCenter)
-        v.addSpacing(12)
         self._render_qr(account["address"])
 
         btns = QDialogButtonBox()
@@ -1506,9 +1507,8 @@ class AddWatchOnlyDialog(Dialog):
         self._existing = {a.lower() for a in existing_addresses}
 
         layout = QVBoxLayout(self)
-        # Outer margins come from the Dialog base (font-derived, uniform
-        # across all dialogs); only the inter-row spacing is set here.
-        layout.setSpacing(10)
+        # Margins and paragraph spacing (between the form and the button row)
+        # come from the Dialog base — font-derived, uniform across all dialogs.
 
         form = QFormLayout()
         self.address_edit = QLineEdit()
@@ -1714,8 +1714,7 @@ class AddHotWalletDialog(Dialog):
         self.resize(560, 0)
 
         layout = QVBoxLayout(self)
-        # Outer margins come from the Dialog base (font-derived, uniform).
-        layout.setSpacing(14)
+        # Margins + paragraph spacing come from the Dialog base (font-derived).
 
         warn = QLabel(
             "qeth will encrypt the private key under your passphrase "
@@ -1781,48 +1780,36 @@ class AddHotWalletDialog(Dialog):
         self.pass2_edit.setMinimumHeight(_input_min_h)
         form.addRow("&Confirm:", self.pass2_edit)
 
-        # Live length / match indicator inline with the form so the
-        # user can see at a glance whether their passphrase is past
-        # the 8-char minimum, and whether the two fields agree —
-        # the global match_lbl below was easy to overlook on the
-        # way from the Confirm field to the Add button.
-        # Reserve room for descenders ('p', 'q' on "passphrases…")
-        # — without an explicit minimum height the form-row cell
-        # sized to the empty label's near-zero hint, and the bold
-        # text ended up clipped at the bottom on first display.
-        self.pass_status_lbl = QLabel("")
-        # Use the bold font's height (plus a couple of px) to reserve
-        # the row — the rich-text spans we'll set are bold.
-        from PySide6.QtGui import QFontMetrics
-        bold_font = self.pass_status_lbl.font()
-        bold_font.setBold(True)
-        self.pass_status_lbl.setMinimumHeight(
-            QFontMetrics(bold_font).height() + 4
-        )
-        form.addRow("", self.pass_status_lbl)
-
         self.label_edit = QLineEdit()
         self.label_edit.setPlaceholderText("e.g. Daily driver")
         self.label_edit.setMinimumHeight(_input_min_h)
         form.addRow("&Label (optional):", self.label_edit)
-        layout.addLayout(form)
 
-        # Theme-aware error / ok colours used by both the inline
-        # passphrase progress and the bottom match_lbl.
+        # Theme-aware error / ok colours used by both status labels below.
         self._err_color = _palette_aware_error_color(self.palette())
         self._ok_color = _palette_aware_ok_color(self.palette())
 
-        # Inline status / rejection hint for the private-key field.
-        # Styled with the palette-aware error red so it actually
-        # reads as a warning on both light and dark themes — the
-        # previous ``palette(highlight)`` came out as light cyan on
-        # some palettes and was effectively invisible.
+        # Two validation lines — passphrase length/match, and private-key
+        # rejection. They sit just below the form (not between two fields,
+        # where an always-reserved blank row read as a big gap), grouped WITH
+        # the form as one paragraph so they don't open a second paragraph gap
+        # above the buttons. Empty → they collapse to nothing; in a plain VBox
+        # (not a form row) a QLabel grows cleanly when its text is set, so no
+        # height needs reserving.
+        self.pass_status_lbl = QLabel("")
+        self.pass_status_lbl.setVisible(False)   # hidden → zero height when empty
         self.match_lbl = QLabel("")
         self.match_lbl.setWordWrap(True)
+        self.match_lbl.setVisible(False)
         self.match_lbl.setStyleSheet(
             f"color: {self._err_color}; font-weight: bold;"
         )
-        layout.addWidget(self.match_lbl)
+        creds = QVBoxLayout()
+        creds.setSpacing(item_spacing(self))
+        creds.addLayout(form)
+        creds.addWidget(self.pass_status_lbl)
+        creds.addWidget(self.match_lbl)
+        layout.addLayout(creds)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.gen_btn = buttons.addButton(
@@ -1856,6 +1843,12 @@ class AddHotWalletDialog(Dialog):
         except Exception:
             return None
 
+    def _set_status(self, label: QLabel, html: str) -> None:
+        """Set a status line's text and hide it when empty, so an empty line
+        reserves no height (an empty QLabel still claims a font line)."""
+        label.setText(html)
+        label.setVisible(bool(html))
+
     def _update_state(self) -> None:
         pk_text = self.pk_edit.text()
         pk_valid = self._parsed_private_key() is not None
@@ -1867,49 +1860,49 @@ class AddHotWalletDialog(Dialog):
         # touched. Green when ≥ 8 chars AND fields match; otherwise
         # red with a count.
         if not p1 and not p2:
-            self.pass_status_lbl.setText("")
+            self._set_status(self.pass_status_lbl, "")
         elif len(p1) < 8:
-            self.pass_status_lbl.setText(
+            self._set_status(self.pass_status_lbl, 
                 f"<span style='color: {self._err_color};"
                 f" font-weight: bold;'>"
                 f"{len(p1)}/8 characters</span>"
             )
         elif p1 != p2:
-            self.pass_status_lbl.setText(
+            self._set_status(self.pass_status_lbl, 
                 f"<span style='color: {self._err_color};"
                 f" font-weight: bold;'>"
                 f"passphrases don't match</span>"
             )
         else:
-            self.pass_status_lbl.setText(
+            self._set_status(self.pass_status_lbl, 
                 f"<span style='color: {self._ok_color};"
                 f" font-weight: bold;'>✓ ok</span>"
             )
 
         if not pk_text.strip():
-            self.match_lbl.setText("")
+            self._set_status(self.match_lbl, "")
             self.gen_btn.setEnabled(False)
             return
         if not pk_valid:
-            self.match_lbl.setText(
+            self._set_status(self.match_lbl, 
                 "Private key must be 64 hex characters (with or "
                 "without 0x prefix)."
             )
             self.gen_btn.setEnabled(False)
             return
         if not p1:
-            self.match_lbl.setText("")
+            self._set_status(self.match_lbl, "")
             self.gen_btn.setEnabled(False)
             return
         if p1 != p2:
-            self.match_lbl.setText("")
+            self._set_status(self.match_lbl, "")
             self.gen_btn.setEnabled(False)
             return
         if len(p1) < 8:
-            self.match_lbl.setText("")
+            self._set_status(self.match_lbl, "")
             self.gen_btn.setEnabled(False)
             return
-        self.match_lbl.setText("")
+        self._set_status(self.match_lbl, "")
         self.gen_btn.setEnabled(True)
 
     def _on_accept(self) -> None:

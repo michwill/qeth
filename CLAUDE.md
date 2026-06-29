@@ -130,14 +130,45 @@ exceeds qint64.
 
 ### Dialogs subclass `qeth.dialog.Dialog`, not `QDialog`
 
-Every dialog inherits `Dialog` (`qeth/dialog.py`), which gives its
-top-level layout uniform, font-derived edge margins on first show —
-half a line-height on every side. Don't set the outer
-`setContentsMargins` per dialog (that's what made some dialogs crowd
-their content against the frame, others over-pad); just build the
-layout and inherit the standard. Inner/nested layouts still set their
-own margins as needed. Mixin dialogs keep the mixin first:
-`class SendTokenDialog(_EventPreviewMixin, Dialog)`.
+Every dialog inherits `Dialog` (`qeth/dialog.py`), which on first show
+applies two house standards to its layout, both font-derived (so they
+track the user's Qt font, not a pixel count):
+
+- **Edge margins** — half a line-height on every side. Don't set the
+  outer `setContentsMargins` per dialog (that's what made some dialogs
+  crowd their content against the frame, others over-pad).
+- **Paragraph spacing** (the GNOME-2-HIG rule). Treat each logical group
+  — a value, a description, an input, the button row — as a *paragraph*:
+  tight gaps *within* a paragraph, a wider gap *between* them. The base
+  couples the two: the top-level box layout gets `group_spacing` (the
+  BETWEEN-paragraph gap) and every form gets `item_spacing` rows +
+  `label_spacing` columns (the WITHIN-paragraph rhythm). `group_spacing`
+  is **2×** `item_spacing` — a clear paragraph break. Don't hand-set a
+  form's `setVerticalSpacing` — the base owns it now. (A always-present-
+  but-empty `QLabel` between paragraphs reads as an *extra* gap because
+  an empty label still claims a font line — `setVisible(bool(text))` it;
+  see the status-label note below.)
+
+So just build `VBox[ form, …, buttonBox ]` and inherit it: the button row
+sits a clear gap below the content — no per-dialog `setSpacing`/
+`addSpacing` for the outer rhythm (those fight or double the standard).
+**A label that captions a non-form widget** (a QTextEdit, a list) must be
+grouped *with* it in a sub-`VBox` at `item_spacing(self)` so the two read
+as one paragraph — otherwise the between-paragraph gap pushes them apart
+(see `prompt_text`, `ChainRpcDialog`'s picker, `SignatureResultDialog`).
+**An always-present-but-usually-empty status label** (validation hints)
+must `setVisible(bool(text))` — an empty `QLabel` still claims a font line,
+which reads as a stray paragraph gap (see `AddHotWalletDialog._set_status`).
+
+Two timing details the base handles, both load-bearing on large-font
+themes: the spacing is applied from `setVisible` (**before** Qt sizes the
+window — doing it in `showEvent`, after the geometry was committed,
+overflowed and clipped content); and `showEvent` grows the window height
+to a word-wrapped label's real `heightForWidth` (Qt's auto-size uses the
+label's wide ~1-line hint, so a label that wraps to several lines at the
+real width would otherwise clip). A dialog with a genuinely bespoke layout
+can set `_auto_spacing = False` to keep only the margins. Mixin dialogs
+keep the mixin first: `class SendTokenDialog(_EventPreviewMixin, Dialog)`.
 
 For one-off text prompts use `dialog.prompt_text(...)` (a `Dialog`-based
 `QInputDialog.getText` replacement, so it inherits the margins) rather
