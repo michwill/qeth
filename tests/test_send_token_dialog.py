@@ -725,3 +725,18 @@ class TestAddressBook:
         dlg._show_book_popup()                     # the ▾ button handler
         assert dlg._book_completer.completionPrefix() == ""
         assert dlg._book_completer.completionCount() == 2   # both wallets
+
+
+class TestLogsProperty:
+    """The dialog exposes the latest simulated event logs as ``_logs`` so the
+    host's post-broadcast leg-folding (ui._on_tx_broadcast → note_transfer_legs)
+    can show a swap's coins in the pending row before the receipt lands. The
+    logs really live on the inner _EventsView; the property delegates."""
+
+    def test_logs_empty_until_sim_then_delegates(self, qtbot, monkeypatch):
+        dlg = _make_dialog(qtbot, monkeypatch, balance_raw=10 ** 6)
+        assert dlg._logs == []                      # no simulation yet
+        fake = [{"address": "0x" + "ab" * 20,
+                 "topics": ["0x" + "00" * 32], "data": "0x"}]
+        dlg._events.set_logs(fake)
+        assert dlg._logs == fake

@@ -3297,6 +3297,16 @@ class _EventPreviewMixin:
     # Debounce for proactive re-runs (open / Send-dialog edits).
     SIM_DEBOUNCE_MS = 400
 
+    @property
+    def _logs(self) -> list:
+        """The most recent simulated event logs (empty until a sim lands).
+        Exposed on the dialog so the host's post-broadcast leg-folding
+        (``ui._on_tx_broadcast`` → ``note_transfer_legs``) can show a swap's
+        coins in the pending row before the receipt/indexer catch up — the
+        logs actually live on the inner ``_EventsView``."""
+        events = getattr(self, "_events", None)
+        return list(events._logs) if events is not None else []
+
     def revert_banner(self) -> QLabel:
         """The red 'will revert' warning label — the host adds it to its own
         layout above the Confirm button so it shows from any tab."""
