@@ -25,10 +25,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QComboBox, QDateEdit,
-    QDialogButtonBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMenu, QScrollArea, QStyle,
+    QDialogButtonBox, QFormLayout, QHeaderView, QLabel,
+    QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QStyle,
     QStyledItemDelegate,
-    QStyleOptionViewItem, QTableWidget, QToolButton, QTreeWidget,
+    QStyleOptionViewItem, QTableWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -502,81 +502,88 @@ class EnsPanel(QWidget):
             "record": _icon("document-properties", _sp.SP_FileIcon),
             "subdomain": _icon("folder-new", _sp.SP_FileDialogNewFolder),
         }
-        # Bottom action bar — quick-access buttons that track the tree
-        # selection (a curated subset of the context menu): a name row shows its
-        # write actions, a record row collapses to Copy + Edit. The current
-        # selection's target is cached for the button slots.
+        # Selection-driven action buttons. They're created here but MOUNTED by
+        # the slot's shared bottom row (via the plugin's action_widgets), so the
+        # ENS actions sit on one line with the chain selector — structurally and
+        # stylistically identical to the Tokens / Transactions panels. The
+        # current selection's target is cached for the button slots.
         self._cur_name: EnsName | None = None
         self._cur_value: str | None = None
         self._cur_edit: tuple[str, str, str] | None = None
-        layout.addWidget(self._build_action_bar())
+        self._build_action_buttons()
         self.tree.itemSelectionChanged.connect(self._update_action_bar)
         self._update_action_bar()
 
-    # --- bottom action bar ------------------------------------------------
+    # --- selection-driven action buttons ----------------------------------
 
-    def _build_action_bar(self) -> QWidget:
-        bar = QWidget()
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(0, 4, 0, 0)
-        h.setSpacing(4)
+    def _build_action_buttons(self) -> None:
+        """Build the buttons the slot mounts on its shared bottom row. Styled to
+        match the other panels: a framed labelled button for the primary actions
+        (like Send / Add account) and flat 28×28 icon buttons for the icon-only
+        utilities (like the token +/copy/star row)."""
         ic = self._act_icons
 
-        def mk(icon: QIcon, *, text: str = "", tip: str) -> QToolButton:
-            b = QToolButton()
+        # Parented to the panel so toggling their visibility never spawns a
+        # stray top-level window before the slot reparents them onto its row
+        # (the panel page is hidden until then; the slot moves them across
+        # before it's shown).
+        def named(icon: QIcon, text: str, tip: str) -> QPushButton:
+            b = QPushButton(text, self)
             b.setIcon(icon)
             b.setIconSize(QSize(16, 16))
-            b.setAutoRaise(True)
-            if text:
-                b.setText(text)
-                b.setToolButtonStyle(
-                    Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             b.setToolTip(tip)
             return b
 
-        # Name-mode buttons (Transfer + Extend carry a label; the rest are
-        # icon-only with a tooltip).
-        self._b_transfer = mk(ic["transfer"], text="Transfer",
-                              tip="Transfer name")
-        self._b_renew = mk(ic["renew"], text="Extend",
-                           tip="Extend registration")
-        self._b_manager = mk(ic["manager"], tip="Set manager")
-        self._b_addr = mk(ic["addr"], tip="Set ETH address")
-        self._b_content = mk(ic["content"], tip="Set content (IPFS)")
-        self._b_copyname = mk(ic["copy"], tip="Copy name")
+        def util(icon: QIcon, tip: str) -> QPushButton:
+            b = QPushButton(self)
+            b.setIcon(icon)
+            b.setToolTip(tip)
+            b.setFlat(True)
+            b.setMaximumSize(28, 28)
+            b.setIconSize(QSize(16, 16))
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            return b
+
+        self._b_transfer = named(ic["transfer"], "Transfer", "Transfer name")
+        self._b_renew = named(ic["renew"], "Extend", "Extend registration")
+        self._b_manager = util(ic["manager"], "Set manager")
+        self._b_addr = util(ic["addr"], "Set ETH address")
+        self._b_content = util(ic["content"], "Set content (IPFS)")
+        self._b_copyname = util(ic["copy"], "Copy name")
+        self._b_reccopy = util(ic["copy"], "Copy value")
+        self._b_recedit = util(ic["edit"], "Edit record")
+        self._b_add = util(
+            _icon("list-add", QStyle.StandardPixmap.SP_FileDialogNewFolder),
+            "Add a name")
+
         self._b_transfer.clicked.connect(lambda: self._emit_name("transfer"))
         self._b_renew.clicked.connect(lambda: self._emit_name("renew"))
         self._b_manager.clicked.connect(lambda: self._emit_name("manager"))
         self._b_addr.clicked.connect(lambda: self._emit_name("addr"))
         self._b_content.clicked.connect(lambda: self._emit_name("content"))
         self._b_copyname.clicked.connect(self._copy_name)
-        self._name_btns = [self._b_transfer, self._b_renew, self._b_manager,
-                           self._b_addr, self._b_content, self._b_copyname]
-
-        # Record-mode buttons.
-        self._b_reccopy = mk(ic["copy"], tip="Copy value")
-        self._b_recedit = mk(ic["edit"], tip="Edit record")
         self._b_reccopy.clicked.connect(self._copy_value)
         self._b_recedit.clicked.connect(self._edit_record)
+        self._b_add.clicked.connect(lambda: self.add_custom_requested.emit())
+
+        self._name_btns = [self._b_transfer, self._b_renew, self._b_manager,
+                           self._b_addr, self._b_content, self._b_copyname]
         self._rec_btns = [self._b_reccopy, self._b_recedit]
 
-        for b in self._name_btns + self._rec_btns:
-            h.addWidget(b)
-        h.addStretch(1)
-        # "Add a name" is a global action (not selection-bound) — pin it to the
-        # right, past the stretch, so it stays put as the contextual buttons on
-        # the left change with the selection.
-        self._add_btn = QToolButton()
-        self._add_btn.setIcon(
-            _icon("list-add", QStyle.StandardPixmap.SP_FileDialogNewFolder))
-        self._add_btn.setIconSize(QSize(16, 16))
-        self._add_btn.setAutoRaise(True)
-        self._add_btn.setToolTip("Add a name")
-        self._add_btn.clicked.connect(lambda: self.add_custom_requested.emit())
-        h.addWidget(self._add_btn)
-        return bar
+    def action_buttons(self) -> list[QWidget]:
+        """The full button list for the slot's bottom row (selection decides
+        which are shown/enabled). The "add a name" button is always present."""
+        self._update_action_bar()
+        return [*self._name_btns, *self._rec_btns, self._b_add]
 
     def _update_action_bar(self) -> None:
+        # Skip while the buttons are detached from a slot row (between tab
+        # switches): toggling setVisible on a parentless widget would pop a
+        # stray top-level window. on_activated re-runs this once they're
+        # remounted. (At construction they're parented to the panel, so the
+        # initial pass still sets sensible state.)
+        if self._b_add.parent() is None:
+            return
         sel = self.tree.selectedItems()
         item = sel[0] if sel else None
         n = item.data(0, _NAME_ROLE) if item is not None else None
@@ -1567,9 +1574,11 @@ class EnsPlugin(Plugin):
             self._panel.edit_record_requested.connect(self._on_edit_record)
         return self._panel
 
-    # The "add a name" button now lives in the panel's own bottom action bar
-    # (alongside the selection-driven write buttons), not the slot's shared
-    # action row — so action_widgets() stays the base empty default.
+    def action_widgets(self) -> list[QWidget]:
+        # The ENS write/copy/add buttons mount on the slot's shared bottom row
+        # (one line with the chain selector), exactly like the Tokens panel —
+        # the panel owns them; selection drives which are shown/enabled.
+        return self._panel.action_buttons() if self._panel is not None else []
 
     def on_account_changed(self, address: str | None) -> None:
         self._load(address)
@@ -1577,6 +1586,10 @@ class EnsPlugin(Plugin):
     def on_activated(self) -> None:
         if self.host is not None and self._loaded_for != self.host.selected_address:
             self._load(self.host.selected_address)
+        # The slot has just (re)mounted our action buttons onto its row — sync
+        # their shown/enabled state to the current selection.
+        if self._panel is not None:
+            self._panel._update_action_bar()
 
     # --- loading ----------------------------------------------------------
 
