@@ -34,9 +34,13 @@ class _StubHost:
         self.selected_address = address
         self.started_workers: list = []
         self.tx_requests: list = []
+        self.status_messages: list = []
         # ENS writes now open a rich composer lazily; capture the op + the
         # post-confirm callback instead of a pre-built request.
         self.ens_ops: list = []
+
+    def status_message(self, text, timeout_ms=3000):
+        self.status_messages.append(text)
 
     def current_chain(self):
         return self._chain
@@ -421,6 +425,76 @@ class TestEnsPanel:
         panel.tree.setCurrentItem(mgr)
         assert panel._b_reccopy.isEnabled()
         assert not panel._b_recedit.isEnabled()
+
+    def test_ctrl_c_copies_name_record_and_role(self, qtbot):
+        from PySide6.QtWidgets import QApplication
+        from qeth.ens_app import OwnershipCheck
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("crv.eth", source="custom")]), NOW)
+        mgr = "0x39415255619783A2E71fcF7d8f708A951d92e1b6"
+        panel.mark_verified({"crv.eth": OwnershipCheck(
+            controller=mgr, registrant=me, owner_known=True)}, me)
+        panel.add_records("crv.eth", EnsRecords(texts={"url": "https://x"}))
+        root = panel.tree.topLevelItem(0)
+        copied = []
+        panel.copied.connect(copied.append)
+
+        # name row → the name
+        panel.tree.setCurrentItem(root)
+        panel._copy_current()
+        assert QApplication.clipboard().text() == "crv.eth"
+        # a record row → its value
+        url = next(root.child(i) for i in range(root.childCount())
+                   if root.child(i).text(0) == "url")
+        panel.tree.setCurrentItem(url)
+        panel._copy_current()
+        assert QApplication.clipboard().text() == "https://x"
+        # the manager role row → the address it shows
+        mrow = next(root.child(i) for i in range(root.childCount())
+                    if root.child(i).text(0) == "manager")
+        panel.tree.setCurrentItem(mrow)
+        panel._copy_current()
+        from eth_utils import to_checksum_address
+        assert QApplication.clipboard().text() == to_checksum_address(mgr)
+        assert copied[-1] == to_checksum_address(mgr)   # announced each time
+
+    def test_ctrl_c_action_is_registered_on_the_tree(self, qtbot):
+        # A tree-scoped Copy shortcut is wired to the copy handler (the actual
+        # keystroke path; verified separately not to leak focus state).
+        from PySide6.QtGui import QKeySequence
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        copy_seq = QKeySequence(QKeySequence.StandardKey.Copy)
+        acts = [a for a in panel.tree.actions() if a.shortcut() == copy_seq]
+        assert acts
+        assert (acts[0].shortcutContext()
+                == Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+    def test_copy_announces_to_status_line(self, qtbot):
+        plugin = EnsPlugin(_StubStore())
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        plugin.widget()._copy("crv.eth")
+        assert host.status_messages == ["Copied crv.eth to clipboard"]
+
+    def test_no_records_placeholder_is_gone(self, qtbot):
+        # A name with zero resolver records still isn't empty (owner/manager),
+        # so we never render a "no records" note.
+        from qeth.ens_app import OwnershipCheck
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("crv.eth", source="custom")]), NOW)
+        panel.mark_verified({"crv.eth": OwnershipCheck(
+            controller=me, registrant=me, owner_known=True)}, me)
+        panel.add_records("crv.eth", EnsRecords())        # no records at all
+        root = panel.tree.topLevelItem(0)
+        labels = [root.child(i).text(0) for i in range(root.childCount())]
+        assert "no records" not in labels
+        assert set(labels) == {"manager", "owner"}
 
     def test_named_buttons_have_mnemonics(self, qtbot):
         # Transfer / Extend carry &-mnemonics like Send / Add Account; the

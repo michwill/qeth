@@ -21,7 +21,7 @@ from collections.abc import Callable, Sequence
 
 from PySide6.QtCore import QDate, QEvent, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QDesktopServices, QIcon, QPalette,
+    QAction, QBrush, QColor, QDesktopServices, QIcon, QKeySequence, QPalette,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QComboBox, QDateEdit,
@@ -411,6 +411,7 @@ class EnsPanel(QWidget):
     records_requested = Signal(str)    # name → load its records (lazy)
     write_requested = Signal(str, str)  # (name, kind) — kind: addr|content|text|record|subdomain
     edit_record_requested = Signal(str, str, str)  # (name, label, value)
+    copied = Signal(str)               # text just put on the clipboard
 
     # Trailing column = verification status, shown as a fixed-size icon (a text
     # ✓/⚠ glyph gets emoji presentation on some themes and changes the row
@@ -465,6 +466,15 @@ class EnsPanel(QWidget):
         self.tree.itemExpanded.connect(self._on_expanded)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_menu)
+        # Ctrl+C copies the selected row's natural value — the name for a name
+        # row, the address/value for a record or owner/manager row — scoped to
+        # the tree (same idiom as the Tokens table's copy shortcut).
+        copy_act = QAction(self.tree)
+        copy_act.setShortcut(QKeySequence.StandardKey.Copy)
+        copy_act.setShortcutContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        copy_act.triggered.connect(self._copy_current)
+        self.tree.addAction(copy_act)
         layout.addWidget(self.tree)
 
         self._domain_icon = _icon("emblem-web", QStyle.StandardPixmap.SP_DriveNetIcon)
@@ -659,13 +669,33 @@ class EnsPanel(QWidget):
         if self._cur_name is not None:
             self.write_requested.emit(self._cur_name.name, kind)
 
+    def _copy(self, text: str | None) -> None:
+        """Put ``text`` on the clipboard and announce it (→ status line)."""
+        if text:
+            _clip(text)
+            self.copied.emit(text)
+
+    def _copy_current(self) -> None:
+        """Ctrl+C — copy the selected row's natural value: the ENS name for a
+        name row, the address/value for a record or owner/manager row."""
+        sel = self.tree.selectedItems()
+        if not sel:
+            return
+        item = sel[0]
+        n = item.data(0, _NAME_ROLE)
+        if isinstance(n, EnsName):
+            self._copy(n.name)
+            return
+        val = item.data(0, _VALUE_ROLE)
+        if val is not None:
+            self._copy(str(val))
+
     def _copy_name(self) -> None:
         if self._cur_name is not None:
-            _clip(self._cur_name.name)
+            self._copy(self._cur_name.name)
 
     def _copy_value(self) -> None:
-        if self._cur_value is not None:
-            _clip(self._cur_value)
+        self._copy(self._cur_value)
 
     def _edit_record(self) -> None:
         if self._cur_edit is not None:
@@ -735,12 +765,10 @@ class EnsPanel(QWidget):
             ch = item.child(i)
             if ch.data(0, _NAME_ROLE) is None:
                 item.removeChild(ch)
+        # No "no records" placeholder: a 2LD always shows its owner + manager
+        # rows (and a subdomain its manager), so an expanded name is never
+        # empty and the note would be misleading.
         rows = _record_rows(rec)
-        if not rows:
-            note = _SortItem(["no records", "", ""])
-            note.setData(0, _TYPE_RANK_ROLE, _RANK_RECORD)
-            note.setForeground(0, QBrush(QColor(120, 120, 120)))
-            item.addChild(note)
         for icon_key, label, value in rows:
             ch = _SortItem([label, "", value])
             ch.setData(0, _TYPE_RANK_ROLE,
@@ -959,10 +987,10 @@ class EnsPanel(QWidget):
             menu.addAction(ic["open"], "Open in ENS app",
                            lambda: QDesktopServices.openUrl(
                                QUrl(ENS_APP_URL.format(name=n.name))))
-            menu.addAction(ic["copy"], "Copy name", lambda: _clip(n.name))
+            menu.addAction(ic["copy"], "Copy name", lambda: self._copy(n.name))
             if n.resolved_address:
                 menu.addAction(ic["copy"], "Copy resolved address",
-                               lambda: _clip(n.resolved_address))
+                               lambda: self._copy(n.resolved_address))
             nm = n.name
             for group in self._write_menu_groups(n):
                 menu.addSeparator()
@@ -971,7 +999,8 @@ class EnsPanel(QWidget):
                         ic[kind], label,
                         lambda k=kind: self.write_requested.emit(nm, k))
         elif value:
-            menu.addAction(ic["copy"], "Copy value", lambda: _clip(str(value)))
+            menu.addAction(ic["copy"], "Copy value",
+                           lambda: self._copy(str(value)))
             # Record row → offer to edit it (the parent name must be writable).
             parent = item.parent()
             pn = parent.data(0, _NAME_ROLE) if parent is not None else None
@@ -1594,7 +1623,12 @@ class EnsPlugin(Plugin):
             self._panel.add_custom_requested.connect(self._on_add_custom)
             self._panel.write_requested.connect(self._on_write_requested)
             self._panel.edit_record_requested.connect(self._on_edit_record)
+            self._panel.copied.connect(self._on_copied)
         return self._panel
+
+    def _on_copied(self, text: str) -> None:
+        if self.host is not None:
+            self.host.status_message(f"Copied {text} to clipboard", 3000)
 
     def action_widgets(self) -> list[QWidget]:
         # The ENS write/copy/add buttons mount on the slot's shared bottom row
