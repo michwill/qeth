@@ -1186,6 +1186,20 @@ class TestEnsWriteActions:
         plugin._renew("blog.vitalik.eth")                   # not a .eth 2LD
         assert host.ens_ops == []
 
+    def test_renew_cannot_shorten_below_current_expiry(self, qtbot):
+        # The renew dialog floors at the CURRENT expiry — you can't "extend" to
+        # an earlier date, and the term is measured from the expiry, not now.
+        from qeth.plugins.ens import _RenewFields, _qdate_from_ts
+        from PySide6.QtCore import QDate
+        fields = _RenewFields("crv.eth", self.OWNED_EXP)  # far-future expiry
+        qtbot.addWidget(fields)
+        exp_qd = _qdate_from_ts(self.OWNED_EXP)
+        assert fields.date.minimumDate() > exp_qd          # strictly forward
+        # an attempt to pick an earlier date is clamped to the minimum
+        fields.date.setDate(QDate(2020, 1, 1))
+        assert fields.date.date() >= fields.date.minimumDate()
+        assert fields.duration_seconds() > 0               # measured from expiry
+
     def test_renew_quote_reaches_field_group(self, qtbot):
         from decimal import Decimal
         from qeth.plugins.ens import _RenewFields

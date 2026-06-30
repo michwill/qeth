@@ -111,13 +111,27 @@ def test_lookup_registrant_names_skips_known_and_resolves():
         if "/nft" in url:
             return nft
         calls.append(url)                # only the unknown tokenId resolves
-        return {"name": "crv.eth"}
+        return {"name": "crv.eth", "attributes": [
+            {"trait_type": "Expiration Date", "display_type": "date",
+             "value": 1801533201000}]}
 
     names = ea.lookup_registrant_names(
         1, "0xabc", skip_labelhashes={vit_id}, get_json=fake_get)
     assert [n.name for n in names] == ["crv.eth"]
     assert names[0].source == "registrant"   # tagged so verify won't drop it
+    assert names[0].expiry_ts == 1801533201  # carried so it shows + can renew
     assert len(calls) == 1 and str(crv_id) in calls[0]   # vitalik never fetched
+
+
+def test_ens_metadata_parses_name_and_expiry():
+    d = {"name": "crv.eth", "attributes": [
+        {"trait_type": "Length", "value": 3},
+        {"trait_type": "Expiration Date", "display_type": "date",
+         "value": 1801533201000}]}
+    assert ea._ens_metadata(1, get_json=lambda u: d) == ("crv.eth", 1801533201)
+    # no expiry attribute → name only
+    assert ea._ens_metadata(1, get_json=lambda u: {"name": "x.eth"}) \
+        == ("x.eth", None)
 
 
 def test_lookup_registrant_names_mainnet_only():

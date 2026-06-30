@@ -352,14 +352,16 @@ def _registrar_token_ids(
     return out
 
 
-def _ens_metadata_name(
+def _ens_metadata(
     token_id: int, *,
     base_url: str = ENS_METADATA_BASE,
     registrar: str = ENS_ETH_REGISTRAR,
     get_json: Callable[[str], dict] = _http_get_json,
-) -> str | None:
-    """Reverse a BaseRegistrar tokenId to its ``.eth`` name via the ENS metadata
-    service (``metadata.ens.domains``). None on any failure."""
+) -> tuple[str, int | None] | None:
+    """Reverse a BaseRegistrar tokenId to ``(name, expiry_ts)`` via the ENS
+    metadata service (``metadata.ens.domains``) — the expiry comes from the
+    "Expiration Date" attribute so an NFT-discovered name can still show its
+    expiry and be renewed. None on any failure; ``expiry_ts`` None if absent."""
     url = f"{base_url}/{registrar}/{token_id}"
     try:
         d = get_json(url)
@@ -367,7 +369,16 @@ def _ens_metadata_name(
         log.debug("ENS metadata lookup failed (%s): %s", token_id, e)
         return None
     name = d.get("name")
-    return str(name) if name else None
+    if not name:
+        return None
+    expiry: int | None = None
+    for a in d.get("attributes") or []:
+        if a.get("trait_type") == "Expiration Date":
+            v = a.get("value")
+            if isinstance(v, int | float):
+                # The service reports JS millisecond timestamps.
+                expiry = int(v) // 1000 if v > 1e12 else int(v)
+    return str(name), expiry
 
 
 def lookup_registrant_names(
@@ -389,14 +400,17 @@ def lookup_registrant_names(
     for tid in _registrar_token_ids(address, get_json=get_json):
         if tid in skip:
             continue
-        name = _ens_metadata_name(tid, get_json=get_json)
-        if name and name.lower() not in seen:
+        meta = _ens_metadata(tid, get_json=get_json)
+        if meta is None:
+            continue
+        name, expiry = meta
+        if name.lower() not in seen:
             seen.add(name.lower())
             # source="registrant": this came from a fresh on-chain NFT read, so
             # the verify pass must not drop it when its (Helios-verified, head-
             # lagging) ownership read still shows the previous registrant — a
             # just-transferred name would otherwise flicker in and vanish.
-            out.append(EnsName(name, source="registrant"))
+            out.append(EnsName(name, source="registrant", expiry_ts=expiry))
     return out
 
 
