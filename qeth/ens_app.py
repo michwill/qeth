@@ -600,6 +600,21 @@ def verify_names(
     return states, verified
 
 
+def read_name_states(chain: Chain, names: list[str]) -> dict[str, OwnershipCheck]:
+    """Fast, UNVERIFIED ownership read at the execution head (controller +
+    registrant + resolved-address) — fresh, so it reflects a just-confirmed tx
+    at once, but not proof-verified. The first-paint / post-write path for the
+    owner/manager rows, mirroring ``read_records``: ``verify_names`` follows with
+    the Helios-proven read that earns the ✓ (and decides drops). Returns ``{}``
+    on any failure (the verified pass is still the authority)."""
+    from .chain import EthClient
+    try:
+        return _read_name_states(EthClient(chain), names)
+    except Exception:
+        log.debug("ENS read_name_states (unverified) failed", exc_info=True)
+        return {}
+
+
 def _read_name_states(client, names: list[str]) -> dict[str, OwnershipCheck]:
     """The multicall body of ``verify_names``, factored out so it can be tested
     against a fake client without a live chain."""

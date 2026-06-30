@@ -35,8 +35,8 @@ from PySide6.QtWidgets import (
 from ..ens_app import (
     ENS_APP_URL, TEXT_KEYS, VERIFY_WAIT_S, EnsCache, EnsName, EnsNode,
     EnsRecords, OwnershipCheck, build_tree, expiry_status, fetch_name,
-    lookup_owned_names, name_warning, read_records, verified_read_records,
-    verify_names,
+    lookup_owned_names, name_warning, read_name_states, read_records,
+    verified_read_records, verify_names,
 )
 from ..plugin import Plugin
 from ..dialog import Dialog, address_field_min_width, prompt_text
@@ -345,28 +345,58 @@ class EnsRecordsWorker(QThread):
             self.msleep(int(_VERIFY_CATCHUP_DELAY_S * 1000))
 
 
+def _states_agree(a: dict[str, OwnershipCheck],
+                  b: dict[str, OwnershipCheck]) -> bool:
+    """True when two ownership reads show the same controller + registrant for
+    every name — i.e. the verified head has caught up to the fast read."""
+    if set(a) != set(b):
+        return False
+    for k in a:
+        if (a[k].controller or "").lower() != (b[k].controller or "").lower():
+            return False
+        if (a[k].registrant or "").lower() != (b[k].registrant or "").lower():
+            return False
+    return True
+
+
 class EnsVerifyWorker(QThread):
-    """Verify the displayed names against on-chain state through Helios — in two
-    batched multicalls (ownership + resolved-address), not per-name. Emits
-    ``ready(address, states, verified)`` where ``states`` is
-    ``{name_lower: OwnershipCheck}``. ``verified`` is True only when a Helios
-    sidecar proved the reads; otherwise ``states`` is empty and the rows stay
-    unbadged (never blocked, never trusting an unverified re-read)."""
+    """Check the displayed names' ownership in two phases, like the records
+    worker: first a fast UNVERIFIED read at the execution head (fresh — reflects
+    a just-confirmed tx at once) for an immediate owner/manager update, then the
+    Helios-proven read that earns the ✓ and decides drops. Emits
+    ``ready(address, states, verified)`` once or twice.
+
+    On a forced post-write refresh (``catchup``), the verified pass waits for
+    Helios to agree with the fresh read before emitting, so a lagging proof
+    can't overwrite the change the user just made."""
 
     ready = Signal(str, object, bool)        # (address, states, verified)
 
     def __init__(self, chain, address: str, names: list[str], parent=None,
-                 *, wait_s: float = VERIFY_WAIT_S):
+                 *, wait_s: float = VERIFY_WAIT_S, catchup: bool = False):
         super().__init__(parent)
         self._chain = chain
         self._address = address
         self._names = list(names)
         self._wait_s = wait_s
+        self._catchup = catchup
 
     def run(self) -> None:
-        states, verified = verify_names(
-            self._chain, self._names, wait_s=self._wait_s)
-        self.ready.emit(self._address, states, verified)
+        fast = read_name_states(self._chain, self._names)
+        if fast:
+            self.ready.emit(self._address, fast, False)
+        tries = _VERIFY_CATCHUP_TRIES if self._catchup else 1
+        for attempt in range(tries):
+            states, verified = verify_names(
+                self._chain, self._names,
+                wait_s=self._wait_s if attempt == 0 else 0.0)
+            if not verified:           # no sidecar / can't prove → stop trying
+                return
+            if (not fast or _states_agree(states, fast)
+                    or attempt == tries - 1):
+                self.ready.emit(self._address, states, True)
+                return
+            self.msleep(int(_VERIFY_CATCHUP_DELAY_S * 1000))
 
 
 def _eth_usd_rate(chain) -> Decimal | None:
@@ -524,6 +554,7 @@ class EnsPanel(QWidget):
         # name_lower → the last verified OwnershipCheck, so the manager/owner
         # rows can be (re-)rendered whenever a name's records reload.
         self._ownership: dict[str, OwnershipCheck] = {}
+        self._ownership_verified: set[str] = set()   # names with a proven ✓
         # Context-menu action icons. The write actions reuse the row icons that
         # already stand for those things (gear = manager, link = address,
         # folder-remote = content, text glyph = text record, folder = subdomain)
@@ -759,6 +790,7 @@ class EnsPanel(QWidget):
         self.tree.clear()
         self._items_by_name.clear()
         self._ownership.clear()
+        self._ownership_verified.clear()
         for node in roots:
             self.tree.addTopLevelItem(self._build(node, now_ts, is_sub=False))
         self.tree.setSortingEnabled(True)
@@ -852,6 +884,7 @@ class EnsPanel(QWidget):
                          _MANAGER_TIP))
         if st.registrant:
             rows.append((self._owner_icon, "owner", st.registrant, _OWNER_TIP))
+        proven = name_l in self._ownership_verified
         for icon, label, addr, tip in rows:
             shown = _checksum(addr) or addr
             ch = _SortItem([label, "", shown])
@@ -861,9 +894,10 @@ class EnsPanel(QWidget):
             ch.setIcon(0, icon)
             ch.setToolTip(0, tip)
             ch.setToolTip(2, shown)
-            # mark_verified only ever runs on proof-verified state, so these are
-            # verified facts — badge them like the records.
-            self._set_status(ch, "ok", _RECORD_TIP)
+            # ✓ only once Helios proved it; the fast read shows the fresh value
+            # without a green badge.
+            if proven:
+                self._set_status(ch, "ok", _RECORD_TIP)
             item.addChild(ch)
 
     def update_resolved(self, name: str, address: str | None) -> None:
@@ -881,18 +915,19 @@ class EnsPanel(QWidget):
         item.setToolTip(2, _RESOLVED_TIP if address else "")
 
     def mark_verified(self, states: dict[str, OwnershipCheck],
-                      address: str) -> list[str]:
-        """Apply the batched on-chain verification to the rows and return the
-        names DROPPED as indexer lies.
+                      address: str, *, verified: bool = True) -> list[str]:
+        """Apply an ownership read to the rows and return the names DROPPED.
 
-        Ownership is the chain's call: a name the chain proves you control gets a
-        ✓; a discovered name the chain says you DON'T own (controller and
-        registrant are someone else) isn't real — the indexer over-reported it —
-        so we remove it from the tree entirely. Pinned (custom) names are never
-        removed: watching a name you don't own is intentional. The resolved
-        address is replaced with the proven head value (no mismatch alarm — the
-        indexer just lagged). Only ever called with proof-verified state, so
-        acting on it is sound."""
+        Two callers: the fast UNVERIFIED read (``verified=False``) freshens the
+        owner/manager rows + resolved address the instant a tx confirms, but
+        never drops a name and never paints the green ✓ (an unverified read
+        can't be trusted to remove anything or to prove ownership). The
+        Helios-proven read (``verified=True``) is the authority: a name it proves
+        you control gets the ✓; one it proves you DON'T own (controller and
+        registrant both someone else) is an indexer lie and is removed. Pinned
+        (custom) names are never dropped; a freshly NFT-discovered
+        (``registrant``) name whose proof is still catching up is kept and
+        badged "pending" instead."""
         removed: list[str] = []
         for name_l, st in states.items():
             item = self._items_by_name.get(name_l)
@@ -901,13 +936,13 @@ class EnsPanel(QWidget):
             n = item.data(0, _NAME_ROLE)
             src = n.source if isinstance(n, EnsName) else ""
             if st.disowned_by(address):
-                # The verified read says this address owns neither role.
+                if not verified:
+                    continue          # unverified can't drop or badge a disown
                 if src == "registrant":
-                    # …but a FRESH on-chain NFT read just surfaced it, and the
-                    # verified head lags (a just-transferred name). Trust the
-                    # fresher source: keep it, badge "proof catching up", and
-                    # don't paint the stale owner/manager rows. A later pass
-                    # (head caught up) verifies it green or a refresh drops it.
+                    # A FRESH on-chain NFT read surfaced it but the verified head
+                    # still lags (a just-transferred name). Keep it, badge "proof
+                    # catching up", don't paint the stale rows. A later pass
+                    # verifies it green or a refresh drops it.
                     self._set_status(item, "pending", _PENDING_TIP)
                     item.setToolTip(0, _PENDING_TIP)
                     continue
@@ -921,20 +956,25 @@ class EnsPanel(QWidget):
             # owned or merely watched — once the read definitively landed.
             if st.owner_known:
                 self._ownership[name_l] = st
+                if verified:
+                    self._ownership_verified.add(name_l)
+                else:
+                    self._ownership_verified.discard(name_l)
                 self._render_ownership_rows(item, name_l)
             if item.data(0, _UNSAFE_ROLE):
                 continue          # keep the ⚠; never add a ✓ to a look-alike
-            # Resolved-to: the proof is read at the chain head, so it IS the
-            # current truth — replace the indexer's hint with it (and make it
-            # copyable). No "mismatch" alarm: a difference just means the indexer
-            # lagged; we simply show the proven, most-recent value.
+            # Resolved-to: a head read (proven or fresh) is more current than the
+            # indexer's hint — show it. No "mismatch" alarm: a difference just
+            # means the indexer lagged.
             if st.resolved_address:
                 if isinstance(n, EnsName):
                     n.resolved_address = st.resolved_address
                 item.setText(2, st.resolved_address)
                 item.setToolTip(2, _RESOLVED_TIP)
-            # One status icon for the whole line (ownership + resolution).
-            if st.owned_by(address):
+            # The line's ✓ is the verified pass's call only — the fast pass shows
+            # the fresh values but leaves the badge as it was (no false green, no
+            # flicker of an existing ✓).
+            if verified and st.owned_by(address):
                 is_sub = isinstance(n, EnsName) and n.is_subdomain
                 tip = _CONTROL_TIP if is_sub else _OWNED_TIP
                 if st.wrapped:
@@ -1682,6 +1722,9 @@ class EnsPlugin(Plugin):
         # _owned, used to gate the record-write actions (a registrant who isn't
         # the manager can't set records until they reclaim the manager role).
         self._controller: set[str] = set()
+        # One-shot: the next verify pass should wait for the verified head to
+        # catch up (set after a write confirms; see _on_refresh).
+        self._verify_catchup = False
 
     # --- plugin contract --------------------------------------------------
 
@@ -1759,11 +1802,14 @@ class EnsPlugin(Plugin):
             self._render(cached)
         self._on_refresh()
 
-    def _on_refresh(self) -> None:
+    def _on_refresh(self, *, catchup: bool = False) -> None:
         host = self.host
         addr = host.selected_address if host is not None else None
         if not addr:
             return
+        # A post-write refresh waits for the verified head to catch up to the
+        # change (so a lagging proof can't overwrite it); a normal load doesn't.
+        self._verify_catchup = catchup
         worker = EnsNamesWorker(addr, sorted(self._store.custom_ens_names))
         worker.ready.connect(self._on_names_ready)
         self._start(worker)
@@ -1797,14 +1843,20 @@ class EnsPlugin(Plugin):
         # on a cold restart it's worth blocking (in this worker thread) for the
         # just-prewarmed sidecar to finish syncing rather than returning
         # unverified and leaving a lie on screen until the next load.
-        worker = EnsVerifyWorker(chain, address, names, wait_s=_OWNERSHIP_WAIT_S)
+        worker = EnsVerifyWorker(chain, address, names, wait_s=_OWNERSHIP_WAIT_S,
+                                 catchup=self._verify_catchup)
+        self._verify_catchup = False        # consume the one-shot flag
         worker.ready.connect(self._on_verified)
         self._start(worker)
 
     def _on_verified(self, address: str, states: dict[str, OwnershipCheck],
                      verified: bool) -> None:
+        # Two passes land here: the fast unverified read (verified=False) for an
+        # immediate owner/manager/role-gate update, then the Helios-proven read
+        # (verified=True) that earns the ✓ and decides drops. Both carry fresh
+        # roles — the verified one only after it caught up (see EnsVerifyWorker).
         host = self.host
-        if not verified or self._panel is None:
+        if self._panel is None:
             return
         if host is not None and host.selected_address != address:
             return                                  # view moved on
@@ -1833,7 +1885,8 @@ class EnsPlugin(Plugin):
                 self._controller.add(name_l)
             else:
                 self._controller.discard(name_l)
-        self._denied.update(self._panel.mark_verified(states, address))
+        self._denied.update(
+            self._panel.mark_verified(states, address, verified=verified))
         self._refresh_writable(address)
 
     def _can_sign(self, address: str) -> bool:
@@ -2377,7 +2430,10 @@ class EnsPlugin(Plugin):
             # the new value shows now, marked "confirmed" until finality earns
             # it the ✓ (rather than waiting on finality to show it at all).
             if op.rediscover:
-                self._on_refresh()
+                # catchup=True: a transfer/reclaim changed ownership, so wait
+                # for the verified head to reflect it before the proof overwrites
+                # the fast read that already shows the new owner/manager.
+                self._on_refresh(catchup=True)
             else:
                 self._on_records_requested(nm, force=True)
 

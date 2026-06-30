@@ -346,6 +346,76 @@ class TestEnsPanel:
         root = panel.tree.topLevelItem(0)
         assert root.data(0, _STATUS_ROLE) == "ok"   # proven → green
 
+    def test_fast_pass_shows_rows_no_green_no_drop(self, qtbot):
+        # The unverified fast pass freshens owner/manager rows at once but never
+        # drops a name and never paints the green ✓.
+        from qeth.plugins.ens import _OWNERSHIP_ROLE, _STATUS_ROLE
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "39" * 20
+        panel.populate(build_tree([
+            EnsName("crv.eth", source="owned"),
+            EnsName("other.eth", source="owned")]), NOW)
+        removed = panel.mark_verified({
+            "crv.eth": OwnershipCheck(controller=me, registrant=me,
+                                      owner_known=True),
+            "other.eth": OwnershipCheck(controller="0x" + "22" * 20,
+                                        owner_known=True),     # disowned
+        }, me, verified=False)
+        assert removed == []                          # nothing dropped
+        crv = panel._items_by_name["crv.eth"]
+        assert crv.data(0, _STATUS_ROLE) != "ok"      # not green yet
+        roles = {crv.child(i).text(0) for i in range(crv.childCount())
+                 if crv.child(i).data(0, _OWNERSHIP_ROLE)}
+        assert roles == {"manager", "owner"}          # rows already shown
+        assert "other.eth" in panel._items_by_name    # disowned NOT dropped
+
+    def test_fast_then_verified_earns_the_green(self, qtbot):
+        from qeth.plugins.ens import _STATUS_ROLE
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "39" * 20
+        panel.populate(build_tree([EnsName("crv.eth", source="owned")]), NOW)
+        st = {"crv.eth": OwnershipCheck(controller=me, registrant=me,
+                                        owner_known=True)}
+        panel.mark_verified(st, me, verified=False)
+        crv = panel._items_by_name["crv.eth"]
+        assert crv.data(0, _STATUS_ROLE) != "ok"
+        mgr = next(crv.child(i) for i in range(crv.childCount())
+                   if crv.child(i).text(0) == "manager")
+        assert mgr.data(0, _STATUS_ROLE) != "ok"      # row unbadged on fast pass
+        panel.mark_verified(st, me, verified=True)
+        assert crv.data(0, _STATUS_ROLE) == "ok"      # now proven
+        mgr = next(crv.child(i) for i in range(crv.childCount())
+                   if crv.child(i).text(0) == "manager")
+        assert mgr.data(0, _STATUS_ROLE) == "ok"
+
+    def test_states_agree(self):
+        from qeth.plugins.ens import _states_agree
+        a = {"x.eth": OwnershipCheck(controller="0xAA", registrant="0xBB")}
+        b = {"x.eth": OwnershipCheck(controller="0xaa", registrant="0xbb")}
+        c = {"x.eth": OwnershipCheck(controller="0xCC", registrant="0xBB")}
+        assert _states_agree(a, b)                     # case-insensitive
+        assert not _states_agree(a, c)
+
+    def test_verify_worker_fast_then_catches_up(self, monkeypatch):
+        import qeth.plugins.ens as ens
+        new = {"crv.eth": OwnershipCheck(controller="0x394", registrant="0x394",
+                                         owner_known=True)}
+        old = {"crv.eth": OwnershipCheck(controller="0x7a", registrant="0x394",
+                                         owner_known=True)}
+        seq = [(old, True), (new, True)]
+        monkeypatch.setattr(ens, "read_name_states", lambda c, n: new)
+        monkeypatch.setattr(ens, "verify_names",
+                            lambda c, n, wait_s=0: seq.pop(0))
+        monkeypatch.setattr(ens, "_VERIFY_CATCHUP_DELAY_S", 0.0)
+        w = ens.EnsVerifyWorker(None, "0x394", ["crv.eth"], catchup=True)
+        emits = []
+        w.ready.connect(lambda a, s, v: emits.append((v, s["crv.eth"].controller)))
+        w.run()
+        assert emits[0] == (False, "0x394")    # fast, fresh — shown at once
+        assert emits[-1] == (True, "0x394")    # verified, caught up (not 0x7a)
+
     def _role_rows(self, item):
         """The manager/owner rows under a name → {label: shown-address}."""
         return {item.child(i).text(0): item.child(i).text(2)
@@ -1083,7 +1153,7 @@ class TestEnsWriteActions:
     def test_subdomain_confirmation_rediscovers(self, qtbot, monkeypatch):
         plugin, host, store = self._plugin(qtbot)
         refreshed: list = []
-        monkeypatch.setattr(plugin, "_on_refresh", lambda: refreshed.append(True))
+        monkeypatch.setattr(plugin, "_on_refresh", lambda **k: refreshed.append(True))
         plugin._add_subdomain("vitalik.eth")
         _name, _op, _chain, _from, on_confirmed = host.ens_ops[0]
         on_confirmed({"status": "0x1"})
@@ -1167,7 +1237,7 @@ class TestEnsWriteActions:
         plugin, host, store = self._plugin(qtbot)
         plugin._names_by_l["vitalik.eth"].expiry_ts = self.OWNED_EXP
         refreshed: list = []
-        plugin._on_refresh = lambda: refreshed.append(True)
+        plugin._on_refresh = lambda **k: refreshed.append(True)
         plugin._renew("vitalik.eth")
         _name, _op, _chain, _from, on_confirmed = host.ens_ops[0]
         on_confirmed({"status": "0x1"})
@@ -1249,7 +1319,7 @@ class TestEnsWriteActions:
     def test_transfer_confirmation_rediscovers(self, qtbot):
         plugin, host, store = self._plugin(qtbot)
         refreshed: list = []
-        plugin._on_refresh = lambda: refreshed.append(True)
+        plugin._on_refresh = lambda **k: refreshed.append(True)
         plugin._transfer("vitalik.eth")
         _name, _op, _chain, _from, on_confirmed = host.ens_ops[0]
         on_confirmed({"status": "0x1"})
