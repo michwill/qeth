@@ -279,6 +279,19 @@ restarts. UI changes persist; RPC chain switches are session-only.
   Etherscan has the same data but paywalls it behind PRO
   (`module=nametag` → "API Exclusive endpoint"). Response: `addresses[CHECKSUM].tags[]`,
   each `{name, tagType, ordinal}`; use `tagType=="name"`, highest ordinal.
+- **ENS name discovery** — two keyless sources, merged in `EnsNamesWorker`.
+  **BENS** (`bens.services.blockscout.com/api/v1/{chainId}/addresses:lookup?owned_by=true`)
+  is keyed on the registry **controller** (the `owner` field; it does *not*
+  populate `registrant`), so it misses a name you hold as the registrant (the
+  NFT) but whose manager is delegated elsewhere — a common DAO setup, e.g.
+  crv.eth (owner 0x7a16…, manager 0x3941…). To close that gap qeth enumerates
+  the BaseRegistrar (`0x57f1…ea85`) ERC-721s the address holds via Blockscout's
+  NFT API (`/api/v2/addresses/{addr}/nft?type=ERC-721`; tokenId =
+  uint256(labelhash), no name in the metadata) and reverses each tokenId to a
+  name via the **ENS metadata service** (`metadata.ens.domains/mainnet/{registrar}/{tokenId}`
+  → `{name}`). Mainnet only; skips labelhashes BENS already returned. Wrapped
+  names need neither path — BENS returns them with `owner=NameWrapper` because
+  it matches on the wrapped owner internally. See `lookup_registrant_names`.
 - **Curve** — official domain is `curve.finance` (**not** `curve.fi`,
   which 404s on most paths I tried). API base
   `https://api.curve.finance/v1/`, OpenAPI spec at

@@ -267,8 +267,21 @@ class EnsNamesWorker(QThread):
         self._custom = list(custom_names)
 
     def run(self) -> None:
+        from ..ens_app import (
+            _is_eth_2ld, _labelhash, lookup_registrant_names,
+        )
         names = lookup_owned_names(ENS_CHAIN_ID, self._address)
         have = {n.name.lower() for n in names}
+        # Names held as the registrant but managed elsewhere — BENS's
+        # controller-keyed sweep misses these (e.g. crv.eth). Skip the .eth
+        # labelhashes BENS already returned so we only resolve the gap.
+        skip = {int.from_bytes(_labelhash(n.name.split(".")[0]), "big")
+                for n in names if _is_eth_2ld(n.name)}
+        for n in lookup_registrant_names(ENS_CHAIN_ID, self._address,
+                                         skip_labelhashes=skip):
+            if n.name.lower() not in have:
+                have.add(n.name.lower())
+                names.append(n)
         for cn in self._custom:
             if cn.lower() in have:
                 continue

@@ -68,6 +68,37 @@ class _StubStore:
 
 # --- EnsPanel --------------------------------------------------------------
 
+class TestEnsNamesWorker:
+    def test_merges_registrant_only_names(self, monkeypatch):
+        # BENS gives the controller-owned names; the registrant sweep adds the
+        # ones it misses (crv.eth), deduped, with its skip-set excluding the
+        # .eth labelhashes BENS already returned.
+        import qeth.ens_app as ea
+        from qeth.plugins.ens import EnsNamesWorker
+
+        monkeypatch.setattr(
+            "qeth.plugins.ens.lookup_owned_names",
+            lambda cid, addr: [EnsName("curvelend.eth"), EnsName("qeth.eth")])
+        captured = {}
+
+        def fake_registrant(cid, addr, *, skip_labelhashes):
+            captured["skip"] = skip_labelhashes
+            # returns crv.eth (new) + curvelend.eth (dup, must be dropped)
+            return [EnsName("crv.eth", source="owned"),
+                    EnsName("curvelend.eth")]
+        monkeypatch.setattr(ea, "lookup_registrant_names", fake_registrant)
+
+        worker = EnsNamesWorker("0xabc", [])
+        got = {}
+        worker.ready.connect(lambda a, ns: got.update(addr=a, names=ns))
+        worker.run()
+        names = sorted(n.name for n in got["names"])
+        assert names == ["crv.eth", "curvelend.eth", "qeth.eth"]   # deduped
+        # the skip-set held the labelhashes of the BENS .eth 2LDs
+        assert int.from_bytes(ea._labelhash("curvelend"), "big") in captured["skip"]
+        assert int.from_bytes(ea._labelhash("qeth"), "big") in captured["skip"]
+
+
 class TestEnsPanel:
     def test_populate_nests_subdomains_under_parent(self, qtbot):
         panel = EnsPanel()

@@ -304,6 +304,98 @@ def lookup_owned_names(
     return out
 
 
+# BENS's owned_by sweep is keyed on the registry *controller*, so a .eth name
+# you hold as the registrant (the NFT) but whose manager is delegated elsewhere
+# — a common DAO/multisig setup, e.g. crv.eth — never shows up there. We close
+# that gap by enumerating the BaseRegistrar ERC-721s the address holds
+# (Blockscout, keyless) and turning each tokenId (== uint256(labelhash)) back
+# into a name via the ENS metadata service. Mainnet only — .eth registrations
+# live on L1. (Wrapped names are already covered: BENS returns them with
+# owner=NameWrapper because it matches on the wrapped owner.)
+BLOCKSCOUT_MAINNET = "https://eth.blockscout.com"
+ENS_METADATA_BASE = "https://metadata.ens.domains/mainnet"
+
+
+def _registrar_token_ids(
+    address: str, *,
+    base_url: str = BLOCKSCOUT_MAINNET,
+    get_json: Callable[[str], dict] = _http_get_json,
+    max_pages: int = 10,
+) -> list[int]:
+    """The BaseRegistrar ERC-721 tokenIds (== uint256(labelhash)) ``address``
+    holds, via Blockscout's NFT-ownership API (keyless, paginated). Tolerant:
+    returns what it gathered on any error."""
+    out: list[int] = []
+    reg = ENS_ETH_REGISTRAR.lower()
+    base = f"{base_url}/api/v2/addresses/{address}/nft"
+    url = f"{base}?" + urllib.parse.urlencode({"type": "ERC-721"})
+    for _ in range(max_pages):
+        try:
+            d = get_json(url)
+        except Exception as e:
+            log.debug("Blockscout NFT lookup failed (%s): %s", address, e)
+            break
+        for it in d.get("items") or []:
+            tok = it.get("token") or {}
+            addr = tok.get("address") or tok.get("address_hash") or ""
+            if addr.lower() != reg:
+                continue
+            tid = it.get("id")
+            try:
+                out.append(int(tid))
+            except (TypeError, ValueError):
+                continue
+        npp = d.get("next_page_params")
+        if not isinstance(npp, dict):
+            break
+        url = f"{base}?" + urllib.parse.urlencode(npp)
+    return out
+
+
+def _ens_metadata_name(
+    token_id: int, *,
+    base_url: str = ENS_METADATA_BASE,
+    registrar: str = ENS_ETH_REGISTRAR,
+    get_json: Callable[[str], dict] = _http_get_json,
+) -> str | None:
+    """Reverse a BaseRegistrar tokenId to its ``.eth`` name via the ENS metadata
+    service (``metadata.ens.domains``). None on any failure."""
+    url = f"{base_url}/{registrar}/{token_id}"
+    try:
+        d = get_json(url)
+    except Exception as e:
+        log.debug("ENS metadata lookup failed (%s): %s", token_id, e)
+        return None
+    name = d.get("name")
+    return str(name) if name else None
+
+
+def lookup_registrant_names(
+    chain_id: int, address: str, *,
+    skip_labelhashes: set[int] | None = None,
+    get_json: Callable[[str], dict] = _http_get_json,
+) -> list[EnsName]:
+    """Unwrapped ``.eth`` names ``address`` holds as the *registrant* (NFT
+    owner) — the ones BENS's controller-keyed sweep misses. Enumerates the
+    BaseRegistrar NFTs held, skipping any tokenId already found via BENS
+    (``skip_labelhashes`` = those names' uint256 labelhashes) to avoid redundant
+    metadata calls, then resolves each remaining tokenId to a name. Mainnet
+    only; tolerant of every failure (a hint, never blocking)."""
+    if chain_id != 1:
+        return []
+    skip = skip_labelhashes or set()
+    out: list[EnsName] = []
+    seen: set[str] = set()
+    for tid in _registrar_token_ids(address, get_json=get_json):
+        if tid in skip:
+            continue
+        name = _ens_metadata_name(tid, get_json=get_json)
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(EnsName(name, source="owned"))
+    return out
+
+
 def fetch_name(
     chain_id: int, name: str, *,
     base_url: str = BENS_BASE,

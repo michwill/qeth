@@ -78,6 +78,60 @@ def test_lookup_tolerates_errors():
     assert ea.lookup_owned_names(1, "0xabc", get_json=boom) == []
 
 
+def test_registrar_token_ids_filters_and_paginates():
+    reg = ea.ENS_ETH_REGISTRAR
+    other = "0x" + "ee" * 20
+    pages = {
+        1: {"items": [{"id": "11", "token": {"address": reg}},
+                      {"id": "22", "token": {"address": other}}],   # not the registrar
+            "next_page_params": {"page": "2"}},
+        2: {"items": [{"id": "33", "token": {"address_hash": reg.lower()}}],
+            "next_page_params": None},
+    }
+
+    def fake_get(url):
+        return pages[2] if "page=2" in url else pages[1]
+
+    ids = ea._registrar_token_ids("0xabc", get_json=fake_get)
+    assert ids == [11, 33]              # the non-registrar token dropped
+
+
+def test_lookup_registrant_names_skips_known_and_resolves():
+    reg = ea.ENS_ETH_REGISTRAR
+    # crv (the gap) + vitalik (already found via BENS → skipped).
+    crv_id = int.from_bytes(ea._labelhash("crv"), "big")
+    vit_id = int.from_bytes(ea._labelhash("vitalik"), "big")
+    nft = {"items": [{"id": str(crv_id), "token": {"address": reg}},
+                     {"id": str(vit_id), "token": {"address": reg}}],
+           "next_page_params": None}
+
+    calls = []
+
+    def fake_get(url):
+        if "/nft" in url:
+            return nft
+        calls.append(url)                # only the unknown tokenId resolves
+        return {"name": "crv.eth"}
+
+    names = ea.lookup_registrant_names(
+        1, "0xabc", skip_labelhashes={vit_id}, get_json=fake_get)
+    assert [n.name for n in names] == ["crv.eth"]
+    assert names[0].source == "owned"
+    assert len(calls) == 1 and str(crv_id) in calls[0]   # vitalik never fetched
+
+
+def test_lookup_registrant_names_mainnet_only():
+    def boom(url):
+        raise AssertionError("should not hit the network off mainnet")
+    assert ea.lookup_registrant_names(10, "0xabc", get_json=boom) == []
+
+
+def test_lookup_registrant_names_tolerates_errors():
+    def boom(url):
+        raise RuntimeError("blockscout down")
+    assert ea.lookup_registrant_names(1, "0xabc", get_json=boom) == []
+
+
 def test_fetch_name_marks_custom():
     def fake_get(url):
         assert "domains/vitalik.eth" in url
