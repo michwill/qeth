@@ -4654,6 +4654,81 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         if pix is not None and not pix.isNull():
             _set_coin_pixmap(self._to_icon_label, pix)
 
+    def _build_to_row(self, to_addr: str | None, from_addr: str,
+                      chain, mono: QFont) -> QWidget:
+        """Render a "To:" field for a *fixed* destination address (the dapp
+        Sign flow): contract-creation placeholder, a known ERC-20's
+        icon + symbol + linked-contract row, or a plain linked address.
+        Async icon updates land in ``_on_to_icon_ready``."""
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        if not to_addr:
+            label = QLabel("(contract creation)")
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setFont(mono)
+            row.addWidget(label)
+            row.addStretch(1)
+            return container
+
+        addr = to_checksum_address(to_addr)
+        from_cs = to_checksum_address(from_addr)
+        entry = (self._token_info(chain.chain_id, addr)
+                 if self._token_info is not None else None)
+
+        if entry is not None:
+            self._to_addr_lower = addr.lower()
+            self._to_icon_label = QLabel()
+            self._to_icon_label.setFixedSize(20, 20)
+            row.addWidget(self._to_icon_label)
+
+            token_url = self._explorer_url(
+                "token", addr, ref_addr=from_cs,
+            )
+            if token_url:
+                addr_html = (
+                    f'<a href="{_escape_html(token_url)}" '
+                    f'style="color: {self._link_color}; '
+                    f'text-decoration: underline; '
+                    f'font-family: monospace;">'
+                    f"{_escape_html(addr)}</a>"
+                )
+            else:
+                addr_html = (
+                    f'<span style="font-family: monospace;">'
+                    f"{_escape_html(addr)}</span>"
+                )
+            label = QLabel(
+                f"{_escape_html(entry.symbol)} ({addr_html})"
+            )
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setOpenExternalLinks(True)
+            label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            _install_copy_menu(label, addr, token_url)
+            row.addWidget(label, 1)
+
+            if self._icon_cache is not None:
+                pix = self._icon_cache.get(chain.chain_id, addr)
+                if pix is not None and not pix.isNull():
+                    _set_coin_pixmap(self._to_icon_label, pix)
+                else:
+                    self._icon_cache.icon_ready.connect(self._on_to_icon_ready)
+                    self._icon_cache.request(
+                        chain.chain_id, addr, entry.logo_uri,
+                    )
+        else:
+            row.addWidget(
+                self._link_label(addr,
+                                 self._explorer_url("address", addr),
+                                 monospace=True),
+                1,
+            )
+        return container
+
     # --- address-book picker ---------------------------------------
 
     def _make_address_field(self, initial: str = "") -> tuple[QWidget, QLineEdit]:
@@ -4880,22 +4955,24 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         ...
 
 
-class SignTransactionDialog(_EventPreviewMixin, Dialog):
+class SignTransactionDialog(_TxComposerDialog):
     """Confirmation dialog for an incoming ``eth_sendTransaction``
-    from the Frame RPC. Reuses the decoded-call renderer used by the
-    history details dialog, and exposes editable gas / fee fields
-    pre-filled by ``GasSuggestionWorker``.
+    from the Frame RPC (and the speed-up / cancel replace flow).
+
+    A thin subclass of ``_TxComposerDialog``: the shell, gas/fee
+    machinery, decoded view, fee summary, signing flow and the
+    replace-mode fee-floor / fixed-nonce clamp all live on the base.
+    This class supplies the fixed-``req`` request, its header rows
+    (Requested-by / To / Contract / Value) and the *async* decoded
+    call (arbitrary dapp calldata, so it fetches the contract ABI
+    with a 4-byte signature-DB fallback rather than a synthetic tree).
 
     The dialog is driven asynchronously by the host: clicking
-    "Confirm and sign" emits ``sign_requested`` (rather than
+    "Confirm and Sign" emits ``sign_requested`` (rather than
     closing the dialog). The host runs signing on a worker; on
     success it calls ``accept()``; on failure it pops an error
     parented to the still-open dialog and calls
     ``set_signing_in_progress(False)`` so the user can retry."""
-
-    # User clicked Confirm and sign. The dialog stays open;
-    # caller does the signing on a worker.
-    sign_requested = Signal()
 
     def __init__(self, req: SigningRequest, chain, *,
                  abi_source: AnyAbiSource | None,
@@ -4916,119 +4993,64 @@ class SignTransactionDialog(_EventPreviewMixin, Dialog):
                  sim_floor_provider:
                      Callable[[int, str], int | None] | None = None,
                  parent=None):
-        super().__init__(parent)
+        # Sign-specific state the base __init__ touches while it runs our
+        # header/decoded hooks — must be set before super().__init__().
         self.req = req
-        self.chain = chain
-        self._abi_source = abi_source
-        self._abi_cache = abi_cache
-        self._identity_source = identity_source
-        self._identity_cache = (
-            identity_cache if identity_cache is not None
-            else ContractIdentityCache())
-        self._tx_cache = tx_cache
-        self._nonce_floor_provider = nonce_floor_provider
-        self._start_worker = start_worker
-        self._token_info = token_info
-        self._known_addresses = {a.lower() for a in (known_addresses or ())}
-        # Same shape as in TransactionDetailsDialog: when the
-        # recipient is a known ERC-20, _build_to_row renders an
-        # icon + symbol + linked-address. Async icon updates land
-        # in _on_to_icon_ready, which checks these two attrs to
-        # know which row to repaint.
-        self._icon_cache = icon_cache
-        self._to_icon_label: QLabel | None = None
-        self._to_addr_lower: str | None = None
-        # Decimal USD-per-native price (e.g. ETH price); when set,
-        # the Expected-fee line shows a "(0.015 USD)" annotation.
-        # None when no cached price is available — the line just
-        # omits the USD parenthetical, no other behaviour changes.
-        self._native_price_usd = native_price_usd
-        # Filled in by _on_gas_suggested; the Confirm button stays
-        # disabled until then so the user can't submit with
-        # uninitialised fee fields.
-        self._gas_ready = False
-        # Captured from the suggestion so _update_expected_fee can
-        # combine baseFee + the (user-editable) priority tip to
-        # produce the "expected" rate.
-        self._base_fee_wei = 0
-        # The node's own gas estimate — what the chain will actually
-        # charge for a successful tx. The spinner's value (gas LIMIT)
-        # is a ceiling per the project's × 1.5 / dapp-floor policy;
-        # using the limit in the expected-fee math overstates by 50 %
-        # or more. We hold the estimate separately and use it (or the
-        # spinner if the user manually lowered it below the estimate)
-        # for the live "Expected fee" line.
-        self._estimated_gas = 0
-        # Replace-mode (speed up / cancel a pending tx): lock the nonce to
-        # the pending tx's, and clamp the suggested fees up to a floor so
-        # the node accepts the same-nonce replacement.
+        self._replace_label = replace_label
+        # The decode is one-shot (req is fixed); guard so the base calling
+        # _refresh_decoded_view() again from _update_state (post gas) doesn't
+        # re-kick the AbiFetchWorker and stomp a completed decode.
+        self._decode_kicked = False
+        super().__init__(
+            chain,
+            to_checksum_address(req.from_addr) if req.from_addr else req.from_addr,
+            title=replace_label or "Sign Transaction",
+            confirm_text="&Replace and Sign" if replace_label
+                         else "&Confirm and Sign",
+            # Checkmark icon — universal "approve"; same resolution chain as
+            # before (emblem-ok › dialog-ok-apply › SP_DialogApplyButton).
+            confirm_icon_names=("emblem-ok", "dialog-ok-apply"),
+            confirm_fallback=QStyle.StandardPixmap.SP_DialogApplyButton,
+            abi_source=abi_source, abi_cache=abi_cache,
+            start_worker=start_worker, token_info=token_info,
+            icon_cache=icon_cache, native_price_usd=native_price_usd,
+            known_addresses=known_addresses,
+            identity_source=identity_source, identity_cache=identity_cache,
+            tx_cache=tx_cache, nonce_floor_provider=nonce_floor_provider,
+            sim_floor_provider=sim_floor_provider,
+            parent=parent,
+        )
+        # Replace-mode (speed up / cancel a pending tx): lock the nonce to the
+        # pending tx's and clamp the suggested fees up to a floor so the node
+        # accepts the same-nonce replacement. The base reset these to None
+        # during __init__; set them now, before the gas suggestion lands.
         self._fixed_nonce = fixed_nonce
         self._fee_floor = fee_floor
-        self._replace_label = replace_label
+        # The request is fixed, so estimate gas immediately (Send waits for a
+        # recipient; here we have everything).
+        self._kick_gas(self.req)
 
-        self.setWindowTitle(replace_label or "Sign Transaction")
-        self.resize(720, 640)
-        self._link_color = self.palette().color(QPalette.ColorRole.WindowText).name()
+    # --- header rows (base hook) -----------------------------------
 
-        # Tabbed shell: the existing detail widgets live on a "Details"
-        # page; the mixin appends an "Events" page that previews the tx's
-        # logs via local simulation. Buttons sit below the tabs, on the
-        # dialog's own (root) layout, so they're shared across tabs.
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 16)
-        root.setSpacing(8)
-        self._tabs = QTabWidget()
-        root.addWidget(self._tabs, 1)
-        _details_page = QWidget()
-        outer = QVBoxLayout(_details_page)
-        outer.setContentsMargins(0, 6, 0, 0)
-        outer.setSpacing(8)
-        self._tabs.addTab(_details_page, "&Details")
-
-        # --- header block (Network / From / To / Value) -----------------
-        header = QFormLayout()
-        header.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        header.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        header.setHorizontalSpacing(16)
-        header.setVerticalSpacing(6)
-        outer.addLayout(header)
-
-        mono = QFont("monospace")
-        self._mono_font = mono
-
-        def _lbl(text: str, *, monospace: bool = False) -> QLabel:
-            q = QLabel(text)
-            q.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            if monospace:
-                q.setFont(mono)
-            q.setWordWrap(True)
-            return q
-
-        from_cs = to_checksum_address(req.from_addr)
-        # "Requested by:" — the caller's Origin (typically the dapp
-        # URL). Only shown when the RPC layer captured one; local-
-        # send flows leave this None and the row is hidden so the
-        # user doesn't see "Requested by: None".
+    def _build_header_rows(self, header: QFormLayout, outer) -> None:
+        req = self.req
+        mono = self._mono_font
+        # "Requested by:" — the caller's Origin (typically the dapp URL).
+        # Only shown when the RPC layer captured one; local flows leave this
+        # None and the row is hidden. Inserted above the base's Network/From
+        # rows so it stays at the top of the header, as before.
         if req.origin:
-            header.addRow(
-                "Requested by:",
-                self._link_label(req.origin, req.origin),
+            header.insertRow(
+                0, "Requested by:", self._link_label(req.origin, req.origin),
             )
-        header.addRow("Network:", _lbl(f"{chain.name} ({chain.chain_id})"))
         header.addRow(
-            "From:",
-            self._link_label(from_cs,
-                             self._explorer_url("address", from_cs),
-                             monospace=True),
-        )
-        header.addRow(
-            "To:", self._build_to_row(req.to_addr, req.from_addr, chain, mono),
+            "To:", self._build_to_row(req.to_addr, req.from_addr, self.chain, mono),
         )
         _id_label, _id_kick = _make_identity_row(
-            to_addr=req.to_addr, chain=chain,
+            to_addr=req.to_addr, chain=self.chain,
             identity_source=self._identity_source,
             identity_cache=self._identity_cache,
-            my_addresses=known_addresses or [],
+            my_addresses=self._known_addresses_list,
             start_worker=self._start_worker, tx_cache=self._tx_cache)
         if _id_label is not None and _id_kick is not None:
             header.addRow("Contract:", _id_label)
@@ -5037,139 +5059,28 @@ class SignTransactionDialog(_EventPreviewMixin, Dialog):
             ether = wei_to_ether(req.value_wei)
             header.addRow(
                 "Value:",
-                _lbl(f"{ether} {chain.symbol}  ({req.value_wei} wei)"),
+                self._value_label(
+                    f"{ether} {self.chain.symbol}  ({req.value_wei} wei)"),
             )
         else:
-            header.addRow("Value:", _lbl("0"))
+            header.addRow("Value:", self._value_label("0"))
 
-        # --- decoded calldata (read-only, syntax-highlighted) ---------
-        outer.addSpacing(4)
-        outer.addWidget(QLabel("Decoded call:"))
-        self.decoded_view = QTextEdit()
-        self.decoded_view.setReadOnly(True)
-        self.decoded_view.setFont(mono)
-        self.decoded_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.decoded_view.setWordWrapMode(
-            QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
-        )
-        self.decoded_view.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
-        )
-        outer.addWidget(self.decoded_view, 1)
+    # --- decoded call (base hook) — async, Sign-specific -----------
 
-        # --- gas / fee editors ---------------------------------------
-        # The auto gas policy is sensible, so the editable controls live
-        # behind a collapsed "Gas settings" expander (progressive
-        # disclosure). The Expected fee summary stays visible below it.
-        outer.addSpacing(4)
-        self._gas_section = _CollapsibleSection("Gas settings")
-        gas_form = QFormLayout()
-        gas_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        gas_form.setHorizontalSpacing(16)
-
-        self.spin_gas = QSpinBox()
-        self.spin_gas.setRange(21_000, _GAS_LIMIT_MAX)
-        self.spin_gas.setSingleStep(1_000)
-        self.spin_gas.setSuffix(" gas")
-        self.spin_gas.setEnabled(False)
-        gas_form.addRow("Gas limit:", self.spin_gas)
-
-        # Exactly one fee mode is populated; the other three stay None.
-        self.spin_max_fee: QDoubleSpinBox | None
-        self.spin_priority: QDoubleSpinBox | None
-        self.spin_gas_price: QDoubleSpinBox | None
-        if chain.eip1559:
-            self.spin_max_fee = QDoubleSpinBox()
-            self.spin_max_fee.setRange(0.0, _GWEI_MAX)
-            self.spin_max_fee.setDecimals(4)
-            self.spin_max_fee.setSingleStep(0.5)
-            self.spin_max_fee.setSuffix(" gwei")
-            self.spin_max_fee.setEnabled(False)
-            gas_form.addRow("Max fee / gas:", self.spin_max_fee)
-
-            self.spin_priority = QDoubleSpinBox()
-            self.spin_priority.setRange(0.0, _GWEI_MAX)
-            self.spin_priority.setDecimals(4)
-            self.spin_priority.setSingleStep(0.1)
-            self.spin_priority.setSuffix(" gwei")
-            self.spin_priority.setEnabled(False)
-            gas_form.addRow("Max priority / gas:", self.spin_priority)
-            self.spin_gas_price = None
-        else:
-            assert self.spin_gas_price is not None
-            self.spin_max_fee = None
-            self.spin_priority = None
-            self.spin_gas_price = QDoubleSpinBox()
-            self.spin_gas_price.setRange(0.0, _GWEI_MAX)
-            self.spin_gas_price.setDecimals(4)
-            self.spin_gas_price.setSingleStep(0.5)
-            self.spin_gas_price.setSuffix(" gwei")
-            self.spin_gas_price.setEnabled(False)
-            gas_form.addRow("Gas price:", self.spin_gas_price)
-
-        self.base_fee_lbl = _lbl("(fetching…)")
-        gas_form.addRow("Network base fee:", self.base_fee_lbl)
-        self._gas_section.set_content_layout(gas_form)
-        outer.addWidget(self._gas_section)
-
-        # Always-visible fee summary (the number the user actually
-        # decides on; the editable knobs above are the detail).
-        summary = QFormLayout()
-        summary.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        summary.setHorizontalSpacing(16)
-        self.max_total_lbl = _lbl("—")
-        summary.addRow("Expected fee:", self.max_total_lbl)
-        outer.addLayout(summary)
-
-        # --- buttons -------------------------------------------------
-        self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel,
-        )
-        self.confirm_btn = self.buttons.addButton(
-            "&Replace and Sign" if replace_label else "&Confirm and Sign",
-            QDialogButtonBox.ButtonRole.AcceptRole,
-        )
-        # Checkmark icon — universal "approve". Distinguishes the
-        # primary action visually from Cancel, which Qt themes
-        # generally render with an ×.
-        _ok_icon = QIcon.fromTheme(
-            "emblem-ok",
-            QIcon.fromTheme(
-                "dialog-ok-apply",
-                QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton),
-            ),
-        )
-        if not _ok_icon.isNull() and _ok_icon.availableSizes():
-            self.confirm_btn.setIcon(_ok_icon)
-        self.confirm_btn.setEnabled(False)
-        self.buttons.rejected.connect(self.reject)
-        # Emit a request signal rather than accept()ing here. The
-        # host runs signing on a worker while the dialog stays
-        # visible; on failure the host pops a popup parented to
-        # this dialog and re-enables the confirm button so the
-        # user can fix the device and retry without losing the
-        # dialog state. The host calls dialog.accept() only on
-        # successful broadcast.
-        self.confirm_btn.clicked.connect(self.sign_requested.emit)
-
-        # --- events preview tab (lazy local simulation) --------------
-        self._init_event_preview(self._tabs, known_addresses=known_addresses,
-                                 sim_floor_provider=sim_floor_provider)
-        # Run the preview up front so a predicted revert warns before the user
-        # opens the Events tab. (Send dialog: a no-op until inputs are valid;
-        # its recipient/amount edits re-kick it.)
-        self.request_simulation()
-
-        root.addWidget(self.revert_banner())
-        root.addWidget(self.buttons)
-
-        # --- decode calldata in the background ----------------------
+    def _refresh_decoded_view(self) -> None:
+        """Kick the background decode of the dapp's (arbitrary) calldata.
+        One-shot: the request is fixed, so re-entry (the base calls this
+        again from _update_state once gas lands) is a no-op."""
+        if self._decode_kicked:
+            return
+        self._decode_kicked = True
+        req = self.req
         if (req.data and req.data not in ("0x", "0X") and req.to_addr
                 and self._abi_source is not None):
             self.decoded_view.setPlainText("(decoding…)")
             worker = AbiFetchWorker(
                 self._abi_source, self._abi_cache,
-                chain.chain_id, req.to_addr,
+                self.chain.chain_id, req.to_addr,
             )
             worker.ready.connect(self._on_abi_ready)
             self._start_worker(worker)
@@ -5177,31 +5088,6 @@ class SignTransactionDialog(_EventPreviewMixin, Dialog):
             self.decoded_view.setPlainText("(contract creation — no method call)")
         else:
             self.decoded_view.setPlainText("(plain value transfer — no calldata)")
-
-        # --- kick the gas suggestion --------------------------------
-        floor = (self._nonce_floor_provider(chain.chain_id, req.from_addr)
-                 if self._nonce_floor_provider is not None else None)
-        gas_worker = GasSuggestionWorker(chain, req, nonce_floor=floor)
-        gas_worker.suggested.connect(self._on_gas_suggested)
-        gas_worker.failed.connect(self._on_gas_failed)
-        self._start_worker(gas_worker)
-
-        # Recompute the "Expected fee" line whenever the user
-        # touches an input that affects it: gas limit and either
-        # (1559) priority tip or (legacy) gas price. spin_max_fee is
-        # excluded — it caps the upper bound but doesn't change the
-        # expected effective rate (base + tip).
-        for sp in (self.spin_gas, self.spin_priority, self.spin_gas_price):
-            if sp is not None:
-                sp.valueChanged.connect(self._update_max_total)
-
-    # --- callbacks ---------------------------------------------------
-
-    def _sim_params(self):
-        """Tx params for the events preview — fixed, straight from the
-        dapp's request (the user can't edit recipient/value here)."""
-        return (self.req.from_addr, self.req.to_addr,
-                self.req.data or "0x", int(self.req.value_wei or 0))
 
     def _sim_blocked_text(self) -> str:
         return "(contract creation — no events to preview)"
@@ -5250,266 +5136,10 @@ class SignTransactionDialog(_EventPreviewMixin, Dialog):
             known_addresses=self._known_addresses,
         )
 
-    def _on_gas_suggested(self, info: dict) -> None:
-        self._base_fee_wei = int(info.get("base_fee") or 0)
-        self._estimated_gas = int(info.get("estimated_gas") or 0)
-        self.spin_gas.setValue(info["gas"])
-        self.spin_gas.setEnabled(True)
-        floor = self._fee_floor
-        if self.chain.eip1559:
-            assert self.spin_max_fee is not None and self.spin_priority is not None
-            max_fee = info["max_fee_per_gas"]
-            prio = info["max_priority_fee_per_gas"]
-            if floor is not None:   # replace-mode: never price below the bump
-                if floor.max_fee_per_gas:
-                    max_fee = max(max_fee, floor.max_fee_per_gas)
-                if floor.max_priority_fee_per_gas:
-                    prio = max(prio, floor.max_priority_fee_per_gas)
-            _set_gwei(self.spin_max_fee, max_fee)
-            self.spin_max_fee.setEnabled(True)
-            _set_gwei(self.spin_priority, prio)
-            self.spin_priority.setEnabled(True)
-        else:
-            assert self.spin_gas_price is not None
-            gp = info["gas_price"]
-            if floor is not None and floor.gas_price:
-                gp = max(gp, floor.gas_price)
-            _set_gwei(self.spin_gas_price, gp)
-            self.spin_gas_price.setEnabled(True)
-        self.base_fee_lbl.setText(
-            f"{_wei_to_gwei(self._base_fee_wei):.4f} gwei"
-        )
-        # Replace-mode locks the nonce to the pending tx's; otherwise use
-        # the chain's next-nonce from the suggestion.
-        self._suggested_nonce = (
-            self._fixed_nonce if self._fixed_nonce is not None
-            else info.get("nonce"))
-        self._gas_ready = True
-        self.confirm_btn.setEnabled(True)
-        self._update_max_total()
+    # --- request construction (base hook) --------------------------
 
-    def _on_gas_failed(self, msg: str) -> None:
-        self.base_fee_lbl.setText(f"(failed: {msg})")
-        # Confirm stays disabled — without fee info we can't submit.
-
-    def set_signing_in_progress(self, busy: bool) -> None:
-        """Lock / unlock the dialog while the host is running the
-        sign-and-broadcast worker. Locked: Confirm + Cancel + all
-        gas spinners disabled (so the user can't fire another sign
-        or close mid-flight). Unlocked: re-enable everything that
-        was enabled before, so the user can fix the device and
-        retry on failure."""
-        self.confirm_btn.setEnabled(not busy and self._gas_ready)
-        # Cancel re-enabled even mid-busy is OK — host treats it as
-        # "user gave up"; but disabling it removes a foot-gun race
-        # against the worker resolving.
-        for btn in self.buttons.buttons():
-            if btn is not self.confirm_btn:
-                btn.setEnabled(not busy)
-        self.spin_gas.setEnabled(not busy and self._gas_ready)
-        if self.chain.eip1559:
-            assert self.spin_max_fee is not None and self.spin_priority is not None
-            self.spin_max_fee.setEnabled(not busy and self._gas_ready)
-            self.spin_priority.setEnabled(not busy and self._gas_ready)
-        else:
-            assert self.spin_gas_price is not None
-            self.spin_gas_price.setEnabled(not busy and self._gas_ready)
-
-    def _update_max_total(self) -> None:
-        """Expected gas fee at the current settings — what the user
-        is actually likely to pay, not the worst-case ceiling.
-
-        Gas-side: a successful tx is only charged for ``gas_used``,
-        which the node's ``eth_estimateGas`` predicts directly. The
-        spinner shows the gas LIMIT (estimate × 1.5 by policy), so
-        using it here would overstate by 50 % or more. Use the
-        estimate, clamped by the spinner in case the user manually
-        lowered the limit below what the chain expects to consume
-        (in which case the tx will likely run out at the spinner
-        value and pay that much).
-
-        Fee-side: for EIP-1559 that's ``baseFee + priorityTip``; in
-        legacy mode it's the user-set gas price.
-
-        Doesn't include the tx's ``value`` — that's shown separately
-        in the Value row above. When the dialog has a native price
-        cached (loaded from the wallet cache by the host), the line
-        also shows the dollar value in parentheses."""
-        if not self._gas_ready:
-            return
-        gas = min(self._estimated_gas or self.spin_gas.value(),
-                  self.spin_gas.value())
-        if self.chain.eip1559:
-            assert self.spin_max_fee is not None and self.spin_priority is not None
-            effective_per_gas_wei = (
-                self._base_fee_wei + _gwei_to_wei(self.spin_priority.value())
-            )
-        else:
-            assert self.spin_gas_price is not None
-            effective_per_gas_wei = _gwei_to_wei(self.spin_gas_price.value())
-        fee_wei = gas * effective_per_gas_wei
-        text = f"≈ {wei_to_ether(fee_wei)} {self.chain.symbol}"
-        if self._native_price_usd is not None:
-            usd = wei_to_ether(fee_wei) * self._native_price_usd
-            text += f"  ({_format_usd(usd)})"
-        self.max_total_lbl.setText(text)
-
-    # --- finalised request -------------------------------------------
-
-    # ---- To: row helpers (mirror TransactionDetailsDialog so the
-    # ---- ERC-20 token row renders identically: icon + symbol +
-    # ---- linked address to /token/<addr>?a=<from>). Duplicated
-    # ---- rather than inherited because the two dialogs already
-    # ---- share enough other state to make a base class awkward.
-
-    def _link_label(self, text: str, url: str | None, *,
-                    monospace: bool = False) -> QLabel:
-        if not url:
-            lbl = QLabel(text)
-            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            if monospace:
-                lbl.setFont(self._mono_font)
-            lbl.setWordWrap(True)
-            return lbl
-        style = f"color: {self._link_color}; text-decoration: underline;"
-        if monospace:
-            style += " font-family: monospace;"
-        html = (
-            f'<a href="{_escape_html(url)}" style="{style}">'
-            f"{_escape_html(text)}</a>"
-        )
-        lbl = QLabel(html)
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        lbl.setOpenExternalLinks(True)
-        lbl.setTextInteractionFlags(
-            Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        lbl.setWordWrap(True)
-        _install_copy_menu(lbl, text, url)
-        return lbl
-
-    def _explorer_url(self, kind: str, addr: str,
-                       *, ref_addr: str | None = None) -> str | None:
-        if not self.chain.explorer or not addr:
-            return None
-        base = self.chain.explorer.rstrip("/")
-        if kind == "tx":
-            return f"{base}/tx/{addr}"
-        if kind == "address":
-            return f"{base}/address/{addr}"
-        if kind == "token":
-            url = f"{base}/token/{addr}"
-            if ref_addr:
-                url += f"?a={ref_addr}"
-            return url
-        return None
-
-    def _build_to_row(self, to_addr: str | None, from_addr: str,
-                      chain, mono: QFont) -> QWidget:
-        container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        if not to_addr:
-            label = QLabel("(contract creation)")
-            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            label.setFont(mono)
-            row.addWidget(label)
-            row.addStretch(1)
-            return container
-
-        addr = to_checksum_address(to_addr)
-        from_cs = to_checksum_address(from_addr)
-        entry = (self._token_info(chain.chain_id, addr)
-                 if self._token_info is not None else None)
-
-        if entry is not None:
-            self._to_addr_lower = addr.lower()
-            self._to_icon_label = QLabel()
-            self._to_icon_label.setFixedSize(20, 20)
-            row.addWidget(self._to_icon_label)
-
-            token_url = self._explorer_url(
-                "token", addr, ref_addr=from_cs,
-            )
-            if token_url:
-                addr_html = (
-                    f'<a href="{_escape_html(token_url)}" '
-                    f'style="color: {self._link_color}; '
-                    f'text-decoration: underline; '
-                    f'font-family: monospace;">'
-                    f"{_escape_html(addr)}</a>"
-                )
-            else:
-                addr_html = (
-                    f'<span style="font-family: monospace;">'
-                    f"{_escape_html(addr)}</span>"
-                )
-            label = QLabel(
-                f"{_escape_html(entry.symbol)} ({addr_html})"
-            )
-            label.setTextFormat(Qt.TextFormat.RichText)
-            label.setOpenExternalLinks(True)
-            label.setTextInteractionFlags(
-                Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
-            )
-            _install_copy_menu(label, addr, token_url)
-            row.addWidget(label, 1)
-
-            if self._icon_cache is not None:
-                pix = self._icon_cache.get(chain.chain_id, addr)
-                if pix is not None and not pix.isNull():
-                    _set_coin_pixmap(self._to_icon_label, pix)
-                else:
-                    self._icon_cache.icon_ready.connect(self._on_to_icon_ready)
-                    self._icon_cache.request(
-                        chain.chain_id, addr, entry.logo_uri,
-                    )
-        else:
-            row.addWidget(
-                self._link_label(addr,
-                                 self._explorer_url("address", addr),
-                                 monospace=True),
-                1,
-            )
-        return container
-
-    def _on_to_icon_ready(self, chain_id: int, contract: str) -> None:
-        if (self._to_icon_label is None
-                or self._to_addr_lower is None
-                or self._icon_cache is None):
-            return
-        if chain_id != self.chain.chain_id or contract != self._to_addr_lower:
-            return
-        pix = self._icon_cache.get(chain_id, contract)
-        if pix is not None and not pix.isNull():
-            _set_coin_pixmap(self._to_icon_label, pix)
-
-    def finalised_request(self) -> SigningRequest:
-        """Returns the SigningRequest with all gas / fee / nonce
-        fields filled from the dialog's current state — ready to
-        hand to a Signer."""
-        if not self._gas_ready:
-            raise SignerError("gas suggestion did not complete")
-        from dataclasses import replace
-        kwargs: dict = {
-            "gas": self.spin_gas.value(),
-            "nonce": self._suggested_nonce,
-        }
-        if self.chain.eip1559:
-            assert self.spin_max_fee is not None and self.spin_priority is not None
-            kwargs["max_fee_per_gas"] = _gwei_to_wei(self.spin_max_fee.value())
-            kwargs["max_priority_fee_per_gas"] = _gwei_to_wei(
-                self.spin_priority.value()
-            )
-            kwargs["gas_price"] = None
-        else:
-            assert self.spin_gas_price is not None
-            kwargs["gas_price"] = _gwei_to_wei(self.spin_gas_price.value())
-            kwargs["max_fee_per_gas"] = None
-            kwargs["max_priority_fee_per_gas"] = None
-        return replace(self.req, **kwargs)
+    def _build_request(self) -> SigningRequest:
+        return self.req
 
 
 def _erc20_transfer_calldata(recipient: str, amount_raw: int) -> str:
