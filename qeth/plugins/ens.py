@@ -477,6 +477,15 @@ class EnsPanel(QWidget):
             Qt.ShortcutContext.WidgetWithChildrenShortcut)
         copy_act.triggered.connect(self._copy_current)
         self.tree.addAction(copy_act)
+        # Enter / Return on a value row launches its editor (a record's value,
+        # or the Set-manager / Transfer dialog for the owner/manager rows).
+        edit_act = QAction(self.tree)
+        edit_act.setShortcuts([QKeySequence(Qt.Key.Key_Return),
+                               QKeySequence(Qt.Key.Key_Enter)])
+        edit_act.setShortcutContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        edit_act.triggered.connect(self._edit_current)
+        self.tree.addAction(edit_act)
         layout.addWidget(self.tree)
 
         self._domain_icon = _icon("emblem-web", QStyle.StandardPixmap.SP_DriveNetIcon)
@@ -544,7 +553,6 @@ class EnsPanel(QWidget):
         # current selection's target is cached for the button slots.
         self._cur_name: EnsName | None = None
         self._cur_value: str | None = None
-        self._cur_edit: tuple[str, str, str] | None = None
         self._build_action_buttons()
         self.tree.itemSelectionChanged.connect(self._update_action_bar)
         self._update_action_bar()
@@ -588,8 +596,10 @@ class EnsPanel(QWidget):
         self._b_addr = util(ic["addr"], "Set ETH address")
         self._b_content = util(ic["content"], "Set content (IPFS)")
         self._b_copyname = util(ic["copy"], "Copy name")
+        # Edit is the labelled primary in record mode (first, framed); Copy is
+        # the icon-only utility beside it.
+        self._b_recedit = named(ic["edit"], "&Edit", "Edit value")
         self._b_reccopy = util(ic["copy"], "Copy value")
-        self._b_recedit = util(ic["edit"], "Edit record")
         self._b_add = util(
             _icon("list-add", QStyle.StandardPixmap.SP_FileDialogNewFolder),
             "Add a name")
@@ -601,12 +611,12 @@ class EnsPanel(QWidget):
         self._b_content.clicked.connect(lambda: self._emit_name("content"))
         self._b_copyname.clicked.connect(self._copy_name)
         self._b_reccopy.clicked.connect(self._copy_value)
-        self._b_recedit.clicked.connect(self._edit_record)
+        self._b_recedit.clicked.connect(self._edit_current)
         self._b_add.clicked.connect(lambda: self.add_custom_requested.emit())
 
         self._name_btns = [self._b_transfer, self._b_renew, self._b_manager,
                            self._b_addr, self._b_content, self._b_copyname]
-        self._rec_btns = [self._b_reccopy, self._b_recedit]
+        self._rec_btns = [self._b_recedit, self._b_reccopy]
 
     def action_buttons(self) -> list[QWidget]:
         """The full button list for the slot's bottom row (selection decides
@@ -661,15 +671,51 @@ class EnsPanel(QWidget):
         val = item.data(0, _VALUE_ROLE)
         self._cur_value = None if val is None else str(val)
         self._b_reccopy.setEnabled(self._cur_value is not None)
-        # Edit only real, editable records — not the manager/owner role rows.
+        # Edit launches the right editor for the row: a record's value editor,
+        # or — for the manager/owner role rows — the Set-manager / Transfer
+        # dialog. Enabled only when that action is actually available.
+        self._b_recedit.setEnabled(self._edit_target(item) is not None)
+
+    def _edit_target(self, item: QTreeWidgetItem):
+        """What "Edit" does for ``item``: ``("record", name, label, value)`` for
+        a resolver-record row, ``("write", name, kind)`` for the manager/owner
+        role rows (kind ``manager``→reclaim, ``transfer``), or None when the row
+        isn't editable (a name row, or one this account can't change)."""
+        if item.data(0, _VALUE_ROLE) is None:
+            return None
         parent = item.parent()
         pn = parent.data(0, _NAME_ROLE) if parent is not None else None
-        editable = (not item.data(0, _OWNERSHIP_ROLE)
-                    and isinstance(pn, EnsName)
-                    and pn.name.lower() in self._writable)
-        self._cur_edit = ((pn.name, item.text(0), self._cur_value or "")
-                          if editable and isinstance(pn, EnsName) else None)
-        self._b_recedit.setEnabled(editable)
+        if not isinstance(pn, EnsName):
+            return None
+        nl = pn.name.lower()
+        if item.data(0, _OWNERSHIP_ROLE):
+            label = item.text(0)
+            if label == "manager" and nl in self._reclaimable:
+                return ("write", pn.name, "manager")
+            if label == "owner" and nl in self._transferable:
+                return ("write", pn.name, "transfer")
+            return None
+        if nl in self._writable:
+            return ("record", pn.name, item.text(0),
+                    str(item.data(0, _VALUE_ROLE)))
+        return None
+
+    def _edit_item(self, item: QTreeWidgetItem) -> None:
+        target = self._edit_target(item)
+        if target is None:
+            return
+        if target[0] == "record":
+            _kind, name, label, value = target
+            self.edit_record_requested.emit(name, label, value)
+        else:
+            _kind, name, write_kind = target
+            self.write_requested.emit(name, write_kind)
+
+    def _edit_current(self) -> None:
+        """Enter / the Edit button — edit the selected value row."""
+        sel = self.tree.selectedItems()
+        if sel:
+            self._edit_item(sel[0])
 
     def _emit_name(self, kind: str) -> None:
         if self._cur_name is not None:
@@ -703,9 +749,6 @@ class EnsPanel(QWidget):
     def _copy_value(self) -> None:
         self._copy(self._cur_value)
 
-    def _edit_record(self) -> None:
-        if self._cur_edit is not None:
-            self.edit_record_requested.emit(*self._cur_edit)
 
     # --- rendering --------------------------------------------------------
 
@@ -1018,14 +1061,17 @@ class EnsPanel(QWidget):
         elif value:
             menu.addAction(ic["copy"], "Copy value",
                            lambda: self._copy(str(value)))
-            # Record row → offer to edit it (the parent name must be writable).
-            parent = item.parent()
-            pn = parent.data(0, _NAME_ROLE) if parent is not None else None
-            if (isinstance(pn, EnsName) and pn.name.lower() in self._writable):
-                label = item.text(0)
+            # Edit launches the row's editor: a record's value, or — on the
+            # owner/manager role rows — the Transfer / Set-manager dialog.
+            target = self._edit_target(item)
+            if target is not None and target[0] == "record":
                 menu.addAction(ic["edit"], "Edit",
-                               lambda: self.edit_record_requested.emit(
-                                   pn.name, label, str(value)))
+                               lambda: self._edit_item(item))
+            elif target is not None:
+                kind = target[2]
+                label = "Set manager" if kind == "manager" else "Transfer name"
+                menu.addAction(ic[kind], label,
+                               lambda: self._edit_item(item))
         return menu
 
 

@@ -446,8 +446,8 @@ class TestEnsPanel:
         assert panel._b_reccopy.isEnabled()
         assert panel._b_recedit.isEnabled()           # parent is writable
 
-    def test_action_bar_edit_disabled_on_role_row(self, qtbot):
-        # The manager/owner rows are not editable records → Copy yes, Edit no.
+    def test_action_bar_edit_disabled_on_role_row_when_not_allowed(self, qtbot):
+        # Manager row, but the account can't reclaim → Copy yes, Edit no.
         from qeth.ens_app import OwnershipCheck
         panel, root = self._bar_panel(qtbot, writable={"crv.eth"})
         me = "0x" + "11" * 20
@@ -457,7 +457,54 @@ class TestEnsPanel:
                    if root.child(i).text(0) == "manager")
         panel.tree.setCurrentItem(mgr)
         assert panel._b_reccopy.isEnabled()
-        assert not panel._b_recedit.isEnabled()
+        assert not panel._b_recedit.isEnabled()    # not reclaimable
+
+    def test_edit_on_role_row_launches_the_right_dialog(self, qtbot):
+        # Editing the manager row → Set-manager; the owner row → Transfer.
+        from qeth.ens_app import OwnershipCheck
+        panel, root = self._bar_panel(
+            qtbot, transferable={"crv.eth"}, reclaimable={"crv.eth"})
+        me = "0x" + "11" * 20
+        panel.mark_verified({"crv.eth": OwnershipCheck(
+            controller=me, registrant=me, owner_known=True)}, me)
+        seen = []
+        panel.write_requested.connect(lambda nm, k: seen.append((nm, k)))
+        mgr = next(root.child(i) for i in range(root.childCount())
+                   if root.child(i).text(0) == "manager")
+        panel.tree.setCurrentItem(mgr)
+        assert panel._b_recedit.isEnabled()
+        panel._b_recedit.click()
+        assert seen[-1] == ("crv.eth", "manager")
+        own = next(root.child(i) for i in range(root.childCount())
+                   if root.child(i).text(0) == "owner")
+        panel.tree.setCurrentItem(own)
+        panel._b_recedit.click()
+        assert seen[-1] == ("crv.eth", "transfer")
+
+    def test_edit_on_record_row_opens_record_editor(self, qtbot):
+        panel, root = self._bar_panel(qtbot, writable={"crv.eth"})
+        panel.add_records("crv.eth", EnsRecords(texts={"url": "https://x"}))
+        url = next(root.child(i) for i in range(root.childCount())
+                   if root.child(i).text(0) == "url")
+        seen = []
+        panel.edit_record_requested.connect(
+            lambda *a: seen.append(a))
+        panel.tree.setCurrentItem(url)
+        panel._b_recedit.click()
+        assert seen == [("crv.eth", "url", "https://x")]
+
+    def test_record_mode_edit_is_named_and_first(self, qtbot):
+        panel, root = self._bar_panel(qtbot, writable={"crv.eth"})
+        assert panel._rec_btns[0] is panel._b_recedit   # Edit leads
+        assert panel._b_recedit.text() == "&Edit"       # labelled
+        assert panel._b_reccopy.text() == ""            # Copy stays icon-only
+
+    def test_enter_shortcut_registered_on_tree(self, qtbot):
+        from PySide6.QtGui import QKeySequence
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        seqs = [s for a in panel.tree.actions() for s in a.shortcuts()]
+        assert QKeySequence(Qt.Key.Key_Return) in seqs
 
     def test_ctrl_c_copies_name_record_and_role(self, qtbot):
         from PySide6.QtWidgets import QApplication
