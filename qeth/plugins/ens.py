@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, ClassVar
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from PySide6.QtCore import QDate, QEvent, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
@@ -132,12 +132,18 @@ _EXPIRY_STYLE = {
 }
 
 
-def _icon(theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
-    """A themed icon, falling back to a built-in Qt standard icon so something
-    always renders regardless of the user's icon theme."""
-    ic = QIcon.fromTheme(theme_name)
-    if not ic.isNull():
-        return ic
+def _icon(names: str | Sequence[str],
+          fallback: QStyle.StandardPixmap) -> QIcon:
+    """A themed icon, taken from the first of ``names`` the active icon theme
+    provides; falls back to a built-in Qt standard icon so something always
+    renders. Passing several names guards against a theme that lacks the primary
+    name silently collapsing distinct actions onto the same generic fallback —
+    e.g. Adwaita has no ``configure`` or ``office-calendar``, so "Set manager"
+    and "Extend" would otherwise both render as a plain document."""
+    for name in ((names,) if isinstance(names, str) else names):
+        ic = QIcon.fromTheme(name)
+        if not ic.isNull():
+            return ic
     app = QApplication.instance()
     if isinstance(app, QApplication):
         return app.style().standardIcon(fallback)
@@ -469,15 +475,24 @@ class EnsPanel(QWidget):
         self._warn_icon = _icon("dialog-warning",
                                 QStyle.StandardPixmap.SP_MessageBoxWarning)
         self._rec_icons = {
-            "address": _icon("insert-link", QStyle.StandardPixmap.SP_FileIcon),
-            "content": _icon("folder-remote", QStyle.StandardPixmap.SP_FileLinkIcon),
+            # A chain link for "points to an address". Distinct SP_FileLinkIcon
+            # last-resort so it can't collapse onto the generic document.
+            "address": _icon(
+                ("insert-link", "emblem-symbolic-link", "mail-attachment",
+                 "edit-link", "gtk-jump-to"),
+                QStyle.StandardPixmap.SP_FileLinkIcon),
+            "content": _icon(
+                ("folder-remote", "folder-publicshare", "network-server"),
+                QStyle.StandardPixmap.SP_DirLinkIcon),
             "text": _icon("text-x-generic", QStyle.StandardPixmap.SP_FileIcon),
         }
         # The two on-chain role rows. Distinct icons so manager (configures the
         # name) and owner (holds its NFT) read apart at a glance: a gear for the
         # manager, a certificate/seal for the owner.
-        self._manager_icon = _icon("configure",
-                                   QStyle.StandardPixmap.SP_FileIcon)
+        self._manager_icon = _icon(
+            ("configure", "preferences-system", "applications-system",
+             "system-run", "preferences-other"),
+            QStyle.StandardPixmap.SP_FileDialogDetailedView)
         self._owner_icon = _icon("application-certificate",
                                  QStyle.StandardPixmap.SP_FileIcon)
         # name_lower → the last verified OwnershipCheck, so the manager/owner
@@ -493,7 +508,10 @@ class EnsPanel(QWidget):
             "open": _icon("internet-web-browser", _sp.SP_DialogOpenButton),
             "copy": copy_ic,
             "edit": _icon("document-edit", _sp.SP_FileIcon),
-            "renew": _icon("office-calendar", _sp.SP_FileIcon),
+            "renew": _icon(
+                ("office-calendar", "x-office-calendar", "appointment-new",
+                 "view-calendar", "view-refresh"),
+                _sp.SP_BrowserReload),
             "transfer": _icon("go-next", _sp.SP_ArrowForward),
             "manager": self._manager_icon,
             "addr": self._rec_icons["address"],
