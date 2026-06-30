@@ -775,16 +775,27 @@ class TokensPlugin(Plugin):
                 tok.balance_updated = now
                 self._wallet_cache.save(cached)
                 return
-        # Otherwise add it — but only with metadata in hand.
-        meta = self._token_metadata.get(chain.chain_id, contract_lower)
-        if meta is None:
-            return
+        # Otherwise add it — we need symbol/name/decimals to render it. Prefer
+        # the on-chain metadata cache, but fall back to the curated token-list
+        # entry, which carries them too. That fallback is what makes a
+        # recognised inbound (CVX, USDC, …) persist even when the metadata
+        # prefill hasn't populated the cache yet — without it the token showed
+        # for a single forced refresh and then dropped back out until Blockscout
+        # caught up. Only a genuinely unknown token is skipped (the next
+        # discovery picks it up with proper metadata).
         entry = self._token_lists.get(chain.chain_id, contract_lower)
+        meta = self._token_metadata.get(chain.chain_id, contract_lower)
+        if meta is not None:
+            symbol, name, decimals = meta["symbol"], meta["name"], meta["decimals"]
+        elif entry is not None:
+            symbol, name, decimals = entry.symbol, entry.name, entry.decimals
+        else:
+            return
         cached.tokens.append(CachedToken(
             contract=contract_lower,
-            symbol=meta["symbol"],
-            name=meta["name"],
-            decimals=meta["decimals"],
+            symbol=symbol,
+            name=name,
+            decimals=decimals,
             logo_uri=entry.logo_uri if entry else None,
             balance_raw=int(delta),
             price_usd=None,

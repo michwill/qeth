@@ -2011,6 +2011,32 @@ class TestReceiptTransferScan:
         tokens_plugin.note_receipt_logs(ETH, None)
         assert tokens_plugin._receipt_contracts == {}
 
+    def test_curated_inbound_persists_without_prefilled_metadata(
+        self, tokens_plugin, monkeypatch,
+    ):
+        # A recognised (curated) inbound token credited from a receipt must
+        # persist to the wallet cache even when the on-chain metadata prefill
+        # hasn't run — using the token-list entry's symbol/name/decimals — so
+        # it doesn't show for one forced refresh then drop out again.
+        from qeth.tokenlists import TokenListEntry
+        token = "0x4e3fbd56cd56c3e72c1403e103b45db9da5b9d2b"   # CVX
+        entry = TokenListEntry(
+            chain_id=ETH.chain_id, address=token, symbol="CVX",
+            name="Convex Token", decimals=18, source="test")
+        monkeypatch.setattr(tokens_plugin._token_lists, "get",
+                            lambda cid, a: entry if a.lower() == token else None)
+        monkeypatch.setattr(tokens_plugin._token_metadata, "get",
+                            lambda cid, a: None)   # prefill hasn't populated it
+        tokens_plugin._apply_receipt_credit_to_cache(
+            ETH, self.ME.lower(), token, 5 * 10 ** 18)
+        cached = tokens_plugin._wallet_cache.load(ETH.chain_id, self.ME.lower())
+        assert cached is not None
+        held = next((t for t in cached.tokens
+                     if t.contract.lower() == token), None)
+        assert held is not None
+        assert held.symbol == "CVX" and held.decimals == 18
+        assert held.balance_raw == 5 * 10 ** 18
+
     def test_logless_receipt_from_our_wallet_refreshes_displayed_view(
         self, tokens_plugin, monkeypatch,
     ):
