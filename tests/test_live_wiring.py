@@ -295,6 +295,30 @@ def test_tokens_on_balance_dirty_throttles_for_current_view(qtbot, monkeypatch):
     assert calls == ["0xABC"]
 
 
+def test_tokens_on_balance_dirty_force_adds_recognised_token(qtbot, monkeypatch):
+    # A live Transfer of a RECOGNISED token forces it into the next discovery
+    # (the multicall set omits the full curated list), so a token received via
+    # a browser tx / airdrop surfaces without waiting minutes for Blockscout.
+    # Spam (unrecognised) tokens are NOT forced — they'd be address-poisoning.
+    from types import SimpleNamespace
+    from qeth.plugins.tokens import TokensPlugin
+    tp = TokensPlugin(Mock())
+    tp._displayed_view = (1, "0xabc")
+    monkeypatch.setattr(tp, "_refresh", lambda a: None)
+    monkeypatch.setattr(tp, "_worth_notifying_token",
+                        lambda cid, t: t.lower() == "0xcvx")
+
+    tp.on_balance_dirty(SimpleNamespace(chain_id=1), "0xABC", "0xCVX")
+    assert "0xcvx" in tp._receipt_contracts.get((1, "0xabc"), set())
+
+    tp.on_balance_dirty(SimpleNamespace(chain_id=1), "0xABC", "0xSPAM")
+    assert "0xspam" not in tp._receipt_contracts.get((1, "0xabc"), set())
+
+    # off-view dirty never forces anything in (the guard returns first).
+    tp.on_balance_dirty(SimpleNamespace(chain_id=137), "0xABC", "0xCVX")
+    assert (137, "0xabc") not in tp._receipt_contracts
+
+
 def test_tokens_sweep_slows_when_current_chain_ws_live(qtbot):
     from PySide6.QtCore import QTimer
     from qeth.plugins.tokens import TokensPlugin

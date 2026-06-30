@@ -510,6 +510,19 @@ class TokensPlugin(Plugin):
         authoritative balance (a reorg-removed log re-reads the same way)."""
         if self._displayed_view != (chain.chain_id, account.lower()):
             return
+        # The discovery multicall set deliberately omits the full curated list
+        # (~5k contracts once aborted the balance thread), so a freshly-received
+        # token that's neither a top-N major nor yet indexed by Blockscout
+        # wouldn't surface from the refresh alone — it'd wait minutes for the
+        # indexer (or a receipt scan, which only fires for txs WE signed). We
+        # have the token's address from the Transfer log, so force a RECOGNISED
+        # one straight into the next discovery — same spam filter as the
+        # notification, so address-poisoning stays out and unknown tokens still
+        # wait for the indexer exactly as before. This is what makes a token
+        # received via a browser tx (or an airdrop) appear without a refresh.
+        if token and self._worth_notifying_token(chain.chain_id, token):
+            self._receipt_contracts.setdefault(
+                (chain.chain_id, account.lower()), set()).add(token.lower())
         self._schedule_live_refresh(account)
 
     def on_native_balance(self, chain, account: str, native_wei) -> None:
