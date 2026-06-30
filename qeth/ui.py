@@ -750,6 +750,28 @@ class MainWindow(QMainWindow):
         dialog.rejected.connect(on_cancel)
         dialog.show()
 
+    def _composer_shared_kwargs(self, chain, from_addr: str) -> dict:
+        """The kwargs every transaction-composer / sign dialog needs — the
+        ABI/identity/tx-history sources, worker pump, icon + price providers,
+        the user's own addresses, and the sim/nonce floor providers. Pulled
+        once here so the Send / Speed-up / ENS / request_transaction openers
+        don't each re-spell the same block."""
+        tp = self.transactions_plugin
+        return {
+            "abi_source": tp._abi_source,
+            "abi_cache": tp._abi_cache,
+            "identity_source": tp._identity_source,
+            "identity_cache": tp._identity_cache,
+            "tx_cache": tp._disk_cache,
+            "start_worker": self.start_worker,
+            "token_info": self.token_info,
+            "icon_cache": self.icon_cache(),
+            "native_price_usd": self.native_price_usd(chain.chain_id, from_addr),
+            "known_addresses": self.account_addresses(),
+            "sim_floor_provider": tp.fork_floor_block,
+            "nonce_floor_provider": tp.pending_nonce_floor,
+        }
+
     def open_send_dialog(self, asset: dict, chain, from_addr: str) -> None:
         """Host-facing entry point used by TokensPlugin's Send
         button. Opens SendTokenDialog and runs the same worker
@@ -758,21 +780,8 @@ class MainWindow(QMainWindow):
         from .plugins.transactions import SendTokenDialog
         dialog = SendTokenDialog(
             asset, chain, from_addr,
-            abi_source=self.transactions_plugin._abi_source,
-            abi_cache=self.transactions_plugin._abi_cache,
-            identity_source=self.transactions_plugin._identity_source,
-            identity_cache=self.transactions_plugin._identity_cache,
-            tx_cache=self.transactions_plugin._disk_cache,
-            start_worker=self.start_worker,
-            token_info=self.token_info,
-            icon_cache=self.icon_cache(),
-            native_price_usd=self.native_price_usd(
-                chain.chain_id, from_addr,
-            ),
-            known_addresses=self.account_addresses(),
-            sim_floor_provider=self.transactions_plugin.fork_floor_block,
+            **self._composer_shared_kwargs(chain, from_addr),
             address_book=self.account_book(),
-            nonce_floor_provider=self.transactions_plugin.pending_nonce_floor,
             parent=self,
         )
         self._launch_sign_flow(
@@ -817,17 +826,7 @@ class MainWindow(QMainWindow):
         verb = "Cancel" if cancel else "Speed-up"
         dialog = SignTransactionDialog(
             req, chain,
-            abi_source=self.transactions_plugin._abi_source,
-            abi_cache=self.transactions_plugin._abi_cache,
-            identity_source=self.transactions_plugin._identity_source,
-            identity_cache=self.transactions_plugin._identity_cache,
-            tx_cache=self.transactions_plugin._disk_cache,
-            start_worker=self.start_worker,
-            token_info=self.token_info,
-            icon_cache=self.icon_cache(),
-            native_price_usd=self.native_price_usd(chain.chain_id, tx.from_addr),
-            known_addresses=self.account_addresses(),
-            sim_floor_provider=self.transactions_plugin.fork_floor_block,
+            **self._composer_shared_kwargs(chain, tx.from_addr),
             fixed_nonce=tx.nonce, fee_floor=floor,
             replace_label=f"{verb} Transaction",
             parent=self,
@@ -853,22 +852,20 @@ class MainWindow(QMainWindow):
         from .plugins.transactions import SignTransactionDialog
         dialog = SignTransactionDialog(
             req, chain,
-            abi_source=self.transactions_plugin._abi_source,
-            abi_cache=self.transactions_plugin._abi_cache,
-            identity_source=self.transactions_plugin._identity_source,
-            identity_cache=self.transactions_plugin._identity_cache,
-            tx_cache=self.transactions_plugin._disk_cache,
-            start_worker=self.start_worker,
-            token_info=self.token_info,
-            icon_cache=self.icon_cache(),
-            native_price_usd=self.native_price_usd(chain.chain_id, req.from_addr),
-            known_addresses=self.account_addresses(),
-            sim_floor_provider=self.transactions_plugin.fork_floor_block,
-            nonce_floor_provider=self.transactions_plugin.pending_nonce_floor,
+            **self._composer_shared_kwargs(chain, req.from_addr),
             replace_label=label,
             parent=self,
         )
+        self._launch_composer(dialog, chain, label=label,
+                              on_broadcast=on_broadcast, on_confirmed=on_confirmed)
 
+    def _launch_composer(self, dialog, chain, *, label: str,
+                         on_broadcast=None, on_confirmed=None) -> None:
+        """Drive a composer / sign-style dialog through the shared
+        sign+broadcast pipeline with status-bar feedback. ``on_confirmed`` is
+        wired (once) to the tx mining; ``on_broadcast`` fires on a successful
+        broadcast. Used by ``request_transaction`` and the ENS composer
+        opener — both build their own dialog, then hand it here."""
         def _bcast(h: str) -> None:
             self.status_message(f"{label}: {h[:12]}…", 6000)
             if on_confirmed is not None:
@@ -879,7 +876,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     import logging
                     logging.getLogger("qeth.ui").debug(
-                        "request_transaction on_broadcast failed", exc_info=True)
+                        "_launch_composer on_broadcast failed", exc_info=True)
 
         self._launch_sign_flow(
             dialog, chain,
