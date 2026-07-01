@@ -56,6 +56,20 @@ HELIOS_NETWORKS: dict[int, tuple[str, str | None]] = {
     59144: ("linea", None),
 }
 
+# Per-module flag that makes helios fetch a FRESH weak-subjectivity checkpoint
+# from external checkpoint-sync services when its cached/default one has aged
+# out. Without it, an old checkpoint — after the wallet hasn't run for a few
+# weeks, or from a months-old binary's baked-in default — makes the consensus
+# RPC answer "404 LC bootstrap unavailable"; the light client never syncs, so
+# the sidecar never reports ready and verified mode silently degrades to the
+# untrusted path. The flag is a no-op when the checkpoint is still fresh. Its
+# spelling differs by subcommand (opstack needs a fresh *Ethereum* checkpoint
+# to trustlessly fetch its unsafe-signer address); linea's module has none.
+_FALLBACK_FLAG: dict[str, str] = {
+    "ethereum": "--load-external-fallback",
+    "opstack": "--ethereum-load-external-fallback",
+}
+
 # Default install location of `heliosup` — GUI sessions often don't have
 # ~/.helios/bin on PATH.
 _HELIOSUP_BIN = os.path.expanduser("~/.helios/bin/helios")
@@ -124,6 +138,9 @@ class HeliosSidecar:
         argv = [binary, module]
         if network:
             argv += ["--network", network]
+        fallback = _FALLBACK_FLAG.get(module)
+        if fallback:
+            argv.append(fallback)   # self-heal a stale checkpoint (see _FALLBACK_FLAG)
         argv += [
             "--execution-rpc", chain.rpc_url,
             "--rpc-bind-ip", "127.0.0.1",

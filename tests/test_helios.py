@@ -129,9 +129,31 @@ def test_spawn_argv_shape():
     argv = sc._proc.argv
     assert argv[0:2] == ["/fake/helios", "opstack"]
     assert argv[2:4] == ["--network", "base"]
+    assert "--ethereum-load-external-fallback" in argv  # self-heal stale checkpoint
     assert "--execution-rpc" in argv
     assert argv[argv.index("--execution-rpc") + 1] == "https://base.example"
     assert "--rpc-port" in argv
+
+
+def test_spawn_argv_includes_checkpoint_fallback_per_module():
+    """Every Helios module that CAN self-heal a stale weak-subjectivity
+    checkpoint gets the (module-specific) external-fallback flag; the one that
+    can't (linea) gets none. Without it an aged-out checkpoint returns '404 LC
+    bootstrap unavailable' from the consensus RPC and the sidecar never syncs."""
+    cases = {
+        1:     "--load-external-fallback",           # ethereum
+        8453:  "--ethereum-load-external-fallback",  # opstack
+        59144: None,                                 # linea: no such flag
+    }
+    for chain_id, flag in cases.items():
+        sc = hl.HeliosSidecar(
+            Chain("C", chain_id, "https://rpc.example"), "/fake/helios",
+            popen=_FakeProc)
+        argv = sc._proc.argv
+        if flag is None:
+            assert not any("external-fallback" in a for a in argv), argv
+        else:
+            assert flag in argv, argv
 
 
 # --- verified_chain ------------------------------------------------------------
