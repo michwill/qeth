@@ -30,6 +30,22 @@ Done and committed:
 - **4b** — `Store.save` copies `accounts` under the lock + seq-ordered writes.
 - **3a/3g** — ENS per-generation `_epoch` drops stale discovery/verify
   landings.
+- **5d** — stale gas estimates dropped by emitting-worker identity.
+- **5e** — helios `_stop_all` snapshots under the lock; `ledger_hid.submit`
+  enqueues under the lock; `_ensure_heavy_imports` / `_ensure_async_imports`
+  publish their guard symbol last.
+
+Fixes surfaced while verifying (not in the original audit):
+- **aiohttp pycares segfault** — `--system-site-packages` gives aiohttp the
+  c-ares `AsyncResolver`, whose `pycares._run_safe_shutdown_loop` thread
+  segfaults when it overlaps the Qt event loop at teardown (latent 0/8,
+  flipped to ~87% by the 2a/2b timing shift). Forced `ThreadedResolver` in
+  `__main__` + conftest → 0/6.
+- **worker-signal lambdas** — the 5d/3a generation guards first bound their
+  generation into a lambda connected to a worker signal; a lambda isn't
+  receiver-tracked, so a worker outliving a closed dialog / torn-down plugin
+  fires into a deleted object. Reworked to bound-method connections +
+  `self.sender()` identity/epoch.
 
 Deferred / not yet done:
 - **P2 BalanceLedger (steps 1–4)** — the big consolidation; 2c/2d/finding-5
