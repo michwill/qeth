@@ -53,12 +53,24 @@ seconds.
   `window.ethereum` exists before the dapp's own scripts run.
 - Announces qeth via **EIP-6963** (`eip6963:announceProvider`) with the
   wallet name and logo, so modern dapps list it in their picker with no
-  `window.ethereum` races.
+  `window.ethereum` races. (Top frame only — see the sub-frame note below.)
 - Sets `window.ethereum.isMetaMask = true` so dapps that only wire up the
   injected wallet for MetaMask (Web3Modal / Reown AppKit / wagmi's
   `injected` connector — e.g. Holyheld) accept qeth instead of falling
   back to a WalletConnect QR. Modern dapps still get the real "qeth"
-  identity via EIP-6963, so nothing that already works regresses.
+  identity via EIP-6963, so nothing that already works regresses. (Top
+  frame only — see the sub-frame note below.)
+- **Stays inert inside cross-origin sub-frames** — most importantly a Safe
+  App running in an iframe inside the Gnosis Safe UI (`app.safe.global`).
+  `window.ethereum` still exists there (so a dapp that touches it at startup
+  doesn't break), but it does *not* claim to be MetaMask, is *not* announced
+  via EIP-6963, and reports no account until an explicit
+  `eth_requestAccounts`. Otherwise a dapp's wallet library would auto-pick
+  our always-authorized injected provider ahead of its **Safe connector**
+  and show the signer EOA instead of the multisig. This mirrors Frame, whose
+  injected provider is likewise not-MetaMask and unauthorized-until-approved
+  inside a frame — so the Safe App resolves its address over the Safe Apps
+  SDK (postMessage to the parent Safe) and shows the multisig.
 - Carries each request's real dapp **Origin** through to qeth, so
   per-origin chain selection (`wallet_switchEthereumChain`) scopes to the
   requesting dapp — one dapp switching chains doesn't move the others.

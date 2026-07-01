@@ -24,6 +24,24 @@
   if (window.__qethConnectorInstalled) return;
   window.__qethConnectorInstalled = true;
 
+  // Are we inside a cross-origin sub-frame? The case that matters is a Safe
+  // App running in an iframe inside the Gnosis Safe UI (app.safe.global).
+  // There we must NOT present as an eager, already-connected wallet: the
+  // dapp's wallet library would auto-pick our injected provider (isMetaMask +
+  // an account handed back with no connect gate) ahead of its Safe connector
+  // and show the signer EOA instead of the multisig. But we also can't just
+  // vanish — removing window.ethereum outright breaks a dapp that touches it
+  // at startup (a plain top-frame-only guard left StakeDAO with no address at
+  // all). So in a sub-frame we stay PRESENT BUT INERT: window.ethereum
+  // exists, but we don't claim to be MetaMask, we don't announce over
+  // EIP-6963, and eth_accounts stays empty until the page explicitly calls
+  // eth_requestAccounts. The dapp then reads the injected connector as
+  // unauthorized and falls through to its Safe connector (which reads the
+  // multisig over the Safe Apps SDK). This mirrors Frame, whose injected
+  // provider is likewise not-MetaMask and unauthorized-until-approved inside
+  // the frame — which is why Frame shows the multisig and we didn't.
+  var IN_SUBFRAME = (window.top !== window.self);
+
   var HTTP_URL = "http://127.0.0.1:1248/";
   var LOGO = "__QETH_LOGO_DATA_URI__";
   var PROVIDER_SRC = "qeth-provider";
@@ -61,13 +79,14 @@
   function QethProvider() {
     Emitter.call(this);
     this.isQeth = true;
-    // Appear as MetaMask. Many dapps (Web3Modal / Reown AppKit / wagmi's
-    // "injected" connector — e.g. Holyheld) only offer the injected
-    // wallet when window.ethereum.isMetaMask is set; otherwise they drop
-    // to a WalletConnect QR. Modern dapps still see us as "qeth" via the
-    // EIP-6963 announcement below, so nothing that already works
-    // regresses. Rabby / Coinbase set this flag the same way.
-    this.isMetaMask = true;
+    // Appear as MetaMask (top frame only). Many dapps (Web3Modal / Reown
+    // AppKit / wagmi's "injected" connector — e.g. Holyheld) only offer the
+    // injected wallet when window.ethereum.isMetaMask is set; otherwise they
+    // drop to a WalletConnect QR. Modern dapps still see us as "qeth" via the
+    // EIP-6963 announcement below, so nothing that already works regresses.
+    // Rabby / Coinbase set this flag the same way. In a sub-frame we
+    // deliberately do NOT claim to be MetaMask — see IN_SUBFRAME above.
+    this.isMetaMask = !IN_SUBFRAME;
     // Minimal slice of MetaMask's "experimental" API that some dapps
     // probe before they'll treat the provider as unlocked.
     this._metamask = {
@@ -76,6 +95,11 @@
     this.chainId = null;
     this.networkVersion = null;
     this.selectedAddress = null;
+    // Sub-frame gate (see IN_SUBFRAME): until the page explicitly connects,
+    // eth_accounts reports empty so the dapp's injected connector stays
+    // unauthorized and its Safe connector wins. The top frame is authorized
+    // from the start — the existing no-click behaviour is unchanged.
+    this._authorized = !IN_SUBFRAME;
 
     this._id = 1;
     this._pending = {};          // json-rpc id -> {resolve, reject}
@@ -105,6 +129,12 @@
     if (!args || typeof args.method !== "string") {
       return Promise.reject(rpcError(-32600, "Invalid request: 'method' required"));
     }
+    // Unauthorized sub-frame: report no account (the dapp reads this as "not
+    // connected") until an explicit eth_requestAccounts flips _authorized in
+    // the .then below. Answered locally so we never even reach the wallet.
+    if (!this._authorized && args.method === "eth_accounts") {
+      return Promise.resolve([]);
+    }
     this._engage();
     var payload = {
       jsonrpc: "2.0", id: this._id++,
@@ -114,6 +144,7 @@
       self._pending[payload.id] = { resolve: resolve, reject: reject };
       self._dispatch(payload);
     }).then(function (result) {
+      if (args.method === "eth_requestAccounts") self._authorized = true;
       self._absorb(args.method, args.params, result);
       return result;
     });
@@ -296,20 +327,23 @@
     }
   } catch (e) { try { window.ethereum = provider; } catch (e2) {} }
 
-  // EIP-6963 discovery.
-  var info = Object.freeze({
-    uuid: (window.crypto && window.crypto.randomUUID)
-      ? window.crypto.randomUUID()
-      : "qeth-" + Date.now() + "-" + Math.floor(Math.random() * 1e9),
-    name: "qeth",
-    icon: LOGO,
-    rdns: "org.qeth",
-  });
-  function announce() {
-    window.dispatchEvent(new CustomEvent("eip6963:announceProvider", {
-      detail: Object.freeze({ info: info, provider: provider }),
-    }));
+  // EIP-6963 discovery — top frame only. In a sub-frame we stay unadvertised
+  // so a Safe App's wallet library discovers only its Safe connector, not us.
+  if (!IN_SUBFRAME) {
+    var info = Object.freeze({
+      uuid: (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : "qeth-" + Date.now() + "-" + Math.floor(Math.random() * 1e9),
+      name: "qeth",
+      icon: LOGO,
+      rdns: "org.qeth",
+    });
+    var announce = function () {
+      window.dispatchEvent(new CustomEvent("eip6963:announceProvider", {
+        detail: Object.freeze({ info: info, provider: provider }),
+      }));
+    };
+    window.addEventListener("eip6963:requestProvider", announce);
+    announce();
   }
-  window.addEventListener("eip6963:requestProvider", announce);
-  announce();
 })();
