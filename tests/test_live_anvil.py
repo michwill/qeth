@@ -383,6 +383,59 @@ def test_on_view_qeth_send_confirm_drops_token(anvil, qtbot, tmp_qeth):
 
 
 @pytest.mark.network
+def test_confirm_reconcile_waits_for_node_to_reach_receipt_block(anvil, qtbot, tmp_qeth):
+    """Deterministic repro of 'send-out never updates via the live path': the
+    confirm arrives (over the ws/tip) naming the receipt's block, but the http
+    RPC hasn't reached it yet, so an immediate read returns the PRE-send value.
+    The confirm reconcile must WAIT (non-blocking) for the node to reach the
+    block, then apply the post-send balance — not settle on the stale one and
+    leave it to the sweep. We simulate the lag by leaving the send PENDING while
+    the confirm fires, then mining."""
+    from qeth.store import Store
+    start = 100 * 10 ** USDC_DECIMALS
+    keep = 60 * 10 ** USDC_DECIMALS
+    _ensure_usdc(anvil, ACCT, start)
+
+    tp, panel, workers = _make_tokens_plugin(anvil, tmp_qeth)
+    store = Store.load()
+    store.accounts = [{"address": ACCT.lower()}]
+    tp._store = store
+    tp.TARGETED_BALANCE_DEBOUNCE_MS = 50
+    _seed_usdc(tp, panel, anvil, start)
+
+    # send is PENDING (anvil --no-mining); it will land in latest+1
+    anvil.impersonate(ACCT)
+    anvil.erc20_transfer(USDC, ACCT, ANY, start - keep)
+    receipt_block = int(anvil.rpc("eth_blockNumber"), 16) + 1
+    assert anvil.erc20_balance(USDC, ACCT) == start        # not mined yet → stale
+
+    def pad(a):
+        return "0x" + a[2:].lower().rjust(64, "0")
+    receipt = {
+        "blockNumber": hex(receipt_block), "from": ACCT.lower(), "to": USDC.lower(),
+        "logs": [{
+            "address": USDC.lower(),
+            "topics": [tp._TRANSFER_TOPIC0, pad(ACCT), pad(ANY)],
+            "data": hex(start - keep),
+        }],
+    }
+    tp.note_receipt_logs(anvil.chain, receipt)   # confirm fires BEFORE the block exists
+    qtbot.wait(400)                              # eager reads run + start retrying
+    cached = tp._wallet_cache.load(1, ACCT.lower())
+    tok = next((x for x in cached.tokens if x.contract == USDC.lower()), None)
+    assert tok is not None and tok.balance_raw == start   # still stale — retrying
+
+    anvil.mine()                                 # node now reaches the receipt block
+    assert anvil.erc20_balance(USDC, ACCT) == keep
+
+    def _updated():
+        c = tp._wallet_cache.load(1, ACCT.lower())
+        t = next((x for x in c.tokens if x.contract == USDC.lower()), None)
+        return t is not None and t.balance_raw == keep
+    qtbot.waitUntil(_updated, timeout=15_000)    # the retry catches up → applies
+
+
+@pytest.mark.network
 def test_on_view_qeth_partial_send_updates_balance(anvil, qtbot, tmp_qeth):
     """Repro of 'partial send-out never updates the balance': a qeth-originated
     PARTIAL send while ON the Tokens tab (row selected). note_receipt_logs +

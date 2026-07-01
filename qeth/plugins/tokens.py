@@ -316,8 +316,8 @@ class TokensPlugin(Plugin):
         # tokens per (chain_id, addr_lower) awaiting one coalesced multicall,
         # and its short debounce timer. Runs regardless of the on-screen view
         # (persists to cache) so a tx's effect is ready on the next tab switch.
-        self._dirty_balances: dict[
-            tuple[int, str], tuple[Any, str, set[str]]] = {}
+        # value = [chain, account, {token_lower}, min_block|None]
+        self._dirty_balances: dict[tuple[int, str], list[Any]] = {}
         self._targeted_timer: QTimer | None = None
         # Views whose wallet cache was updated in the background (a targeted
         # balance re-read) while the Tokens tab was NOT active, so the on-screen
@@ -600,10 +600,13 @@ class TokensPlugin(Plugin):
             return h if h.startswith("0x") else "0x" + h.lower()
         return str(topic).lower()
 
-    def on_balance_dirty(self, chain, account: str, token: str) -> None:
+    def on_balance_dirty(self, chain, account: str, token: str,
+                         block=None) -> None:
         """A ws ERC-20 Transfer touched ``account`` on ``chain`` (the
         LiveWatcher, relayed by TransactionsPlugin). We never trust the log's
         value — instead it names the token whose ``balanceOf`` changed.
+        ``block`` is the log's block: the re-read waits for the RPC to reach it,
+        so a lagging http backend behind the ws doesn't read the PRE-event value.
 
         Two responses, deliberately split:
 
@@ -616,7 +619,7 @@ class TokensPlugin(Plugin):
         - **On the on-screen view only**, also schedule the full discovery
           refresh (prices, and surfacing a brand-new token not yet cached)."""
         if token:
-            self._queue_targeted_balance(chain, account, token)
+            self._queue_targeted_balance(chain, account, token, block)
         if self._displayed_view != (chain.chain_id, account.lower()):
             return
         # The discovery multicall set deliberately omits the full curated list
@@ -634,17 +637,21 @@ class TokensPlugin(Plugin):
                 (chain.chain_id, account.lower()), set()).add(token.lower())
         self._schedule_live_refresh(account)
 
-    def _queue_targeted_balance(self, chain, account: str, token: str) -> None:
+    def _queue_targeted_balance(self, chain, account: str, token: str,
+                                block=None) -> None:
         """Accumulate a dirty token for a coalesced targeted balance read.
         A swap fires several Transfer logs touching the account in one block;
         folding them into one short-debounced multicall keeps it to a single
-        cheap round-trip per burst instead of one per leg."""
+        cheap round-trip per burst instead of one per leg. ``block`` (the log's
+        block) is tracked as the minimum height the re-read must reach."""
         key = (chain.chain_id, account.lower())
         slot = self._dirty_balances.get(key)
         if slot is None:
-            slot = (chain, account, set())
+            slot = [chain, account, set(), None]
             self._dirty_balances[key] = slot
         slot[2].add(token.lower())
+        if block is not None:
+            slot[3] = max(slot[3] or 0, int(block))
         if self._targeted_timer is None:
             self._targeted_timer = QTimer(self)
             self._targeted_timer.setSingleShot(True)
@@ -655,22 +662,51 @@ class TokensPlugin(Plugin):
     def _on_targeted_balance(self) -> None:
         """Fire one tiny ``balanceOf`` multicall per dirtied (chain, account)
         for exactly the tokens the ws Transfer logs named, then apply the
-        authoritative result to the cache (+ panel if on screen)."""
+        authoritative result to the cache (+ panel if on screen). Waits (non-
+        blocking) for the RPC to reach the log's block first."""
         if self.host is None:
             self._dirty_balances.clear()
             return
         pending = self._dirty_balances
         self._dirty_balances = {}
-        for chain, account, contracts in pending.values():
+        for chain, account, contracts, min_block in pending.values():
             if not contracts:
                 continue
-            bw = BalanceWorker(chain, account, sorted(contracts))
-            bw.refreshed.connect(
-                lambda cid, nat, bals, blk, ch=chain, acct=account:
-                self._apply_targeted_balances(ch, acct, nat, bals, blk))
-            bw.failed.connect(
-                lambda msg: log.warning("targeted BalanceWorker failed: %s", msg))
-            self.host.start_worker(bw)
+            self._reconcile_up_to_block(
+                chain, account, sorted(contracts), min_block)
+
+    def _reconcile_up_to_block(self, chain, account: str, tokens,
+                               min_block, attempts: int = 20) -> None:
+        """Re-read ``tokens`` at latest and apply — but only once the RPC's head
+        has reached ``min_block`` (the event's block). If the read comes back at
+        an EARLIER block (a lagging http backend behind the ws that pushed the
+        log / receipt), reschedule shortly rather than apply a pre-event balance.
+        Non-blocking (a QTimer, NOT a sleeping worker thread → no signing-dialog
+        stall). Correctness against out-of-order reads still comes from per-token
+        block-ordering; this just stops the eager read from settling on a stale
+        value and leaving the update to the slow sweep."""
+        if self.host is None or not tokens:
+            return
+        toks = list(tokens)
+        bw = BalanceWorker(chain, account, toks)
+        bw.refreshed.connect(
+            lambda cid, nat, bals, blk, ch=chain, acct=account, tk=toks,
+            mb=min_block, at=attempts:
+            self._on_reconcile_read(ch, acct, nat, bals, blk, tk, mb, at))
+        bw.failed.connect(
+            lambda msg: log.warning("targeted BalanceWorker failed: %s", msg))
+        self.host.start_worker(bw)
+
+    def _on_reconcile_read(self, chain, account: str, native_wei, balances_raw,
+                           block, tokens, min_block, attempts) -> None:
+        if (min_block is not None and block is not None
+                and int(block) < int(min_block) and attempts > 1):
+            QTimer.singleShot(
+                700, lambda: self._reconcile_up_to_block(
+                    chain, account, tokens, min_block, attempts - 1))
+            return
+        self._apply_targeted_balances(
+            chain, account, native_wei, balances_raw, block)
 
     def _apply_targeted_balances(
         self, chain, account: str, native_wei, balances_raw: dict, block=None,
@@ -1104,19 +1140,14 @@ class TokensPlugin(Plugin):
         # re-read the moved tokens (at the node's current head) and route them
         # through the same drop/persist/repaint path as a live event. This
         # covers the sender side (dropping a sent-to-zero token) that the old
-        # code left to discovery. It reads at latest (NOT a pinned/awaited
-        # block — that blocked a worker thread for up to 10s under LB skew,
-        # which delayed unrelated work like the signing dialog); per-token
-        # block-ordering + the receive-side _record_nonzero_block above keep it
-        # correct without waiting.
+        # code left to discovery. It waits (NON-blocking, via QTimer — not the
+        # old sleeping worker that stalled the signing dialog) for the http RPC
+        # to reach the receipt's block before trusting the read: the confirm
+        # arrives over the ws/tip, but the balanceOf read goes over http, which
+        # can still be a moment behind that block and return the PRE-send value.
         for wallet, tokens in touched.items():
-            bw = BalanceWorker(chain, wallet, sorted(tokens))
-            bw.refreshed.connect(
-                lambda cid, nat, bals, blk, ch=chain, acct=wallet:
-                self._apply_targeted_balances(ch, acct, nat, bals, blk))
-            bw.failed.connect(
-                lambda msg: log.warning("confirm reconcile failed: %s", msg))
-            self.host.start_worker(bw)
+            self._reconcile_up_to_block(
+                chain, wallet, sorted(tokens), receipt_block)
         current = self.host.selected_address
         if current is None:
             return

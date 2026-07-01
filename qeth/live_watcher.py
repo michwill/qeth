@@ -99,7 +99,11 @@ class LiveWatcher(QThread):
     confirmed = Signal(object, str, object)  # (chain, hash, raw receipt dict)
     dropped = Signal(object, str)            # (chain, hash) — nonce consumed
     still_pending = Signal(object, str)      # (chain, hash) — probe saw it open
-    balance_dirty = Signal(object, str, str)  # (chain, account, token_address)
+    # (chain, account, token_address, block) — block is the Transfer log's
+    # block, so the consumer can wait for its RPC to reach that height before
+    # trusting a re-read (a lagging http backend behind the ws that pushed us
+    # the log would otherwise read the PRE-event balance).
+    balance_dirty = Signal(object, str, str, object)
     native_balance = Signal(object, str, object)  # (chain, account, wei)
     # (chain, account, token, counterparty, outgoing, raw_value) — a Transfer
     # touching the account, decoded for a sent/received desktop notification.
@@ -356,7 +360,13 @@ class LiveWatcher(QThread):
         token = get("address")
         if not token:
             return
-        self.balance_dirty.emit(chain, account, str(token))
+        block: int | None
+        try:
+            bn = get("blockNumber")
+            block = _to_int(bn) if bn is not None else None
+        except Exception:
+            block = None
+        self.balance_dirty.emit(chain, account, str(token), block)
         try:
             topics = get("topics") or []
             if len(topics) < 3:

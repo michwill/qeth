@@ -103,8 +103,9 @@ def test_update_live_account_and_balance_dirty_relay(qtbot, monkeypatch):
     assert plugin._live_account == (gnosis, "0xabc")
     assert plugin._live_account_provider() == (gnosis, "0xabc")
 
-    plugin._on_balance_dirty(gnosis, "0xabc", "0xToken")
-    tokens.on_balance_dirty.assert_called_once_with(gnosis, "0xabc", "0xToken")
+    plugin._on_balance_dirty(gnosis, "0xabc", "0xToken", 123)
+    tokens.on_balance_dirty.assert_called_once_with(
+        gnosis, "0xabc", "0xToken", 123)
 
     plugin._on_native_balance(gnosis, "0xabc", 5 * 10**18)
     tokens.on_native_balance.assert_called_once_with(gnosis, "0xabc", 5 * 10**18)
@@ -537,6 +538,45 @@ def test_discovery_merges_and_is_block_ordered(qtbot, tmp_path):
     # a FRESH discovery reads it 0 at block 101 → authoritative drop
     discover({tok: 0}, block=101)
     assert tok not in held()
+
+
+def test_reconcile_waits_for_rpc_to_reach_the_event_block(qtbot, monkeypatch):
+    """A read that comes back at a block BEFORE the event's block (a lagging
+    http backend behind the ws that pushed the log/receipt) must NOT be applied
+    — it would settle on the pre-event balance. It reschedules (non-blocking)
+    until the RPC reaches the block, then applies. With no min_block, or once
+    the read is at/after it, or when retries run out, it applies."""
+    from types import SimpleNamespace
+    from qeth.plugins.tokens import TokensPlugin
+    tp = TokensPlugin(Mock())
+    ch = SimpleNamespace(chain_id=1)
+    applied: list = []
+    retried: list = []
+    monkeypatch.setattr(tp, "_apply_targeted_balances",
+                        lambda *a: applied.append(a))
+    monkeypatch.setattr(tp, "_reconcile_up_to_block",
+                        lambda *a: retried.append(a))
+
+    # read at 805 < event block 810 → do NOT apply; schedule a retry
+    tp._on_reconcile_read(ch, "0xa", 1, {"0xt": 5}, 805, ["0xt"], 810, 5)
+    assert applied == []
+    qtbot.waitUntil(lambda: bool(retried), timeout=3000)   # QTimer retry fired
+    assert retried[0][3] == 810 and retried[0][4] == 4     # min_block, attempts-1
+
+    # read at/after the event block → apply now
+    applied.clear()
+    tp._on_reconcile_read(ch, "0xa", 1, {"0xt": 5}, 811, ["0xt"], 810, 5)
+    assert len(applied) == 1
+
+    # no min_block → apply immediately (browser tx / event carried no block)
+    applied.clear()
+    tp._on_reconcile_read(ch, "0xa", 1, {"0xt": 5}, 800, ["0xt"], None, 5)
+    assert len(applied) == 1
+
+    # retries exhausted → apply whatever we have rather than loop forever
+    applied.clear()
+    tp._on_reconcile_read(ch, "0xa", 1, {"0xt": 5}, 805, ["0xt"], 810, 1)
+    assert len(applied) == 1
 
 
 def test_stale_confirm_read_does_not_regress_the_panel(qtbot, tmp_path):
