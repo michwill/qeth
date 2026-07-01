@@ -1308,6 +1308,33 @@ class TestOnReceiptConfirmed:
                                       self._confirmed_receipt())
         assert panel.table.item(0, 0).toolTip() == "Success"
 
+    def test_duplicate_deliveries_run_side_effects_once(self, qtbot, tmp_qeth):
+        """A confirmation is delivered repeatedly — the ws watcher re-probes a
+        still-pending tx every block until the snapshot is rebuilt. The
+        receipt side effects (the tx_confirmed fan-out and the tokens
+        receipt-log credit, a non-idempotent delta) must fire ONCE, or a
+        received token's balance transiently doubles. Regression for 1c."""
+        plugin = TransactionsPlugin()
+        qtbot.addWidget(plugin.widget())
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [self._pending()]
+        h = plugin._cache[key][0].hash
+
+        fired: list = []
+        plugin.tx_confirmed.connect(lambda c, hh, r: fired.append(hh))
+        credits: list = []
+        plugin.host = type("H", (), {})()
+        plugin.host.tokens_plugin = type(
+            "T", (), {"note_receipt_logs":
+                      lambda self, c, r: credits.append(r)})()
+
+        for _ in range(5):   # five duplicate deliveries
+            plugin._on_receipt_confirmed(ETH, h, self._confirmed_receipt())
+
+        assert fired == [h]        # tx_confirmed emitted exactly once
+        assert len(credits) == 1   # receipt credit applied exactly once
+        assert plugin._cache[key][0].pending is False
+
 
 class TestOnTxDropped:
     """A pending tx whose nonce got consumed by a *different* tx must
@@ -1328,6 +1355,7 @@ class TestOnTxDropped:
     def test_marks_dropped_and_clears_raw(self, qtbot, tmp_qeth):
         plugin = TransactionsPlugin()
         qtbot.addWidget(plugin.widget())
+        plugin.DROP_READING_MIN_SPACING_S = 0   # test the count, not the timing
         key = (ETH.chain_id, ADDR.lower())
         plugin._cache[key] = [self._pending()]
         plugin._disk_cache.save(*key, plugin._cache[key])
@@ -1352,6 +1380,7 @@ class TestOnTxDropped:
         RPC still falsely drops a pending tx, just more slowly."""
         plugin = TransactionsPlugin()
         qtbot.addWidget(plugin.widget())
+        plugin.DROP_READING_MIN_SPACING_S = 0   # test the count, not the timing
         key = (ETH.chain_id, ADDR.lower())
         plugin._cache[key] = [self._pending()]
         plugin._disk_cache.save(*key, plugin._cache[key])
@@ -1364,6 +1393,35 @@ class TestOnTxDropped:
             plugin._on_tx_dropped(ETH, h)
         assert plugin._cache[key][0].pending is True    # not believed yet
         plugin._on_tx_dropped(ETH, h)           # 3rd CONSECUTIVE reading
+        assert plugin._cache[key][0].dropped is True
+
+    def test_fast_ws_readings_are_rate_limited(self, qtbot, tmp_qeth,
+                                                monkeypatch):
+        """The ws watcher emits `dropped` every block (~2 s on an L2). Readings
+        closer together than DROP_READING_MIN_SPACING_S must not each count, or
+        a mined-but-receipt-lagging tx is falsely (and permanently) dropped
+        before its receipt propagates. Only readings a poll interval apart
+        count toward the threshold."""
+        plugin = TransactionsPlugin()
+        qtbot.addWidget(plugin.widget())
+        key = (ETH.chain_id, ADDR.lower())
+        plugin._cache[key] = [self._pending()]
+        plugin._disk_cache.save(*key, plugin._cache[key])
+        h = plugin._cache[key][0].hash
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("time.monotonic", lambda: clock["t"])
+        # A burst every 2 s — far more than DROP_CONFIRM_READINGS raw readings,
+        # but all within one spacing window → only the first counts.
+        for _ in range(10):
+            plugin._on_tx_dropped(ETH, h)
+            clock["t"] += 2.0
+        assert plugin._cache[key][0].pending is True   # not believed on a burst
+
+        # Now space them a full interval apart → the count advances and flips.
+        for _ in range(plugin.DROP_CONFIRM_READINGS):
+            clock["t"] += plugin.DROP_READING_MIN_SPACING_S
+            plugin._on_tx_dropped(ETH, h)
         assert plugin._cache[key][0].dropped is True
 
     def test_watcher_probes_pending_txs_of_non_selected_accounts(
@@ -1413,6 +1471,7 @@ class TestOnTxDropped:
         plugin = TransactionsPlugin()
         panel = plugin.widget()
         qtbot.addWidget(panel)
+        plugin.DROP_READING_MIN_SPACING_S = 0   # test the glyph, not the timing
         key = (ETH.chain_id, ADDR.lower())
         plugin._cache[key] = [self._pending()]
         panel.set_context(ETH, ADDR)

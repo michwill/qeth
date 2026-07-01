@@ -938,6 +938,14 @@ class TransactionsPlugin(Plugin):
     # many consecutive readings across watcher ticks — a mined tx's receipt
     # propagates and confirms within a tick or two, clearing the count.
     DROP_CONFIRM_READINGS = 3
+    # Minimum wall-clock gap between two readings that count toward the
+    # threshold above. The ws watcher emits `dropped` every new head (~2 s on
+    # L2s), which would pile up DROP_CONFIRM_READINGS in seconds — far faster
+    # than the ~30 s a mined tx's receipt can take to propagate through a load
+    # balancer. Spacing readings a poll interval apart keeps "3 consecutive
+    # readings" spanning the time the threshold was calibrated for, whichever
+    # source (fast ws or 10 s poll) supplies them.
+    DROP_READING_MIN_SPACING_S = 10.0
 
     def __init__(
         self,
@@ -998,10 +1006,19 @@ class TransactionsPlugin(Plugin):
         # a (chain, addr) — that's what prevents the empty → populated
         # flicker on startup.
         self._cache: dict[tuple[int, str], list[Transaction]] = {}
-        # Per-hash count of consecutive "looks dropped" readings — a single one
-        # is unreliable behind a load-balanced RPC, so we wait for repeats
+        # Per-hash (count, last monotonic time) of consecutive "looks dropped"
+        # readings — a single one is unreliable behind a load-balanced RPC, so
+        # we wait for repeats, spaced at least DROP_READING_MIN_SPACING_S apart,
         # before flipping a tx to the terminal dropped state.
-        self._drop_readings: dict[str, int] = {}
+        self._drop_readings: dict[str, tuple[int, float]] = {}
+        # (chain_id, hash) of confirmations we've already processed. A confirm
+        # is a one-time terminal event but is DELIVERED repeatedly — the ws
+        # watcher re-probes each still-pending tx on every new head, and the
+        # poll watcher can add its own — so we dedupe to keep the receipt
+        # side effects (the tx_confirmed fan-out and the non-idempotent
+        # receipt-log credit) from repeating. Bounded by the session's
+        # confirmed-tx count.
+        self._confirmed_seen: set[tuple[int, str]] = set()
         # Active fetches — prevents duplicate Blockscout calls when
         # on_activated / on_account_changed / on_chain_changed all fire
         # close together (e.g. user clicks a new account while the tab
@@ -1405,11 +1422,22 @@ class TransactionsPlugin(Plugin):
         the receive-side of a swap before Blockscout indexes it
         (3+ minutes lag on busy chains)."""
         chain_id = chain.chain_id
+        # Process each confirmation once. The same (chain, hash) is delivered
+        # repeatedly — the ws watcher re-probes every still-pending tx on each
+        # new head and re-emits `confirmed` until the pending snapshot is
+        # rebuilt, and the poll watcher can add its own. Re-running the side
+        # effects below doubled a received token's balance (note_receipt_logs'
+        # credit is a delta) and re-fired the whole tx_confirmed fan-out
+        # (ENS re-read, view invalidation). The first delivery still runs even
+        # when no pending row matches (a Blockscout race already swapped it),
+        # so a one-shot tx_confirmed listener never misses it.
+        seen_key = (chain_id, tx_hash)
+        if seen_key in self._confirmed_seen:
+            return
+        self._confirmed_seen.add(seen_key)
         # Confirmed → cancel any tentative drop-readings for this hash.
         self._drop_readings.pop(tx_hash, None)
-        # Let sibling plugins react to this exact tx confirming. Emitted
-        # unconditionally (even when no pending row matches — e.g. a Blockscout
-        # race already swapped it) so a one-shot listener never misses it.
+        # Let sibling plugins react to this exact tx confirming.
         self.tx_confirmed.emit(chain, tx_hash, receipt)
         # Forward to TokensPlugin regardless of whether we still
         # have a matching pending entry — the tokens scan only
@@ -1431,6 +1459,11 @@ class TransactionsPlugin(Plugin):
                     return    # already confirmed (race with Blockscout)
                 txs[i] = _confirmed_from_receipt(t, receipt)
                 self._disk_cache.save(chain_id, key[1], txs)
+                # No longer pending → drop it from the live snapshot so the ws
+                # watcher stops re-probing (and re-confirming) it every block.
+                # Fixes the duplicate deliveries at the source; _confirmed_seen
+                # covers any already in flight.
+                self._rebuild_live_snapshot()
                 # Repaint just the one row whose hash we updated;
                 # rebuilding the whole table here used to freeze
                 # the UI on big caches even though we only swap
@@ -1491,9 +1524,21 @@ class TransactionsPlugin(Plugin):
         reading repeats ``DROP_CONFIRM_READINGS`` times across ticks — by then
         a mined tx's receipt has propagated and confirmed instead. A
         contradicting still-pending / confirmed reading resets the count
-        (``_on_tx_still_pending`` / ``_on_receipt_confirmed``)."""
-        seen = self._drop_readings.get(tx_hash, 0) + 1
-        self._drop_readings[tx_hash] = seen
+        (``_on_tx_still_pending`` / ``_on_receipt_confirmed``).
+
+        Readings must also be ``DROP_READING_MIN_SPACING_S`` apart to count:
+        the ws watcher emits `dropped` every block, so on a fast L2 the raw
+        readings arrive far quicker than a lagging receipt can propagate —
+        without the spacing the threshold elapses in seconds and falsely
+        (and permanently, since the later `confirmed` bails on a non-pending
+        row) drops a mined-but-receipt-lagging tx."""
+        import time
+        now = time.monotonic()
+        seen, last = self._drop_readings.get(tx_hash, (0, 0.0))
+        if seen > 0 and (now - last) < self.DROP_READING_MIN_SPACING_S:
+            return   # too soon after the last counted reading — don't count it
+        seen += 1
+        self._drop_readings[tx_hash] = (seen, now)
         if seen < self.DROP_CONFIRM_READINGS:
             log.debug(
                 "tx %s looks dropped (%d/%d readings) — re-checking before "
@@ -1515,6 +1560,9 @@ class TransactionsPlugin(Plugin):
                     t, pending=False, dropped=True, raw_signed=None,
                 )
                 self._disk_cache.save(chain_id, key[1], txs)
+                # Terminal → drop it from the live snapshot so the ws watcher
+                # stops re-probing it every block (as on confirm).
+                self._rebuild_live_snapshot()
                 log.info(
                     "tx %s dropped — nonce %d already consumed by another tx",
                     tx_hash, t.nonce,
