@@ -1791,6 +1791,15 @@ class EnsPlugin(Plugin):
         # One-shot: the next verify pass should wait for the verified head to
         # catch up (set after a write confirms; see _on_refresh).
         self._verify_catchup = False
+        # Generation counter, bumped per refresh (a new account load or a
+        # post-write rediscover). Every discovery / verify worker captures it
+        # at spawn; a landing whose captured epoch is stale is dropped. This is
+        # what stops a still-running load-time verify worker from repainting the
+        # OLD owner (with a green ✓) over the fresh read a post-write refresh
+        # already applied, and a stale discovery from overwriting the cache with
+        # an older name set — races that address-equality alone can't catch
+        # (both workers are for the same address).
+        self._epoch = 0
 
     # --- plugin contract --------------------------------------------------
 
@@ -1874,14 +1883,22 @@ class EnsPlugin(Plugin):
         addr = host.selected_address if host is not None else None
         if not addr:
             return
+        # A new generation: any discovery / verify worker still in flight from
+        # before this refresh is now stale and must not land (see _epoch).
+        self._epoch += 1
         # A post-write refresh waits for the verified head to catch up to the
         # change (so a lagging proof can't overwrite it); a normal load doesn't.
         self._verify_catchup = catchup
         worker = EnsNamesWorker(addr, sorted(self._store.custom_ens_names))
-        worker.ready.connect(self._on_names_ready)
+        epoch = self._epoch
+        worker.ready.connect(
+            lambda a, n, ep=epoch: self._on_names_ready(a, n, epoch=ep))
         self._start(worker)
 
-    def _on_names_ready(self, address: str, names: list[EnsName]) -> None:
+    def _on_names_ready(self, address: str, names: list[EnsName],
+                        *, epoch: int | None = None) -> None:
+        if epoch is not None and epoch != self._epoch:
+            return                                  # superseded generation
         host = self.host
         if host is None or host.selected_address != address:
             return                                  # view moved on
@@ -1942,15 +1959,22 @@ class EnsPlugin(Plugin):
         worker = EnsVerifyWorker(chain, address, names, wait_s=_OWNERSHIP_WAIT_S,
                                  catchup=self._verify_catchup)
         self._verify_catchup = False        # consume the one-shot flag
-        worker.ready.connect(self._on_verified)
+        epoch = self._epoch
+        worker.ready.connect(
+            lambda a, s, v, ep=epoch: self._on_verified(a, s, v, epoch=ep))
         self._start(worker)
 
     def _on_verified(self, address: str, states: dict[str, OwnershipCheck],
-                     verified: bool) -> None:
+                     verified: bool, *, epoch: int | None = None) -> None:
         # Two passes land here: the fast unverified read (verified=False) for an
         # immediate owner/manager/role-gate update, then the Helios-proven read
         # (verified=True) that earns the ✓ and decides drops. Both carry fresh
         # roles — the verified one only after it caught up (see EnsVerifyWorker).
+        if epoch is not None and epoch != self._epoch:
+            # A newer refresh superseded the generation this worker was spawned
+            # in — dropping it stops a lagging verified pass from repainting the
+            # pre-refresh (e.g. pre-write) owner over the fresh read.
+            return
         host = self.host
         if self._panel is None:
             return

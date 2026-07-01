@@ -1161,6 +1161,43 @@ class TestEnsWriteActions:
         }, True)
         assert plugin.widget()._writable == set()
 
+    def test_stale_verify_worker_dropped_by_epoch(self, qtbot):
+        """A verify worker spawned before a refresh bumped the generation must
+        not land its now-stale ownership over the fresh read — the
+        green-✓-on-old-owner / reverted-role-gate regression. Both landings are
+        for ADDR, so address-equality can't catch it; the epoch does."""
+        plugin, host, store = self._plugin(qtbot)
+        plugin._on_verified(ADDR, {
+            "vitalik.eth": OwnershipCheck(
+                controller=ADDR, owner_known=True, resolver=self.RESOLVER),
+        }, True, epoch=plugin._epoch)
+        assert "vitalik.eth" in plugin.widget()._writable
+
+        stale = plugin._epoch
+        plugin._epoch += 1          # a refresh started a new generation
+        # Stale worker lands a pre-refresh state where ADDR no longer controls
+        # the name — would drop it from _owned and un-writable it if applied.
+        plugin._on_verified(ADDR, {
+            "vitalik.eth": OwnershipCheck(
+                controller="0x" + "99" * 20, owner_known=True,
+                resolver=self.RESOLVER),
+        }, True, epoch=stale)
+        assert "vitalik.eth" in plugin.widget()._writable    # dropped, not reverted
+
+    def test_stale_discovery_dropped_by_epoch(self, qtbot):
+        """A discovery worker from an earlier generation must not overwrite the
+        cache with its older name set (finding 3g(a))."""
+        plugin, host, store = self._plugin(qtbot)
+        plugin._verify = lambda *a, **k: None       # don't spawn a real worker
+        saved: list = []
+        plugin._cache.save = lambda *a: saved.append(a[1])   # (chain, addr, …)
+        stale = plugin._epoch
+        plugin._epoch += 1
+        plugin._on_names_ready(ADDR, [EnsName("stale.eth")], epoch=stale)
+        assert saved == []                          # stale generation → dropped
+        plugin._on_names_ready(ADDR, [EnsName("fresh.eth")], epoch=plugin._epoch)
+        assert saved == [ADDR]                       # current generation applied
+
     def test_set_text_builds_request_to_resolver(self, qtbot):
         plugin, host, store = self._plugin(qtbot)
         plugin._write_text("vitalik.eth")
