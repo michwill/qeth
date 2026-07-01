@@ -177,3 +177,14 @@ class TestSetManager:
         token_id = int.from_bytes(_labelhash("vitalik"), "big")
         assert _body(data) == abi_encode(
             ["uint256", "address"], [token_id, self.MANAGER])
+
+    def test_set_subnode_manager_via_registry_setsubnodeowner(self):
+        # A subdomain's manager is set through the parent on the registry:
+        # setSubnodeOwner(parentNode, labelhash(child), owner). Leaves the
+        # subdomain's resolver/records intact (unlike setSubnodeRecord).
+        to, data = ens_write.set_subnode_manager(NAME, "ops", self.MANAGER)
+        assert to == ENS_REGISTRY
+        assert _selector(data) == "06ab5923"
+        assert _body(data) == abi_encode(
+            ["bytes32", "bytes32", "address"],
+            [namehash(NAME), _labelhash("ops"), self.MANAGER])

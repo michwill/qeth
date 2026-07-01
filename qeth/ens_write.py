@@ -32,6 +32,9 @@ _SEL_SET_CONTENTHASH = bytes.fromhex("304e6ade")   # setContenthash(bytes32,byte
 _SEL_SET_RESOLVER = bytes.fromhex("1896f70a")      # registry.setResolver(bytes32,address)
 # registry.setSubnodeRecord(bytes32,bytes32,address,address,uint64)
 _SEL_SUBNODE_RECORD = bytes.fromhex("5ef2c7f0")
+# registry.setSubnodeOwner(bytes32,bytes32,address) — reassign a subnode's owner
+# (manager) without touching its resolver/records.
+_SEL_SUBNODE_OWNER = bytes.fromhex("06ab5923")
 # NameWrapper.setSubnodeRecord(bytes32,string,address,address,uint64,uint32,uint64)
 _SEL_WRAPPED_SUBNODE = bytes.fromhex("24c1af44")
 _SEL_RENEW = bytes.fromhex("acf1a841")             # controller.renew(string,uint256)
@@ -209,6 +212,25 @@ def set_manager(name: str, manager: str) -> Tx:
     token_id = int.from_bytes(_labelhash(name.split(".")[0]), "big")
     body = _abi(["uint256", "address"], [token_id, manager])
     return _tx(ENS_ETH_REGISTRAR, _SEL_RECLAIM, body)
+
+
+def set_subnode_manager(parent_name: str, label: str, manager: str) -> Tx:
+    """Set the manager (registry owner) of an *unwrapped* subdomain
+    ``label.parent_name`` to ``manager``, via
+    ``registry.setSubnodeOwner(parentNode, labelHash, owner)``.
+
+    This is how the owner of a name manages a subdomain someone else currently
+    holds: only the PARENT's controller may call, so the name's owner can
+    reassign / reclaim ``ops.foo.eth`` (e.g. back to themselves so they can then
+    edit its records). Unlike ``setSubnodeRecord`` it leaves the subdomain's
+    resolver and records untouched. It's the subdomain analogue of ``set_manager``
+    (which reclaims a 2LD via the BaseRegistrar).
+
+    Wrapped parents manage subnodes through the NameWrapper (string label +
+    fuses + a parent-bounded expiry) — out of scope here; gate to unwrapped."""
+    body = _abi(["bytes32", "bytes32", "address"],
+                [namehash(parent_name), _labelhash(label), manager])
+    return _tx(ENS_REGISTRY, _SEL_SUBNODE_OWNER, body)
 
 
 def eth_addr_bytes(address: str) -> bytes:
