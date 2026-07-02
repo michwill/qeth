@@ -101,6 +101,43 @@ def test_reused_token_resets_unpriced_grace(tmp_path):
     assert (1, TOK.lower()) not in unpriced   # grace window restarted
 
 
+def test_apply_floor_credits_a_received_token(tmp_path):
+    ledger, cache, _ = _ledger(tmp_path, meta=_meta())
+    ledger.apply_floor(CHAIN, ACC, TOK, 10, 5 * 10**18)
+    assert cache.load(1, ACC).tokens[0].balance_raw == 5 * 10**18
+
+
+def test_apply_floor_skips_when_a_read_at_or_after_block_applied(tmp_path):
+    """finding 5: the ws absolute read at the receipt block already reflects
+    the receive, so the credit must not double-count — in EITHER order."""
+    ledger, cache, _ = _ledger(tmp_path, meta=_meta())
+    # read-first: absolute 150 at block 10, then the credit at block 10.
+    ledger.apply_read(CHAIN, ACC, 0, {TOK: 150}, block=10)
+    ledger.apply_floor(CHAIN, ACC, TOK, 10, 50)      # same block → skipped
+    assert cache.load(1, ACC).tokens[0].balance_raw == 150
+    ledger.apply_floor(CHAIN, ACC, TOK, 9, 50)       # older block → skipped
+    assert cache.load(1, ACC).tokens[0].balance_raw == 150
+    ledger.apply_floor(CHAIN, ACC, TOK, 11, 50)      # newer block → credits
+    assert cache.load(1, ACC).tokens[0].balance_raw == 200
+
+
+def test_apply_floor_is_idempotent_across_duplicate_confirms(tmp_path):
+    """Two apply_floor calls for the same token at the same block credit ONCE
+    (the first stamps the block; the second is skipped) — which is why the
+    caller sums a receipt's per-token logs before calling."""
+    ledger, cache, _ = _ledger(tmp_path, meta=_meta())
+    ledger.apply_floor(CHAIN, ACC, TOK, 10, 5)
+    ledger.apply_floor(CHAIN, ACC, TOK, 10, 5)       # duplicate → no double
+    assert cache.load(1, ACC).tokens[0].balance_raw == 5
+
+
+def test_apply_floor_blocks_a_later_stale_zero_drop(tmp_path):
+    ledger, cache, _ = _ledger(tmp_path, meta=_meta())
+    ledger.apply_floor(CHAIN, ACC, TOK, 20, 7)        # received at block 20
+    ledger.apply_read(CHAIN, ACC, 0, {TOK: 0}, block=15)   # older zero → ignored
+    assert cache.load(1, ACC).tokens[0].balance_raw == 7
+
+
 def test_getter_tracks_a_swapped_cache(tmp_path):
     """The ledger reads the cache through the getter, so a caller that swaps
     its WalletCache instance is seen (the plugin/tests do this)."""

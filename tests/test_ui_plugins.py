@@ -2112,8 +2112,8 @@ class TestReceiptTransferScan:
                             lambda cid, a: entry if a.lower() == token else None)
         monkeypatch.setattr(tokens_plugin._token_metadata, "get",
                             lambda cid, a: None)   # prefill hasn't populated it
-        tokens_plugin._apply_receipt_credit_to_cache(
-            ETH, self.ME.lower(), token, 5 * 10 ** 18)
+        tokens_plugin._ledger.apply_floor(
+            ETH, self.ME.lower(), token, 100, 5 * 10 ** 18)
         cached = tokens_plugin._wallet_cache.load(ETH.chain_id, self.ME.lower())
         assert cached is not None
         held = next((t for t in cached.tokens

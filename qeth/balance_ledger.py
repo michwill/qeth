@@ -83,6 +83,67 @@ class BalanceLedger:
         self.balance_block[bkey] = max(self.balance_block.get(bkey, 0),
                                        int(block))
 
+    # --- the receipt-side credit (delta, idempotent) ------------------------
+
+    def apply_floor(self, chain, account: str, contract: str, block,
+                    delta: int) -> None:
+        """Receipt-side credit: the account received ``delta`` raw units of
+        ``contract`` as of ``block`` (from a confirmed tx's Transfer log — no
+        balanceOf read). Block-ordered and idempotent: if an authoritative read
+        at or after ``block`` has already been applied for this token, the
+        received amount is already in the cached balance — do nothing. That is
+        what stops the credit from double-counting on top of the ws absolute
+        read at the same block (which lands in either order), and any duplicate
+        confirm delivery. Otherwise add ``delta`` (adding the token if absent
+        and we have its metadata) and stamp it at ``block`` so a later stale
+        read can't drop it.
+
+        Callers must sum a receipt's per-token deltas and call this ONCE per
+        token — two Transfer logs of the same token in one tx would otherwise
+        have the second skipped by the stamp the first leaves."""
+        contract_lower = contract.lower()
+        bkey = (chain.chain_id, account.lower(), contract_lower)
+        if block is not None and self.balance_block.get(bkey, 0) >= int(block):
+            return   # a read at/after this block already reflects the receive
+        if int(delta) <= 0:
+            return
+        now = int(time.time())
+        cache = self._get_cache()
+        cached = cache.load(chain.chain_id, account)
+        if cached is None:
+            cached = CachedWallet(
+                chain_id=chain.chain_id, address=account.lower(),
+                native_balance_wei=0, native_balance_updated=0)
+        existing = next(
+            (t for t in cached.tokens if t.contract.lower() == contract_lower),
+            None)
+        if existing is not None:
+            existing.balance_raw = max(0, int(existing.balance_raw) + int(delta))
+            existing.balance_updated = now
+        else:
+            # Add it — need symbol/name/decimals to render. Prefer the on-chain
+            # metadata cache, fall back to the curated list entry (both carry
+            # them); a genuinely unknown token is skipped (the next discovery
+            # picks it up with proper metadata).
+            entry = self._token_lists.get(chain.chain_id, contract_lower)
+            meta = self._token_metadata.get(chain.chain_id, contract_lower)
+            if meta is not None:
+                symbol, name, decimals = (
+                    meta["symbol"], meta["name"], meta["decimals"])
+            elif entry is not None:
+                symbol, name, decimals = (
+                    entry.symbol, entry.name, entry.decimals)
+            else:
+                return
+            self._unpriced_since.pop((chain.chain_id, contract_lower), None)
+            cached.tokens.append(CachedToken(
+                contract=contract_lower, symbol=symbol, name=name,
+                decimals=decimals, logo_uri=entry.logo_uri if entry else None,
+                balance_raw=int(delta), price_usd=None,
+                balance_updated=now, price_updated=0))
+        cache.save(cached)
+        self.note_nonzero(chain.chain_id, account, contract_lower, block)
+
     # --- the ordered absolute write -----------------------------------------
 
     def apply_read(self, chain, account: str, native_wei, balances_raw: dict,

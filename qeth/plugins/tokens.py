@@ -860,12 +860,6 @@ class TokensPlugin(Plugin):
         callers / tests read naturally)."""
         self._ledger.apply_read(chain, account, native_wei, balances_raw, block)
 
-    def _record_nonzero_block(self, chain_id: int, account: str,
-                              contract: str, block) -> None:
-        """Mark a token as seen NON-ZERO at ``block`` so a later stale read
-        can't drop it (ledger-owned; thin wrapper)."""
-        self._ledger.note_nonzero(chain_id, account, contract, block)
-
     def on_native_balance(self, chain, account: str, native_wei) -> None:
         """The on-screen account's native balance, read over the live ws every
         ~minute (LiveWatcher.native_balance, relayed by TransactionsPlugin).
@@ -1035,6 +1029,11 @@ class TokensPlugin(Plugin):
         # token contracts that moved for each of our wallets in THIS tx — read
         # authoritatively below, at the receipt's own block.
         touched: dict[str, set[str]] = {}
+        # (wallet_lower, token_lower) -> summed received amount in THIS receipt.
+        # Summed across logs so the same token received twice in one tx credits
+        # once with the total (the ledger stamps the token after the credit, so
+        # a per-log call would drop the second — see BalanceLedger.apply_floor).
+        credits: dict[tuple[str, str], int] = {}
         receipt_block = self._parse_block(receipt.get("blockNumber"))
         # The tx's own endpoints are affected regardless of its events:
         # the sender's NATIVE balance changed by construction (gas +
@@ -1074,29 +1073,22 @@ class TokensPlugin(Plugin):
                     ).add(token)
                     touched.setdefault(party, set()).add(token.lower())
                     affected_wallets.add(party)
-                    # On the RECEIVING side, apply the credit
-                    # straight to the wallet's cache so the new
-                    # holding is visible the next time the user
-                    # views that wallet — without waiting for a
-                    # discovery cycle on a wallet they may not be
-                    # currently viewing. On the sender side we
-                    # rely on the user's normal-view refresh: the
-                    # sender's wallet is usually the active view
-                    # when a tx is broadcast, so its discovery
-                    # picks up the new (lower) balance moments
-                    # after the receipt comes in.
+                    # On the RECEIVING side, sum the credit for a single ledger
+                    # apply below — so the new holding is visible the next time
+                    # the user views that wallet, without waiting for discovery
+                    # on a wallet they may not be viewing. (The sender side
+                    # relies on the reconcile / normal-view refresh.)
                     if is_recipient and value > 0:
-                        self._apply_receipt_credit_to_cache(
-                            chain, party, token, value,
-                        )
-                        # We KNOW this token is non-zero as of the receipt's
-                        # block, so record it: a stale balanceOf read (from an
-                        # LB backend still behind, or a worker kicked before the
-                        # claim) that returns 0 at an older block can no longer
-                        # drop the just-claimed token. This is the receive-side
-                        # counterpart to a read's own block-ordering.
-                        self._record_nonzero_block(
-                            chain_id, party, token, receipt_block)
+                        ck = (party, token.lower())
+                        credits[ck] = credits.get(ck, 0) + value
+        # Apply each received token's total ONCE, block-ordered + idempotent:
+        # if an authoritative read at/after the receipt block already landed,
+        # the amount is already in the balance, so this no-ops (no double count
+        # on top of the ws absolute read, or a duplicate confirm). The stamp it
+        # leaves also blocks a later stale zero read from dropping the token.
+        for (wallet, token_lower), delta in credits.items():
+            self._ledger.apply_floor(
+                chain, wallet, token_lower, receipt_block, delta)
         if not affected_wallets or self.host is None:
             return
         # Confirm-driven reconcile: a confirmed tx is the source of truth, so
@@ -1128,65 +1120,6 @@ class TokensPlugin(Plugin):
             return int(value, 16) if isinstance(value, str) else int(value)
         except (ValueError, TypeError):
             return None
-
-    def _apply_receipt_credit_to_cache(
-        self, chain, address_lower: str, contract: str, delta: int,
-    ) -> None:
-        """Bump the cached balance for (chain, address, contract)
-        by ``delta`` raw units. If the token isn't in the cache,
-        add it — but only when we have its metadata locally (from
-        the curated lists' prefill or a prior multicall). For
-        unknown contracts we skip; the next discovery will pick
-        them up with proper metadata. Saves the cache on the
-        worker thread."""
-        import time
-        cached = self._wallet_cache.load(chain.chain_id, address_lower)
-        contract_lower = contract.lower()
-        now = int(time.time())
-        if cached is None:
-            # No cache file yet — create one so the next view
-            # has the new holding to render.
-            cached = CachedWallet(
-                chain_id=chain.chain_id,
-                address=address_lower,
-                native_balance_wei=0,
-                native_balance_updated=0,
-            )
-        # Update in place if present.
-        for tok in cached.tokens:
-            if tok.contract.lower() == contract_lower:
-                tok.balance_raw = max(0, int(tok.balance_raw) + int(delta))
-                tok.balance_updated = now
-                self._wallet_cache.save(cached)
-                return
-        # Otherwise add it — we need symbol/name/decimals to render it. Prefer
-        # the on-chain metadata cache, but fall back to the curated token-list
-        # entry, which carries them too. That fallback is what makes a
-        # recognised inbound (CVX, USDC, …) persist even when the metadata
-        # prefill hasn't populated the cache yet — without it the token showed
-        # for a single forced refresh and then dropped back out until Blockscout
-        # caught up. Only a genuinely unknown token is skipped (the next
-        # discovery picks it up with proper metadata).
-        entry = self._token_lists.get(chain.chain_id, contract_lower)
-        meta = self._token_metadata.get(chain.chain_id, contract_lower)
-        if meta is not None:
-            symbol, name, decimals = meta["symbol"], meta["name"], meta["decimals"]
-        elif entry is not None:
-            symbol, name, decimals = entry.symbol, entry.name, entry.decimals
-        else:
-            return
-        cached.tokens.append(CachedToken(
-            contract=contract_lower,
-            symbol=symbol,
-            name=name,
-            decimals=decimals,
-            logo_uri=entry.logo_uri if entry else None,
-            balance_raw=int(delta),
-            price_usd=None,
-            balance_updated=now,
-            price_updated=0,
-        ))
-        self._wallet_cache.save(cached)
 
     def _sibling_held_contracts(self, chain_id: int,
                                  self_address: str) -> set[str]:
