@@ -803,9 +803,12 @@ def _read_records_ccip(
 def _read_records_via_client(
     client, name: str, *, text_keys: tuple = TEXT_KEYS, block: str = "latest",
     resolver: str | None = None,
-) -> tuple[EnsRecords, bool, bool, str | None]:
+) -> tuple[EnsRecords, bool, bool, str | None, int | None]:
     """Read a name's resolver records on-chain → ``(records, ok, extended,
-    resolver)``.
+    resolver, block)``. ``block`` is the height round 2 (the records batch) ran
+    at, co-read in the same aggregate so the caller can order this read against
+    others (the verified proof of an OLDER block must not regress a fresher
+    fast read); ``None`` if that height couldn't be read.
 
     - ``ok`` False = a read DIDN'T LAND (a transient multicall failure, e.g. a
       just-synced sidecar's "header for hash not found"). An empty result with
@@ -826,13 +829,15 @@ def _read_records_via_client(
             resolver_p = mc.add(ENS_REGISTRY, _SEL_RESOLVER + node,
                                 decoder=_decode_addr_word)
         if not resolver_p.success:
-            return rec, False, False, None      # resolver lookup glitched
+            return rec, False, False, None, None   # resolver lookup glitched
         resolver = resolver_p.value             # None ⇒ zero ⇒ no resolver
     if not resolver:
-        return rec, True, False, None           # landed: name has no resolver
+        return rec, True, False, None, None      # landed: name has no resolver
     text_p: dict = {}
     iface = _IFACE_EXTENDED + b"\x00" * 28      # supportsInterface(bytes4) arg
     with client.multicall(block=block) as mc:
+        # Co-read the height the records ran at (same aggregate → consistent).
+        block_p = mc.block_number()
         supports_p = mc.add(resolver, _SEL_SUPPORTS + iface, decoder=_decode_bool)
         # The ETH address record (where the name points). Read it here at the
         # chain head alongside text/contenthash so a setAddr shows the moment it
@@ -845,6 +850,8 @@ def _read_records_via_client(
             resolver, _SEL_CONTENTHASH + node,
             decoder=lambda raw: decode_contenthash(_abi_bytes(raw)))
     extended = bool(supports_p.success and supports_p.value)
+    blk = (int(block_p.value)
+           if block_p.success and block_p.value is not None else None)
     if any(p.success for p in (addr_p, *text_p.values(), content_p)):
         if addr_p.success and addr_p.value:
             rec.addresses[str(_ETH_COIN_TYPE)] = addr_p.value
@@ -853,20 +860,20 @@ def _read_records_via_client(
                 rec.texts[key] = str(p.value)
         if content_p.success and content_p.value:
             rec.contenthash = content_p.value
-        return rec, True, extended, resolver
+        return rec, True, extended, resolver, blk
     if extended:
-        return rec, True, extended, resolver    # CCIP: on-chain empty expected
-    return rec, False, extended, resolver        # glitch — neither landed
+        return rec, True, extended, resolver, blk  # CCIP: on-chain empty expected
+    return rec, False, extended, resolver, blk      # glitch — neither landed
 
 
 def read_records(
     chain: Chain, name: str, *, text_keys: tuple = TEXT_KEYS,
     client=None, resolver: str | None = None,
-) -> tuple[EnsRecords, bool]:
-    """Fast, UNVERIFIED record read → ``(records, ok)`` (see
-    ``_read_records_via_client`` for ``ok``). The first-paint path: shows records
-    in ~1 s instead of waiting on the verified read to proof-fetch every slot
-    through Helios; the ✓ comes later via ``verified_read_records``.
+) -> tuple[EnsRecords, bool, int | None]:
+    """Fast, UNVERIFIED record read → ``(records, ok, block)`` (see
+    ``_read_records_via_client`` for ``ok`` / ``block``). The first-paint path:
+    shows records in ~1 s instead of waiting on the verified read to proof-fetch
+    every slot through Helios; the ✓ comes later via ``verified_read_records``.
 
     ``client`` reuses a warm ``EthClient`` across expands; ``resolver``
     pre-supplies the name's resolver to skip a round-trip — if that (possibly
@@ -874,12 +881,12 @@ def read_records(
     from .chain import EthClient
     cl = client if client is not None else EthClient(chain)
     try:
-        rec, ok, extended, res = _read_records_via_client(
+        rec, ok, extended, res, blk = _read_records_via_client(
             cl, name, text_keys=text_keys, block="latest", resolver=resolver)
         if (resolver is not None and ok and not extended
                 and not rec.texts and not rec.contenthash):
             # a stale pre-supplied resolver landed empty → re-read without it
-            rec, ok, extended, res = _read_records_via_client(
+            rec, ok, extended, res, blk = _read_records_via_client(
                 cl, name, text_keys=text_keys, block="latest")
         if extended and res and not rec.texts and not rec.contenthash:
             # offchain (CCIP): follow the gateway. Unverifiable, but it beats a
@@ -889,16 +896,16 @@ def read_records(
             except Exception:
                 log.debug("ENS CCIP follow failed", exc_info=True)
             ok = True
-        return rec, ok
+        return rec, ok, blk
     except Exception:
         log.debug("ENS read_records failed", exc_info=True)
-        return EnsRecords(), False
+        return EnsRecords(), False, None
 
 
 def verified_read_records(
     chain: Chain, name: str, *,
     wait_s: float = VERIFY_WAIT_S, text_keys: tuple = TEXT_KEYS,
-) -> tuple[EnsRecords, bool]:
+) -> tuple[EnsRecords, bool, int | None]:
     """Verified-ONLY record read at the chain HEAD → ``(records, verified)``.
     Reads at ``latest`` (sync-committee-verified by Helios, not finalized) so the
     ✓ reflects the MOST RECENT on-chain records, not the ~2-epoch-stale finalized
@@ -912,22 +919,22 @@ def verified_read_records(
     from .verified import verified_client
     client, verified = verified_client(chain, wait_s=wait_s, fallback=False)
     if client is None or not verified:
-        return EnsRecords(), False
+        return EnsRecords(), False, None
     # Retry the just-synced-sidecar transient (same as verify_names) so on-chain
     # records reliably earn their ✓ instead of intermittently missing it.
     for attempt in range(_VERIFY_RETRIES):
         try:
-            rec, ok, extended, _ = _read_records_via_client(
+            rec, ok, extended, _, blk = _read_records_via_client(
                 client, name, text_keys=text_keys, block="latest")
         except Exception:
             log.debug("ENS verified_read_records failed", exc_info=True)
-            rec, ok, extended = EnsRecords(), False, False
+            rec, ok, extended, blk = EnsRecords(), False, False, None
         if ok:
             offchain_only = extended and not rec.texts and not rec.contenthash
-            return (EnsRecords(), False) if offchain_only else (rec, True)
+            return (EnsRecords(), False, None) if offchain_only else (rec, True, blk)
         if attempt < _VERIFY_RETRIES - 1:
             time.sleep(_VERIFY_RETRY_DELAY_S)
-    return EnsRecords(), False
+    return EnsRecords(), False, None
 
 
 def _abi_bytes(raw) -> str | None:
@@ -999,10 +1006,12 @@ class EnsCache:
 
     def load_records(
         self, chain_id: int, name: str,
-    ) -> tuple[EnsRecords, bool] | None:
-        """Cached ``(records, verified)`` for a name, or None. So re-expanding a
-        name (or reopening the app) paints its records instantly while a refresh
-        runs."""
+    ) -> tuple[EnsRecords, int, bool] | None:
+        """Cached ``(records, block, verified)`` for a name, or None. So
+        re-expanding a name (or reopening the app) paints its records instantly
+        while a refresh runs. ``block`` (0 for pre-block-stamp caches) lets a
+        live read outrank a stale cached value — even a cached verified one, so
+        a Helios-less session can still update a changed record."""
         p = self._records_path(chain_id, name)
         if not p.exists():
             return None
@@ -1016,28 +1025,18 @@ class EnsCache:
             texts=dict(d.get("texts") or {}),
             contenthash=d.get("contenthash"),
         )
-        return rec, bool(d.get("verified"))
+        return rec, int(d.get("block") or 0), bool(d.get("verified"))
 
     def save_records(self, chain_id: int, name: str, rec: EnsRecords,
-                     verified: bool) -> None:
+                     block: int, verified: bool) -> None:
         from .fsatomic import atomic_write_text
         p = self._records_path(chain_id, name)
         p.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "chain_id": int(chain_id), "name": name.lower(),
             "addresses": rec.addresses, "texts": rec.texts,
-            "contenthash": rec.contenthash, "verified": bool(verified),
+            "contenthash": rec.contenthash, "block": int(block),
+            "verified": bool(verified),
         }
         atomic_write_text(p, json.dumps(data, indent=2))
 
-    def forget_records(self, chain_id: int, name: str) -> None:
-        """Drop a name's cached records — so a refresh after the user CHANGED
-        them won't paint the now-stale (possibly verified) old value before the
-        fresh read lands."""
-        p = self._records_path(chain_id, name)
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log.warning("ENS records cache unlink failed %s: %s", p, e)

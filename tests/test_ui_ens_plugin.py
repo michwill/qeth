@@ -1041,7 +1041,7 @@ class TestEnsPlugin:
         plugin.widget().populate(build_tree([EnsName("alice.eth")]), NOW)
         # prime the disk records cache
         rec = EnsRecords(texts={"url": "https://alice.example"})
-        plugin._cache.save_records(1, "alice.eth", rec, verified=True)
+        plugin._cache.save_records(1, "alice.eth", rec, 100, verified=True)
 
         plugin._on_records_requested("alice.eth")
         # records rendered synchronously from cache (before any worker result)
@@ -1053,20 +1053,38 @@ class TestEnsPlugin:
 
     def test_head_read_shows_then_verified_upgrades(self, qtbot, tmp_qeth):
         # Both reads are at the chain head: the fast unverified read paints the
-        # value, the Helios read upgrades it to verified ✓ — and a late
-        # unverified re-emit must not downgrade it back.
+        # value, the Helios read at the SAME block upgrades it to verified ✓ —
+        # and a late unverified re-emit must not downgrade it back.
         plugin = EnsPlugin(_StubStore())
         plugin.attach(_StubHost(address=ADDR))
         qtbot.addWidget(plugin.widget())
         plugin.widget().populate(build_tree([EnsName("alice.eth")]), NOW)
         rec = EnsRecords(texts={"url": "v1"})
-        plugin._on_records_ready("alice.eth", rec, False, True)
-        assert plugin._rec_cache["alice.eth"] == (rec, False)
-        plugin._on_records_ready("alice.eth", rec, True, True)
-        assert plugin._rec_cache["alice.eth"] == (rec, True)
-        # a stale late unverified emit for the same value can't downgrade the ✓
-        plugin._on_records_ready("alice.eth", rec, False, True)
-        assert plugin._rec_cache["alice.eth"] == (rec, True)
+        plugin._on_records_ready("alice.eth", rec, 100, False, True)  # fast @100
+        assert plugin._rec_cache["alice.eth"] == (rec, 100, False)
+        plugin._on_records_ready("alice.eth", rec, 100, True, True)   # proof @100
+        assert plugin._rec_cache["alice.eth"] == (rec, 100, True)
+        # a late unverified re-emit (same value, same block) can't downgrade ✓
+        plugin._on_records_ready("alice.eth", rec, 100, False, True)
+        assert plugin._rec_cache["alice.eth"] == (rec, 100, True)
+        # a NEWER unverified read of the SAME value keeps the ✓ (proof still
+        # valid for an unchanged value — no flicker on every refresh)
+        plugin._on_records_ready("alice.eth", rec, 101, False, True)
+        assert plugin._rec_cache["alice.eth"] == (rec, 101, True)
+
+    def test_newer_read_of_changed_record_replaces_verified(self, qtbot, tmp_qeth):
+        # finding 3e: a live fast read of a CHANGED record at a NEWER block must
+        # replace even a cached VERIFIED value (dropping the now-invalid ✓). The
+        # old verified-ratchet froze it, so a Helios-less session — or a startup
+        # cache paint — never reflected an external change.
+        plugin = EnsPlugin(_StubStore())
+        plugin.attach(_StubHost(address=ADDR))
+        qtbot.addWidget(plugin.widget())
+        plugin.widget().populate(build_tree([EnsName("alice.eth")]), NOW)
+        plugin._rec_cache["alice.eth"] = (EnsRecords(texts={"url": "old"}), 100, True)
+        new = EnsRecords(texts={"url": "new"})
+        plugin._on_records_ready("alice.eth", new, 101, False, True)
+        assert plugin._rec_cache["alice.eth"] == (new, 101, False)
 
     def test_records_glitch_does_not_wipe(self, qtbot, tmp_qeth):
         plugin = EnsPlugin(_StubStore())
@@ -1074,10 +1092,10 @@ class TestEnsPlugin:
         qtbot.addWidget(plugin.widget())
         plugin.widget().populate(build_tree([EnsName("alice.eth")]), NOW)
         good = EnsRecords(texts={"url": "https://alice.example"})
-        plugin._on_records_ready("alice.eth", good, False, True)
+        plugin._on_records_ready("alice.eth", good, 100, False, True)
         # a glitchy read (ok=False, empty) must NOT overwrite the shown records
-        plugin._on_records_ready("alice.eth", EnsRecords(), True, False)
-        assert plugin._rec_cache["alice.eth"] == (good, False)
+        plugin._on_records_ready("alice.eth", EnsRecords(), 101, True, False)
+        assert plugin._rec_cache["alice.eth"] == (good, 100, False)
         root = plugin.widget().tree.topLevelItem(0)
         labels = [root.child(i).text(0) for i in range(root.childCount())]
         assert "url" in labels and "no records" not in labels
@@ -1323,20 +1341,27 @@ class TestEnsWriteActions:
         on_confirmed({"status": "0x1"})
         assert forced == [("vitalik.eth", True)]
 
-    def test_force_refresh_drops_stale_cache_and_disk(self, qtbot, tmp_qeth):
+    def test_force_refresh_keeps_anchor_and_block_orders(self, qtbot, tmp_qeth):
+        # A forced (post-write) re-read KEEPS the cached anchor (finding 3b):
+        # popping it, as before, left the anti-regression guards with no anchor,
+        # so a still-in-flight pre-write worker's read landed unguarded. Now the
+        # block ordering handles it — the stale worker (older block) is dropped
+        # and the fresh post-write read (newer block) wins.
         plugin, host, store = self._plugin(qtbot)
         old = EnsRecords(texts={"url": "old"})
-        # a previously-verified value sits in memory + on disk
-        plugin._rec_cache["vitalik.eth"] = (old, True)
-        plugin._cache.save_records(1, "vitalik.eth", old, verified=True)
+        plugin._rec_cache["vitalik.eth"] = (old, 100, True)
+        plugin._cache.save_records(1, "vitalik.eth", old, 100, verified=True)
         plugin._on_records_requested("vitalik.eth", force=True)
-        # forcing wipes the stale state so the fresh head read becomes the truth
-        assert "vitalik.eth" not in plugin._rec_cache
-        assert plugin._cache.load_records(1, "vitalik.eth") is None
-        # the new head read then shows immediately, marked unverified (no proof)
+        # the anchor is KEPT, not wiped
+        assert plugin._rec_cache["vitalik.eth"] == (old, 100, True)
+        # a still-in-flight pre-write worker (OLDER block) lands → dropped
+        plugin._on_records_ready(
+            "vitalik.eth", EnsRecords(texts={"url": "stale"}), 99, False, True)
+        assert plugin._rec_cache["vitalik.eth"] == (old, 100, True)
+        # the fresh post-write read (NEWER block) wins, shown unverified (no proof)
         new = EnsRecords(texts={"url": "new"})
-        plugin._on_records_ready("vitalik.eth", new, False, True)
-        assert plugin._rec_cache["vitalik.eth"] == (new, False)
+        plugin._on_records_ready("vitalik.eth", new, 101, False, True)
+        assert plugin._rec_cache["vitalik.eth"] == (new, 101, False)
 
     def test_subdomain_confirmation_rediscovers(self, qtbot, monkeypatch):
         plugin, host, store = self._plugin(qtbot)
@@ -1657,14 +1682,14 @@ class TestResolvedAddressFollowsRecords:
         assert self._row_addr(plugin) == self.OLD
         # a head read carrying the new addr updates the prominent name-row column
         rec = EnsRecords(addresses={"60": self.NEW})
-        plugin._on_records_ready("curvelend.eth", rec, False, True)
+        plugin._on_records_ready("curvelend.eth", rec, 100, False, True)
         assert self._row_addr(plugin) == self.NEW
 
     def test_normal_read_does_not_clear_address(self, qtbot, tmp_qeth):
         # An ordinary expand whose head read has no addr (e.g. CCIP/offchain)
         # must NOT blank a resolution the name row already shows.
         plugin = self._plugin(qtbot)
-        plugin._on_records_ready("curvelend.eth", EnsRecords(), False, True)
+        plugin._on_records_ready("curvelend.eth", EnsRecords(), 100, False, True)
         assert self._row_addr(plugin) == self.OLD
 
     def test_forced_read_clears_address_on_zero(self, qtbot, tmp_qeth):
@@ -1672,25 +1697,26 @@ class TestResolvedAddressFollowsRecords:
         # means the addr was set to 0x0, so the name row clears.
         plugin = self._plugin(qtbot)
         plugin._on_records_requested("curvelend.eth", force=True)
-        plugin._on_records_ready("curvelend.eth", EnsRecords(), False, True)
+        plugin._on_records_ready("curvelend.eth", EnsRecords(), 100, False, True)
         assert self._row_addr(plugin) == ""
 
     def test_lagging_verified_read_does_not_revert_to_old(self, qtbot, tmp_qeth):
         # The bug: after a setAddr confirms, the fast RPC read shows the NEW
-        # address, but Helios's verified head still trails the execution RPC and
-        # proves the OLD value — which must NOT overwrite the fresh one.
+        # address, but Helios's verified head still trails and proves the OLD
+        # value — which must NOT overwrite the fresh one. Ordered by block now:
+        # the lagging proof carries an OLDER block, so it's dropped.
         plugin = self._plugin(qtbot)
         new_rec = EnsRecords(addresses={"60": self.NEW})
         old_rec = EnsRecords(addresses={"60": self.OLD})
-        # fast RPC head read: the new value
-        plugin._on_records_ready("curvelend.eth", new_rec, False, True)
+        # fast RPC head read: the new value at block 101
+        plugin._on_records_ready("curvelend.eth", new_rec, 101, False, True)
         assert self._row_addr(plugin) == self.NEW
-        assert plugin._rec_cache["curvelend.eth"] == (new_rec, False)
-        # lagging Helios proof of the OLD value must be ignored
-        plugin._on_records_ready("curvelend.eth", old_rec, True, True)
+        assert plugin._rec_cache["curvelend.eth"] == (new_rec, 101, False)
+        # lagging Helios proof of the OLD value at an OLDER block → ignored
+        plugin._on_records_ready("curvelend.eth", old_rec, 100, True, True)
         assert self._row_addr(plugin) == self.NEW
-        assert plugin._rec_cache["curvelend.eth"] == (new_rec, False)
-        # once Helios catches up and proves the NEW value, it earns the ✓
-        plugin._on_records_ready("curvelend.eth", new_rec, True, True)
+        assert plugin._rec_cache["curvelend.eth"] == (new_rec, 101, False)
+        # once Helios catches up (block ≥ 101) and proves the NEW value → ✓
+        plugin._on_records_ready("curvelend.eth", new_rec, 101, True, True)
         assert self._row_addr(plugin) == self.NEW
-        assert plugin._rec_cache["curvelend.eth"] == (new_rec, True)
+        assert plugin._rec_cache["curvelend.eth"] == (new_rec, 101, True)

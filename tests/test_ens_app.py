@@ -218,12 +218,12 @@ def test_ens_cache_records_round_trip(tmp_path):
     assert cache.load_records(1, "vitalik.eth") is None
     rec = ea.EnsRecords(texts={"url": "https://vitalik.ca"},
                         contenthash="ipfs://bafy")
-    cache.save_records(1, "Vitalik.eth", rec, verified=True)
+    cache.save_records(1, "Vitalik.eth", rec, 1234, verified=True)
     back = cache.load_records(1, "vitalik.eth")        # case-insensitive
     assert back is not None
-    got, verified = back
+    got, block, verified = back
     assert got.texts == {"url": "https://vitalik.ca"}
-    assert got.contenthash == "ipfs://bafy" and verified is True
+    assert got.contenthash == "ipfs://bafy" and block == 1234 and verified is True
 
 
 # --- on-chain verification (namehash / decoders / multicall orchestration) --
@@ -338,6 +338,11 @@ class _FakeMC:
         ok, val = self._resp(target, data[:4])
         return _FakePending(ok, val)
 
+    def block_number(self):
+        # The records batch co-reads the height (mc.block_number()); a stub
+        # value is enough for the callers that don't assert on it.
+        return _FakePending(True, 1000)
+
 
 class _FakeClient:
     def __init__(self, resp):
@@ -410,7 +415,7 @@ def test_read_records_via_client_batches():
             return True, "ipfs://bafy"
         return False, None
 
-    rec, ok, ext, res = ea._read_records_via_client(
+    rec, ok, ext, res, _blk = ea._read_records_via_client(
         _FakeClient(resp), "vitalik.eth")
     assert ok is True and ext is False
     assert rec.contenthash == "ipfs://bafy"
@@ -431,7 +436,7 @@ def test_read_records_includes_eth_address():
             return True, ADDR
         return False, None
 
-    rec, ok, ext, res = ea._read_records_via_client(
+    rec, ok, ext, res, _blk = ea._read_records_via_client(
         _FakeClient(resp), "vitalik.eth")
     assert ok is True
     assert rec.addresses == {"60": ADDR}
@@ -449,20 +454,20 @@ def test_read_records_zero_address_is_absent():
             return True, "hi"
         return False, None              # addr (+ everything else) absent
 
-    rec, ok, ext, res = ea._read_records_via_client(_FakeClient(resp), "x.eth")
+    rec, ok, ext, res, _blk = ea._read_records_via_client(_FakeClient(resp), "x.eth")
     assert ok is True and rec.addresses == {}
 
 
 def test_read_records_no_resolver_is_landed_empty():
     # registry.resolver read LANDS but returns zero → no records, ok=True.
-    rec, ok, ext, res = ea._read_records_via_client(
+    rec, ok, ext, res, _blk = ea._read_records_via_client(
         _FakeClient(lambda t, s: (True, None)), "x.eth")
     assert ok is True and rec.texts == {} and rec.contenthash is None
 
 
 def test_read_records_resolver_glitch_is_not_ok():
     # resolver lookup read FAILED (multicall slot) → ok=False (don't trust it).
-    rec, ok, ext, res = ea._read_records_via_client(
+    rec, ok, ext, res, _blk = ea._read_records_via_client(
         _FakeClient(lambda t, s: (False, None)), "x.eth")
     assert ok is False and rec.texts == {}
 
@@ -476,7 +481,7 @@ def test_read_records_round2_glitch_is_not_ok():
             return True, RESOLVER
         return False, None                            # all text/content/supports fail
 
-    rec, ok, ext, res = ea._read_records_via_client(_FakeClient(resp), "x.eth")
+    rec, ok, ext, res, _blk = ea._read_records_via_client(_FakeClient(resp), "x.eth")
     assert ok is False and ext is False
 
 
@@ -492,7 +497,7 @@ def test_read_records_extended_resolver_is_ccip():
             return True, 1                            # IExtendedResolver
         return False, None                            # text/content revert (CCIP)
 
-    rec, ok, ext, res = ea._read_records_via_client(_FakeClient(resp), "uni.eth")
+    rec, ok, ext, res, _blk = ea._read_records_via_client(_FakeClient(resp), "uni.eth")
     assert ok is True and ext is True and res == RESOLVER
     assert rec.texts == {} and rec.contenthash is None
 
@@ -526,7 +531,7 @@ def test_read_records_skips_resolver_lookup_when_supplied():
             return True, "hi"
         return False, None
 
-    rec, ok, ext, res = ea._read_records_via_client(
+    rec, ok, ext, res, _blk = ea._read_records_via_client(
         _FakeClient(resp), "vitalik.eth", resolver=RESOLVER)
     assert ok is True and rec.texts                   # records came back
     assert ea._SEL_RESOLVER not in seen               # round 1 was skipped
@@ -546,7 +551,7 @@ def test_read_records_self_heals_stale_resolver():
             return True, None             # content call lands (empty) so ok=True
         return False, None                # stale resolver's text lands empty
 
-    rec, ok = ea.read_records(object(), "x.eth",
+    rec, ok, _blk = ea.read_records(object(), "x.eth",
                               client=_FakeClient(resp), resolver="0x" + "99" * 20)
     assert ok is True and rec.texts and all(v == "hi" for v in rec.texts.values())
 
@@ -558,9 +563,9 @@ def test_verified_read_records_onchain_extended_is_verified(monkeypatch):
     monkeypatch.setattr("qeth.chain.EthClient", lambda c: object())
     rec = ea.EnsRecords(texts={"url": "base.org"})
     monkeypatch.setattr(ea, "_read_records_via_client",
-                        lambda *a, **k: (rec, True, True, "0xR"))
-    out, verified = ea.verified_read_records(object(), "base.eth")
-    assert verified is True and out.texts == {"url": "base.org"}
+                        lambda *a, **k: (rec, True, True, "0xR", 500))
+    out, verified, blk = ea.verified_read_records(object(), "base.eth")
+    assert verified is True and out.texts == {"url": "base.org"} and blk == 500
 
 
 def test_verified_read_records_offchain_only_is_unverified(monkeypatch):
@@ -569,8 +574,8 @@ def test_verified_read_records_offchain_only_is_unverified(monkeypatch):
     monkeypatch.setattr("qeth.verified.verified_chain", lambda c, **k: object())
     monkeypatch.setattr("qeth.chain.EthClient", lambda c: object())
     monkeypatch.setattr(ea, "_read_records_via_client",
-                        lambda *a, **k: (ea.EnsRecords(), True, True, "0xR"))
-    _out, verified = ea.verified_read_records(object(), "uni.eth")
+                        lambda *a, **k: (ea.EnsRecords(), True, True, "0xR", 500))
+    _out, verified, _blk = ea.verified_read_records(object(), "uni.eth")
     assert verified is False
 
 
@@ -584,11 +589,11 @@ def test_verified_read_records_retries_transient(monkeypatch):
     def flaky(*a, **k):
         calls["n"] += 1
         if calls["n"] < 2:
-            return ea.EnsRecords(), False, False, None     # glitch
-        return rec, True, False, "0xR"
+            return ea.EnsRecords(), False, False, None, None   # glitch
+        return rec, True, False, "0xR", 500
 
     monkeypatch.setattr(ea, "_read_records_via_client", flaky)
-    out, verified = ea.verified_read_records(object(), "vitalik.eth")
+    out, verified, _blk = ea.verified_read_records(object(), "vitalik.eth")
     assert verified is True and out.texts == {"url": "x"} and calls["n"] == 2
 
 

@@ -310,7 +310,7 @@ class EnsRecordsWorker(QThread):
     twice — ``ok`` False means the read didn't land (a glitch), so the consumer
     must keep what's already shown rather than wipe it."""
 
-    ready = Signal(str, object, bool, bool)  # (name, EnsRecords, verified, ok)
+    ready = Signal(str, object, object, bool, bool)  # (name, rec, block, verified, ok)
 
     def __init__(self, chain, name: str, parent=None,
                  *, wait_s: float = VERIFY_WAIT_S, client=None,
@@ -331,20 +331,27 @@ class EnsRecordsWorker(QThread):
         self._catchup = catchup
 
     def run(self) -> None:
-        rec, ok = read_records(self._chain, self._name,
-                               client=self._client, resolver=self._resolver)
-        self.ready.emit(self._name, rec, False, ok)
+        rec, ok, fast_block = read_records(
+            self._chain, self._name,
+            client=self._client, resolver=self._resolver)
+        self.ready.emit(self._name, rec, fast_block, False, ok)
         tries = _VERIFY_CATCHUP_TRIES if self._catchup else 1
         for attempt in range(tries):
-            vrec, verified = verified_read_records(
+            vrec, verified, vblock = verified_read_records(
                 self._chain, self._name,
                 wait_s=self._wait_s if attempt == 0 else 0.0)
             if not verified:           # no sidecar / can't prove → stop trying
                 return
-            # Emit once Helios agrees with the head read (or the read didn't
-            # land so there's nothing to match, or we're out of catch-up budget).
-            if not ok or vrec == rec or attempt == tries - 1:
-                self.ready.emit(self._name, vrec, True, True)
+            # Emit once the verified read reflects the SAME-OR-NEWER chain state
+            # as the fast read (its block ≥ the fast read's), so the ✓ lands on
+            # the value the head already shows rather than a lagging proof of the
+            # old one — or on the last attempt (the block-ordered reducer drops
+            # it anyway if it's still behind). A single non-catchup pass emits
+            # immediately; the reducer orders it.
+            caught_up = (fast_block is None or vblock is None
+                         or vblock >= fast_block)
+            if not ok or caught_up or attempt == tries - 1:
+                self.ready.emit(self._name, vrec, vblock, True, True)
                 return
             self.msleep(int(_VERIFY_CATCHUP_DELAY_S * 1000))
 
@@ -1759,11 +1766,13 @@ class EnsPlugin(Plugin):
         self._cache = EnsCache()
         self._panel: EnsPanel | None = None
         self._loaded_for: str | None = None
-        # In-memory records cache (name → (records, verified)) layered over the
-        # disk cache, so re-expanding a name is instant within a session too.
-        # Both the fast (unverified RPC) and the Helios reads are at the chain
-        # HEAD, so ``verified`` True means "proven at latest".
-        self._rec_cache: dict[str, tuple[EnsRecords, bool]] = {}
+        # In-memory records cache (name → (records, block, verified)) layered
+        # over the disk cache, so re-expanding a name is instant within a session
+        # too. ``block`` is the height the shown value was read at; a read at an
+        # older block (a lagging verified proof, a still-in-flight pre-write
+        # worker) can never regress it, and an equal-block read only upgrades
+        # unverified → verified. ``verified`` True means "proven at that block".
+        self._rec_cache: dict[str, tuple[EnsRecords, int, bool]] = {}
         # Names whose records we're re-reading because a write to them just
         # confirmed. For these the head read is authoritative enough to also
         # CLEAR the name-row address (a setAddr to 0x0) — outside this set a
@@ -2067,12 +2076,13 @@ class EnsPlugin(Plugin):
             return
         nl = name.lower()
         if force:
-            # A write to this name just CONFIRMED. Drop the stale value so the
-            # fresh head read becomes what's shown, rather than re-painting the
-            # old cached one first.
+            # A write to this name just CONFIRMED. Mark it forced (so the
+            # fresh read clears a now-empty address) but KEEP the cached anchor:
+            # the fresh post-write read carries a NEWER block and wins by the
+            # reducer, while a still-in-flight pre-write worker's read carries an
+            # older block and is dropped. Popping it (as before) left the guards
+            # with no anchor, so that stale worker landed unguarded.
             self._force_reread.add(nl)
-            self._rec_cache.pop(nl, None)
-            self._cache.forget_records(ENS_CHAIN_ID, name)
         else:
             # Paint cached records instantly (memory → disk), then refresh.
             cached = self._rec_cache.get(nl)
@@ -2081,7 +2091,7 @@ class EnsPlugin(Plugin):
                 if cached is not None:
                     self._rec_cache[nl] = cached
             if cached is not None:
-                self._panel.add_records(name, cached[0], cached[1])
+                self._panel.add_records(name, cached[0], cached[2])
         chain = self._mainnet()
         if chain is None:
             return
@@ -2098,29 +2108,37 @@ class EnsPlugin(Plugin):
         self._start(worker)
 
     def _on_records_ready(self, name: str, rec: EnsRecords,
-                          verified: bool, ok: bool) -> None:
+                          block, verified: bool, ok: bool) -> None:
         # A read that didn't land (transient RPC/sidecar glitch) comes back empty
         # but is NOT authoritative — keep whatever's already shown rather than
         # wipe good records. (This was the "records vanished on a glitch" bug.)
         if not ok:
             return
         nl = name.lower()
-        # The worker emits the fast unverified read first, then (if a sidecar
-        # could prove it) the Helios read — both at the chain head.
-        prev = self._rec_cache.get(nl)
-        # Don't let the late unverified phase of a refresh clobber a verified
-        # result with a worse one; otherwise newest wins.
-        if prev is not None and prev[1] and not verified:
-            return
-        # Don't let a LAGGING verified read regress the value: Helios's verified
-        # head can trail the execution RPC by a few slots, so right after a
-        # change its proof may still show the OLD value. The fast RPC read (which
-        # the chain head already reflects) is the freshest truth — keep it, and
-        # let the ✓ land later when Helios's proof finally agrees.
-        if verified and prev is not None and not prev[1] and prev[0] != rec:
-            return
-        self._rec_cache[nl] = (rec, verified)
-        self._cache.save_records(ENS_CHAIN_ID, name, rec, verified)
+        # Block-ordered reducer — the single rule that replaces the old
+        # verified-ratchet + lagging-proof + value-agreement guards:
+        #   accept iff this read saw a NEWER block than what's shown, or the
+        #   SAME block and it upgrades unverified → verified.
+        # So a lagging verified proof (older block) can never regress a fresher
+        # fast read regardless of its ✓ (3b/3c), and a live fast read of a
+        # CHANGED record at a newer block replaces even a cached verified value
+        # — including on a Helios-less session (3e). block-less reads are the
+        # weakest (0): never override an ordered value.
+        b = int(block) if block is not None else 0
+        prev = self._rec_cache.get(nl)   # (rec, block, verified) | None
+        if prev is not None:
+            prec, pblock, pverified = prev
+            if b < pblock:
+                return   # older read — can't regress
+            if b == pblock and not (verified and not pverified):
+                return   # same block, no verified upgrade → nothing new
+            # A newer read of the SAME value that happens to be unverified must
+            # not flicker the ✓ off — the proof is still valid for an unchanged
+            # value (the verified catch-up would just re-earn it).
+            if not verified and pverified and rec == prec:
+                verified = True
+        self._rec_cache[nl] = (rec, b, verified)
+        self._cache.save_records(ENS_CHAIN_ID, name, rec, b, verified)
         if self._panel is not None:
             self._panel.add_records(name, rec, verified)
             # Reflect the head ETH address on the name row's "Resolves to" too.
