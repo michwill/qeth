@@ -34,14 +34,18 @@ Done and committed:
 - **5e** — helios `_stop_all` snapshots under the lock; `ledger_hid.submit`
   enqueues under the lock; `_ensure_heavy_imports` / `_ensure_async_imports`
   publish their guard symbol last.
-- **P2 BalanceLedger (core)** — `qeth/balance_ledger.py` is now the single
-  owner of the freshness stamps + ordered cache mutation (was two dicts +
-  duplicated logic). Every balance write funnels through it: `apply_read`
-  (absolute, block-ordered), `apply_native` (ordered ws-poll native, **2d**),
-  `apply_floor` (idempotent receipt credit — **finding 5**), and discovery's
-  native is ordered too (**2c**). `note_nonzero` / `is_token_stale` /
-  `stamp_token` / `stamp_native` are the shared primitives. Unit-covered in
-  `tests/test_balance_ledger.py`.
+- **P2 BalanceLedger** — `qeth/balance_ledger.py` is now the single owner of
+  the freshness stamps + ordered cache mutation (was two dicts + duplicated
+  logic). Every balance write funnels through it: `apply_read` (absolute,
+  block-ordered; a block-less read is the weakest — never overrides an ordered
+  value or drops on zero), `apply_native` (ordered ws-poll native, **2d**),
+  `apply_floor` (idempotent receipt credit — **finding 5**); discovery's native
+  is ordered too (**2c**). `reset_chain` on ws reconnect is the reorg escape
+  (**step 3** — floors can't over-stamp post-min-block, so this only covers the
+  blind-gap). Discovery's persist keeps hidden held tokens (**step 2**
+  cache-invariant). Token sources read through getters (post-construction swap).
+  Unit + wiring coverage in `tests/test_balance_ledger.py` /
+  `tests/test_live_wiring.py`; verified on the real fork.
 
 Fixes surfaced while verifying (not in the original audit):
 - **aiohttp pycares segfault** — `--system-site-packages` gives aiohttp the
@@ -56,21 +60,17 @@ Fixes surfaced while verifying (not in the original audit):
   `self.sender()` identity/epoch.
 
 Deferred / not yet done:
-- **P2 remainder** — with the ledger + ordered writes done, what's left is
-  lower-value/higher-churn or genuinely rare:
-  - *cache-invariant merge (step 2)* — discovery already MERGES for display,
-    but `_save_wallet_cache` still rebuilds the cache from the visible set,
-    which drops user-hidden tokens from disk (contra `_filter_hidden_from_cache`).
-    Route discovery's persist through `apply_read` (merge-only) to close it.
-  - *reorg escape (step 3)* — monotonic floors freeze state if one is stamped
-    too high or a reorg rewinds the chain. Age out floors older than ~2 min, or
-    reset a chain's floors on ws `link_state` reconnect. Rare; one place now
-    (the ledger) instead of three maps.
-  - *satellites* — `_unpriced_since` account keying (LOW display glitch);
-    a `block=None` read should be weakest (apply only to unstamped tokens,
-    never drop-on-zero) — now rare post-co-read; `_carry_forward_absent`
-    shouldn't stamp; `_reconcile_up_to_block` singleShot chains want a
-    shutdown/generation guard (exit-only QThread-abort risk).
+- **P2 remaining satellites** — the three genuinely low-value/high-churn ones:
+  - `_unpriced_since` account keying — one account's expired grace can hide
+    another's just-received token (LOW display glitch); the grace map is shared
+    with the panel's display-time filter, so keying it by account is medium
+    churn across both.
+  - `_carry_forward_absent` shouldn't stamp a carried (not-actually-read) value
+    at the aggregate block (a later correct read at a lower block is discarded);
+    rare, needs marking carried entries through the merge.
+  - `_reconcile_up_to_block` singleShot chains — an exit-only QThread-abort risk
+    that mostly can't fire (the event loop is gone by the time the plugin is
+    destroyed); would need a plugin shutdown hook.
 - **P3 records block-stamp (steps 2–5)** — 3b/3c/3e remain.
 - **4a single-instance lock** — UX call (forbid vs focus-raise) for the user.
 - **P5** — being picked off individually.
