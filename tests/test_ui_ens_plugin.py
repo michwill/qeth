@@ -554,6 +554,37 @@ class TestEnsPanel:
         w.run()
         assert emits == [(False, "0xNEW")]     # only the fresh read, no stale ✓
 
+    def test_verify_worker_fast_failed_catchup_stays_silent(self, monkeypatch):
+        # satellite 5: on a post-write catchup, a FAILED fast read leaves no head
+        # to order against — a lagging verified read could drop a just-acquired
+        # name, so the worker emits nothing (the ✓ lands on a later refresh).
+        import qeth.plugins.ens as ens
+        states = {"s.eth": OwnershipCheck(controller="0xold", owner_known=True)}
+        monkeypatch.setattr(ens, "read_name_states", lambda c, n: ({}, None))
+        monkeypatch.setattr(ens, "verify_names",
+                            lambda c, n, wait_s=0: (states, True, 100))
+        monkeypatch.setattr(ens, "_VERIFY_CATCHUP_DELAY_S", 0.0)
+        monkeypatch.setattr(ens, "_VERIFY_CATCHUP_TRIES", 2)
+        w = ens.EnsVerifyWorker(None, "0xme", ["s.eth"], catchup=True)
+        emits = []
+        w.ready.connect(lambda a, s, v: emits.append(v))
+        w.run()
+        assert emits == []                     # nothing emitted
+
+    def test_verify_worker_fast_failed_normal_load_emits_verified(self, monkeypatch):
+        # …but on a NORMAL load there's no pending change to lag behind, so the
+        # verified read IS the current state and must still land its ✓.
+        import qeth.plugins.ens as ens
+        states = {"s.eth": OwnershipCheck(controller="0xcur", owner_known=True)}
+        monkeypatch.setattr(ens, "read_name_states", lambda c, n: ({}, None))
+        monkeypatch.setattr(ens, "verify_names",
+                            lambda c, n, wait_s=0: (states, True, 100))
+        w = ens.EnsVerifyWorker(None, "0xme", ["s.eth"], catchup=False)
+        emits = []
+        w.ready.connect(lambda a, s, v: emits.append(v))
+        w.run()
+        assert emits == [True]                 # verified read emitted
+
     def _role_rows(self, item):
         """The manager/owner rows under a name → {label: shown-address}."""
         return {item.child(i).text(0): item.child(i).text(2)

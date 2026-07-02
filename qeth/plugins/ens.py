@@ -405,8 +405,17 @@ class EnsVerifyWorker(QThread):
             # changing (externally, or served by a lagging failover backend)
             # between the two reads — the old all-names _states_agree suppressed
             # the WHOLE verified pass in that case (finding 3d).
-            caught_up = (not fast or fast_block is None or vblock is None
-                         or vblock >= fast_block)
+            if not fast:
+                # The fast read failed — no fresh head to order against. On a
+                # post-write CATCHUP we can't confirm the proof has reached the
+                # change, so a lagging verified read could drop a just-acquired
+                # name — don't emit it (the ✓ lands on a later refresh, when a
+                # fast read lands). On a normal load there's no pending change to
+                # lag behind, so the verified read IS the current state (satellite 5).
+                caught_up = not self._catchup
+            else:
+                caught_up = (fast_block is None or vblock is None
+                             or vblock >= fast_block)
             if caught_up:
                 self.ready.emit(self._address, states, True)
                 return
