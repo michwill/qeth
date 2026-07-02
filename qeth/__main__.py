@@ -208,6 +208,18 @@ def main() -> int:
     # don't have to (and can't portably) guess the taskbar/panel colour.
     app.setWindowIcon(app_icon())
 
+    # Single-instance guard (4a): a second qeth sharing ~/.qeth would silently
+    # clobber the first's config / wallet cache / tx cache (load-once,
+    # whole-state-save, no cross-process merge). Hand off to the running
+    # instance — raise its window — and exit, BEFORE any heavy import / RPC
+    # bind / store load, so the second launch is cheap. Keyed on the config
+    # root so only instances that actually share it are coalesced.
+    from .single_instance import SingleInstanceGuard
+    from .store import CONFIG_DIR
+    guard = SingleInstanceGuard(str(CONFIG_DIR))
+    if not guard.is_primary():
+        return 0
+
     # Pull the web3/eth_abi/requests stack now, while no window
     # exists yet. They're deferred at import time (qeth.chain only
     # loads them on first EthClient construction); leaving the
@@ -244,6 +256,7 @@ def main() -> int:
         )
 
     win = MainWindow(store, rpc)
+    guard.set_window(win)   # a later launch's hand-off raises this window
     win.show()
     # Minimise → tray when the platform has one. Keep a reference
     # so Python doesn't GC the controller; Qt's parent ownership
