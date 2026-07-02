@@ -108,22 +108,40 @@ Deferred / not yet done:
   failed still emits the verified read unconditioned (block-wait's `not fast`
   path) — could drop a just-acquired name on a lagging proof; the safer policy
   (emit vs keep-unverified) is ambiguous.
-- **5b verified-sim floor bypass** — a dapp `eth_sendRawTransaction` is proxied
-  without recording it, so `fork_floor_block` doesn't know about the in-flight
-  tx and a follow-up verified preview forks behind head and can falsely revert.
-  Needs raw-tx sender/nonce recovery + a cross-thread record into the pending
-  tracker (the RPC runs on the aiohttp thread). MED, involved — a dedicated
-  pass.
-- **4d AbiCache sentinel TOCTOU** — LOW, self-healing (µs window, 14 d sentinel
-  expiry); accept + document, or `O_EXCL` for sentinels.
-- **5f leaks** (not races) — tx-details / composer dialogs connect to the shared
-  `IconCache.icon_ready` and are never destroyed; `_call_on_confirm` listeners
-  for dropped txs never disconnected.
-- **5g** — implicit-thread-safety comments on the `finished`-signal set-mutating
-  lambdas (single GIL-atomic ops today; a comment so nobody adds iteration).
+- **5b verified-sim floor bypass — effectively mitigated by architecture, NOT
+  building.** Re-analysed: for a proxied raw broadcast to make a follow-up
+  preview falsely revert, the raw tx must be FROM a qeth-managed account (a
+  preview is always for our own next tx, and `fork_floor_block` filters by
+  address). But qeth's own sends go `eth_sendTransaction` → `submit_async` →
+  signing dialog → `add_pending` (already recorded), and `eth_signTransaction`
+  is refused (`-32601`) — so a dapp cannot obtain a qeth-signed raw tx to
+  re-broadcast. Every `eth_sendRawTransaction` reaching us is therefore signed
+  by a FOREIGN key; its `from` isn't one of our accounts and can't touch our
+  fork floor. The only trigger left is the user importing the SAME key into
+  both qeth and a dapp's embedded wallet — contrived. The involved fix
+  (multi-type raw-tx sender/nonce decode + a cross-thread record path) isn't
+  warranted; the `eth_signTransaction` refusal is the standing mitigation. (The
+  original audit flagged it without accounting for that refusal.) Decode + the
+  bridge channel were both prototyped and confirmed feasible if it's ever
+  wanted.
+- **4d AbiCache sentinel TOCTOU — accepted as-is.** µs load→decide→write window;
+  worst case a negative sentinel overwrites a real ABI, which self-heals on the
+  next fetch and the sentinel expires in 14 d anyway. Not worth an `O_EXCL`
+  dance. Genuinely latent.
+- **5g implicit thread-safety — accepted as-is.** The `finished`-signal lambdas
+  that mutate GUI-owned sets (`icons.py`, `plugins/tokens.py:~796`,
+  `plugins/transactions.py`) are each a single GIL-atomic `set.discard` /
+  `list.remove` — safe today. The hazard is only latent (adding iteration/
+  logging to one would create a race); no code change, noted here.
+- **5f leaks (not races) — LOW, real.** tx-details / composer dialogs connect to
+  the shared `IconCache.icon_ready` and are never destroyed (no
+  `WA_DeleteOnClose`); `_call_on_confirm` listeners for dropped txs aren't
+  disconnected. App-lifetime accumulation; worth a `WA_DeleteOnClose` pass but
+  orthogonal to the race audit.
 - **P2/P3 satellites (LOW)** — `_unpriced_since` account keying;
   `_carry_forward_absent` shouldn't stamp; `_reconcile_up_to_block` shutdown
-  guard; `_force_reread` per-worker; verify-worker fast-read-failed emit.
+  guard; `_force_reread` per-worker; verify-worker fast-read-failed emit. Each
+  is a rare display glitch or an exit-only edge; see the P2/P3 sections.
 
 Post-fix re-review notes (adversarial pass over the branch):
 - **min-block trade — REVISED, the min was wrong too.** The "self-healing"
