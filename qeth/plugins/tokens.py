@@ -290,6 +290,14 @@ class TokensPlugin(Plugin):
     # so the HTTP sweep slows to this deep backstop instead of polling every
     # minute. Drops back to REFRESH_INTERVAL_MS the moment ws goes down.
     SLOW_REFRESH_INTERVAL_MS = 300_000  # 5 min
+    # Cadence of the cheap balanceOf reconcile of the displayed tokens
+    # (_on_reconcile_tick), run only while ws is live. It's the safety net for a
+    # Transfer-log subscription that dies SILENTLY: a provider/LB can drop the
+    # logs filter while newHeads keep flowing, so link_state stays True (socket
+    # warm, native poll fine) yet no balance_dirty ever fires and an ERC-20
+    # balance sits stale until the demoted 5-min sweep. This bounds that
+    # staleness independent of the discovery sweep.
+    RECONCILE_INTERVAL_MS = 60_000
 
     def __init__(self, store):
         super().__init__()
@@ -375,6 +383,7 @@ class TokensPlugin(Plugin):
         # Lifecycle objects (built lazily / in attach).
         self._panel = None
         self._refresh_timer: QTimer | None = None
+        self._reconcile_timer: QTimer | None = None
         self._lists_loader: TokenListsLoader | None = None
         self._top_tokens_loader: TopTokensLoader | None = None
 
@@ -520,6 +529,14 @@ class TokensPlugin(Plugin):
         self._refresh_timer.setInterval(self.REFRESH_INTERVAL_MS)
         self._refresh_timer.timeout.connect(self._on_refresh_tick)
         self._refresh_timer.start()
+        # Cheap balanceOf reconcile at a fixed cadence. While ws is live the
+        # discovery sweep above is demoted to SLOW_REFRESH_INTERVAL_MS (5 min);
+        # this bounds ERC-20 balance staleness to ~RECONCILE_INTERVAL_MS if the
+        # Transfer-log subscription dies silently (see _on_reconcile_tick).
+        self._reconcile_timer = QTimer()
+        self._reconcile_timer.setInterval(self.RECONCILE_INTERVAL_MS)
+        self._reconcile_timer.timeout.connect(self._on_reconcile_tick)
+        self._reconcile_timer.start()
         # Kick the curated token-lists loader. Host tracks the worker so
         # it isn't GC'd while running.
         self._lists_loader = TokenListsLoader(self._token_lists)
@@ -1692,6 +1709,27 @@ class TokensPlugin(Plugin):
         addr = self.host.selected_address
         if addr is not None:
             self._refresh(addr)
+
+    def _on_reconcile_tick(self) -> None:
+        """Cheap periodic balanceOf reconcile of the displayed tokens — the
+        safety net for a silently-dead Transfer-log subscription (see
+        RECONCILE_INTERVAL_MS). Reuses _reconcile_displayed_balances (one
+        multicall, routed through the same persist+rerender as a live update),
+        so a stale ERC-20 balance corrects within ~a minute even when the ws
+        stops delivering logs without dropping the socket.
+
+        Only runs while the on-screen chain has a live ws: with ws down the
+        60-s discovery sweep already re-reads every balance, so a second read
+        would be redundant."""
+        if self.host is None or self._shutting_down:
+            return
+        addr = self.host.selected_address
+        if addr is None:
+            return
+        chain = self.host.current_chain()
+        if chain.chain_id not in self._ws_live_chains:
+            return
+        self._reconcile_displayed_balances(chain, addr)
 
     def _carry_forward_absent(
         self, chain, address: str, balances_raw: dict, contracts: list,

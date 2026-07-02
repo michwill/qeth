@@ -1162,3 +1162,39 @@ def test_tokens_sweep_slows_when_current_chain_ws_live(qtbot):
     assert tp._refresh_timer.interval() == TokensPlugin.REFRESH_INTERVAL_MS
     tp.on_ws_link_state(SimpleNamespace(chain_id=137), True)    # other chain -> no change
     assert tp._refresh_timer.interval() == TokensPlugin.REFRESH_INTERVAL_MS
+
+
+def test_reconcile_tick_reads_displayed_balances_only_while_ws_live(
+        qtbot, tmp_path):
+    """The periodic reconcile is the safety net for a silently-dead Transfer-log
+    subscription: while the on-screen chain is ws-live (discovery demoted to the
+    5-min slow sweep) it must re-read the displayed balances every tick, so a
+    stale ERC-20 can't persist. With ws down the 60-s discovery sweep already
+    re-reads balances, so the reconcile stays idle rather than doubling up."""
+    from types import SimpleNamespace
+    from qeth.plugins.tokens import BalanceWorker, TokensPlugin
+    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    tp = TokensPlugin(Mock())
+    tp._wallet_cache = WalletCache(cache_dir=tmp_path)
+    tp._wallet_cache.save(CachedWallet(
+        chain_id=100, address="0xabc", native_balance_wei=1,
+        tokens=[CachedToken(contract="0xtok", symbol="T", name="Tok",
+                            decimals=18, balance_raw=5)]))
+    workers: list = []
+    tp.host = SimpleNamespace(
+        selected_address="0xABC",
+        current_chain=lambda: SimpleNamespace(chain_id=100),
+        start_worker=workers.append)
+
+    tp._on_reconcile_tick()                       # ws NOT live → no read
+    assert workers == []
+
+    tp._ws_live_chains = {100}
+    tp._on_reconcile_tick()                       # ws live → reconcile
+    assert len(workers) == 1
+    assert isinstance(workers[0], BalanceWorker)
+    assert workers[0].contracts == ["0xtok"]      # over the displayed set
+
+    tp._shutting_down = True                       # quitting → no new worker
+    tp._on_reconcile_tick()
+    assert len(workers) == 1
