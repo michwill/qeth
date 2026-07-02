@@ -206,14 +206,22 @@ class BalanceLedger:
     # --- the ordered absolute write -----------------------------------------
 
     def apply_read(self, chain, account: str, native_wei, balances_raw: dict,
-                   block=None) -> None:
+                   block=None, blocks: dict | None = None) -> None:
         """Write the authoritative native + per-token balances into the wallet
         cache (absolute values, unlike the receipt path's delta). Each token is
         PER-TOKEN block-ordered via :attr:`balance_block`: a read at an older
         block than the one last recorded for that token is ignored, so a stale
         read can't drop or regress a freshly-claimed token. A token read ZERO at
         a fresh-enough block is dropped; an uncached token is added only when we
-        have metadata AND a non-zero balance."""
+        have metadata AND a non-zero balance.
+
+        ``block`` orders NATIVE (per account). ``blocks`` maps each token to the
+        height ITS chunk was read at; a token uses its own height, falling back
+        to ``block`` only when absent (a carried-forward value not freshly read).
+        Ordering every token by one per-batch ``block`` was wrong: the min let a
+        single lagging chunk freeze a token read fresh elsewhere (its zero
+        rejected as stale, so a spent token never dropped — the Arbitrum
+        stuck-balance bug)."""
         now = int(time.time())
         cache = self._get_cache()
         cached = cache.load(chain.chain_id, account)
@@ -240,18 +248,21 @@ class BalanceLedger:
         emptied: set[str] = set()
         for contract_lower, raw in balances_raw.items():
             bkey = (chain.chain_id, account.lower(), contract_lower)
-            if block is None:
+            # Order this token by the height ITS chunk was read at, not the
+            # per-batch min — else one lagging chunk freezes it (see docstring).
+            tblock = blocks.get(contract_lower, block) if blocks else block
+            if tblock is None:
                 if bkey in self.balance_block:
                     continue   # ordered elsewhere — a block-less read is too
                                # weak to override or drop it
-            elif block < self.balance_block.get(bkey, 0):
+            elif tblock < self.balance_block.get(bkey, 0):
                 continue   # stale read for this token — ignore
             else:
-                self.balance_block[bkey] = int(block)
+                self.balance_block[bkey] = int(tblock)
             tok = existing.get(contract_lower)
             if tok is not None:
                 if int(raw) <= 0:
-                    if block is not None:
+                    if tblock is not None:
                         emptied.add(contract_lower)   # authoritative zero → drop
                     # else: a block-less zero is too weak to drop — keep it
                 else:

@@ -344,17 +344,21 @@ class TestMulticallContextManager:
         ])
         monkeypatch.setattr(eth_client, "call",
                             lambda tx, block="latest": response)
-        block, native, bals = eth_client.head_balances([token], holder)
+        block, native, bals, blocks = eth_client.head_balances([token], holder)
         assert block == 0x1234
         assert native == 999
         assert bals[token.lower()] == 500
+        assert blocks[token.lower()] == 0x1234
 
-    def test_head_balances_stamps_the_minimum_chunk_block(
+    def test_head_balances_stamps_each_token_at_its_own_chunk_block(
             self, eth_client, monkeypatch):
-        """Behind a load balancer the chunks can land on backends at different
-        heights. head_balances returns the MINIMUM so a value is never stamped
-        NEWER than it was read — the fix for 2a, where a stale chunk-2 read got
-        chunk-1's fresher block and resurrected a just-sent token."""
+        """Behind a load balancer the chunks land on backends at different
+        heights. head_balances returns each token's OWN chunk height in
+        ``blocks`` so a consumer orders that token by the block it was actually
+        read at — NOT by the batch min, which lets one lagging chunk freeze a
+        token read fresh in another (the Arbitrum stuck-balance bug: a spent
+        token's authoritative zero rejected as stale forever). ``block`` stays
+        the conservative min for native ordering + the reconcile wait."""
         tokens = ["0x" + c * 40 for c in "ab"]
         holder = "0x" + "d" * 40
         # batch_size=1 → chunks [native], [tokA], [tokB]; the tokA chunk lags.
@@ -368,12 +372,15 @@ class TestMulticallContextManager:
         ])
         monkeypatch.setattr(eth_client, "call",
                             lambda tx, block="latest": next(responses))
-        block, native, bals = eth_client.head_balances(
+        block, native, bals, blocks = eth_client.head_balances(
             tokens, holder, batch_size=1)
-        assert block == 98          # the minimum — conservative stamp
+        assert block == 98          # the minimum — for native + reconcile wait
         assert native == 7
         assert bals[tokens[0].lower()] == 11
         assert bals[tokens[1].lower()] == 13
+        # per-token: each token carries the height ITS chunk ran at
+        assert blocks[tokens[0].lower()] == 98    # tokA's lagging chunk
+        assert blocks[tokens[1].lower()] == 101   # tokB's fresher chunk
 
     def test_add_with_custom_decoder(self, eth_client, monkeypatch):
         token = "0x" + "a" * 40

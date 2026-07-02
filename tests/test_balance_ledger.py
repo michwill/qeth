@@ -112,6 +112,30 @@ def test_block_none_read_cannot_overwrite_an_ordered_value(tmp_path):
     assert w.native_balance_wei == 6 * 10**18 and w.tokens[0].balance_raw == 200
 
 
+def test_apply_read_orders_each_token_by_its_own_block(tmp_path):
+    """The Arbitrum stuck-balance bug: ordering every token by the per-batch MIN
+    block let one lagging chunk's low height reject a token read FRESH in another
+    chunk — so a spent token's authoritative zero was rejected as stale forever
+    and the balance never dropped. Per-token `blocks` fixes it: each token is
+    ordered by the height its own chunk ran at."""
+    cache = WalletCache(cache_dir=tmp_path)
+    TOK2 = "0x" + "ef" * 20
+    metadata = _Lists({TOK.lower(): _meta(), TOK2.lower(): _meta()})
+    ledger = BalanceLedger(lambda: cache, lambda: _Lists(), lambda: metadata, {})
+    # read 1: both tokens held, both chunks fresh at block 100
+    ledger.apply_read(CHAIN, ACC, 0, {TOK: 100, TOK2: 200}, block=100,
+                      blocks={TOK.lower(): 100, TOK2.lower(): 100})
+    # TOK spent out (reads 0) in a chunk that's FRESH at block 110; TOK2's chunk
+    # LAGS at 90, dragging the batch min to 90. Old code stamped both at 90 → 90
+    # < TOK's floor 100 → TOK's zero rejected → STUCK. Per-token: TOK uses its
+    # own 110 (≥ 100) → dropped.
+    ledger.apply_read(CHAIN, ACC, 0, {TOK: 0, TOK2: 200}, block=90,
+                      blocks={TOK.lower(): 110, TOK2.lower(): 90})
+    toks = {t.contract: t.balance_raw for t in cache.load(1, ACC).tokens}
+    assert TOK.lower() not in toks          # spent token dropped (no longer stuck)
+    assert toks.get(TOK2.lower()) == 200    # the lagging token kept unchanged
+
+
 def test_reused_token_resets_unpriced_grace(tmp_path):
     ledger, cache, unpriced = _ledger(tmp_path, meta=_meta())
     unpriced[(1, TOK.lower())] = 123.0        # a past grace timestamp

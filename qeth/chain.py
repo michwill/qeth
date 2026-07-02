@@ -413,28 +413,39 @@ class EthClient:
 
     def head_balances(
         self, tokens: list[str], holder: str, batch_size: int = 100,
-    ) -> "tuple[int | None, int | None, dict[str, int]]":
+    ) -> "tuple[int | None, int | None, dict[str, int], dict[str, int | None]]":
         """Read the holder's NATIVE balance (``getEthBalance``), each token's
         ``balanceOf``, and the block each chunk ran at (``getBlockNumber``, one
         per chunk) — all in one ``aggregate3`` at ``latest``. Returns
-        ``(block, native_wei, balances)``.
+        ``(block, native_wei, balances, blocks)``.
 
         Co-reading everything in a single aggregate keeps native, tokens and
         height on the same backend per chunk: no separate ``eth_getBalance`` /
         ``eth_blockNumber`` a load balancer could serve from a lagging backend
         (which is how a native or per-token value used to get stamped with a
         height it wasn't read at). Reading at ``latest`` never fails "block in
-        the future". ``block`` is the MINIMUM height across chunks
-        (conservative — see :meth:`Multicall.min_block`), ``None`` if none
-        reported; ``native_wei`` is ``None`` if that read failed."""
+        the future".
+
+        ``blocks`` maps each token to the height ITS chunk ran at — so a
+        consumer orders each token by the block that token was actually read at,
+        NOT by a single per-batch stamp. A single stamp is wrong both ways: the
+        min across chunks lets one lagging backend's low height freeze a token
+        read fresh in another chunk (its authoritative zero gets rejected as
+        stale forever); a max/first-chunk stamp lets a lagging read masquerade
+        as fresh and resurrect a spent token. ``block`` (the conservative MINIMUM
+        height, ``None`` if none reported) is kept for native ordering and the
+        reconcile catch-up wait; ``native_wei`` is ``None`` if that read
+        failed."""
         with self.multicall(batch_size=batch_size, block="latest",
                             track_blocks=True) as mc:
             nat = mc.eth_balance(holder)
             queued = [(t, mc.balance_of(t, holder)) for t in tokens]
         balances = {t.lower(): f.value for t, f in queued
                     if f.success and f.value is not None}
+        blocks = {t.lower(): f.block for t, f in queued
+                  if f.success and f.value is not None}
         native = int(nat.value) if (nat.success and nat.value is not None) else None
-        return mc.min_block(), native, balances
+        return mc.min_block(), native, balances, blocks
 
     def multicall_erc20_metadata(
         self, tokens: list[str], batch_size: int = 30,

@@ -203,7 +203,7 @@ class BalanceWorker(QThread):
     # discard a result older than one it already applied — a slow/stale worker
     # must never overwrite a fresher read (see _apply_targeted_balances). Block
     # numbers exceed qint32 → object.
-    refreshed = Signal(QULONGLONG, object, object, object)
+    refreshed = Signal(QULONGLONG, object, object, object, object)  # +per-token blocks
     failed = Signal(str)
 
     def __init__(self, chain, address: str, token_contracts: list[str],
@@ -223,7 +223,7 @@ class BalanceWorker(QThread):
             # could serve stale. The block lets consumers order this result
             # against concurrent reads (per-token block-ordering); a lagging
             # read carries a lower block and is superseded by a fresher one.
-            block, native, balances = client.head_balances(
+            block, native, balances, blocks = client.head_balances(
                 self.contracts, self.address)
             if native is None:
                 # getEthBalance didn't come back (its chunk failed) — fall
@@ -235,7 +235,7 @@ class BalanceWorker(QThread):
                 # rare failure path; pre-change EVERY refresh read native
                 # separately.
                 native = client.get_balance(self.address, "latest")
-            self.refreshed.emit(self.chain.chain_id, native, balances, block)
+            self.refreshed.emit(self.chain.chain_id, native, balances, block, blocks)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -583,8 +583,8 @@ class TokensPlugin(Plugin):
             return
         bw = BalanceWorker(chain, addr, [t.contract for t in cached.tokens])
         bw.refreshed.connect(
-            lambda cid, nat, bals, blk, ch=chain, acct=addr:
-            self._apply_targeted_balances(ch, acct, nat, bals, blk))
+            lambda cid, nat, bals, blk, blks, ch=chain, acct=addr:
+            self._apply_targeted_balances(ch, acct, nat, bals, blk, blks))
         bw.failed.connect(
             lambda msg: log.warning("reconcile BalanceWorker failed: %s", msg))
         self.host.start_worker(bw)
@@ -714,15 +714,17 @@ class TokensPlugin(Plugin):
         toks = list(tokens)
         bw = BalanceWorker(chain, account, toks)
         bw.refreshed.connect(
-            lambda cid, nat, bals, blk, ch=chain, acct=account, tk=toks,
+            lambda cid, nat, bals, blk, blks, ch=chain, acct=account, tk=toks,
             mb=min_block, at=attempts:
-            self._on_reconcile_read(ch, acct, nat, bals, blk, tk, mb, at))
+            self._on_reconcile_read(ch, acct, nat, bals, blk, tk, mb, at, blks))
         bw.failed.connect(
             lambda msg: log.warning("targeted BalanceWorker failed: %s", msg))
         self.host.start_worker(bw)
 
     def _on_reconcile_read(self, chain, account: str, native_wei, balances_raw,
-                           block, tokens, min_block, attempts) -> None:
+                           block, tokens, min_block, attempts, blocks=None) -> None:
+        # `block` is the per-batch MIN (conservative) — wait on it so every
+        # token's chunk has reached the receipt block before we apply.
         if (min_block is not None and block is not None
                 and int(block) < int(min_block) and attempts > 1):
             QTimer.singleShot(
@@ -730,10 +732,11 @@ class TokensPlugin(Plugin):
                     chain, account, tokens, min_block, attempts - 1))
             return
         self._apply_targeted_balances(
-            chain, account, native_wei, balances_raw, block)
+            chain, account, native_wei, balances_raw, block, blocks)
 
     def _apply_targeted_balances(
         self, chain, account: str, native_wei, balances_raw: dict, block=None,
+        blocks: dict | None = None,
     ) -> None:
         """Authoritative targeted balances landed. Persist to the wallet cache
         first (that's the source of truth), then render the on-screen view from
@@ -751,7 +754,9 @@ class TokensPlugin(Plugin):
         a load-balanced node whose backends report different heads)."""
         key = (chain.chain_id, account.lower())
         raw = {k.lower(): int(v) for k, v in balances_raw.items()}
-        self._persist_targeted_balances(chain, account, native_wei, raw, block)
+        blks = {k.lower(): v for k, v in blocks.items()} if blocks else None
+        self._persist_targeted_balances(
+            chain, account, native_wei, raw, block, blks)
         # Decide on-screen from the HOST's actual selection, not the internal
         # _displayed_view — the latter is transiently reset to None by
         # _invalidate_view_and_refresh (the qeth-send confirm path), and if the
@@ -854,11 +859,14 @@ class TokensPlugin(Plugin):
 
     def _persist_targeted_balances(
         self, chain, account: str, native_wei, balances_raw: dict, block=None,
+        blocks: dict | None = None,
     ) -> None:
         """Write authoritative native + per-token balances into the wallet
         cache, block-ordered. Thin wrapper over the ledger (kept so existing
-        callers / tests read naturally)."""
-        self._ledger.apply_read(chain, account, native_wei, balances_raw, block)
+        callers / tests read naturally). ``blocks`` carries the per-token read
+        heights (each token ordered by its own chunk's block, not the batch min)."""
+        self._ledger.apply_read(
+            chain, account, native_wei, balances_raw, block, blocks)
 
     def on_native_balance(self, chain, account: str, native_wei,
                           block=None) -> None:
@@ -1201,8 +1209,8 @@ class TokensPlugin(Plugin):
             # updates' bug — the cache was right, the panel stale). Block
             # ordering drops the stale read per token.
             bw.refreshed.connect(
-                lambda cid, nat, bals, blk, ch=chain, acct=address:
-                self._apply_targeted_balances(ch, acct, nat, bals, blk))
+                lambda cid, nat, bals, blk, blks, ch=chain, acct=address:
+                self._apply_targeted_balances(ch, acct, nat, bals, blk, blks))
             bw.failed.connect(
                 lambda msg: log.warning("BalanceWorker failed: %s", msg)
             )
@@ -1362,9 +1370,10 @@ class TokensPlugin(Plugin):
                 host.start_worker(rw)
 
             def on_balances(cid: int, mc_native, mc_balances: dict,
-                            block=None) -> None:
+                            block=None, blocks=None) -> None:
                 pv["native_wei"] = int(mc_native)
                 pv["block"] = block
+                pv["blocks"] = {k.lower(): v for k, v in (blocks or {}).items()}
                 raw = {k.lower(): int(v) for k, v in mc_balances.items()}
                 # A queried token ABSENT from the result had its balanceOf
                 # read fail (rate-limited upstream / lagging node), not
@@ -1385,6 +1394,7 @@ class TokensPlugin(Plugin):
                 # preserves the existing cache and only refreshes prices.
                 pv["read_failed"] = True
                 pv["block"] = None
+                pv["blocks"] = {}
                 raw = {
                     b.contract.lower(): int(b.balance_raw) for b in blockscout_tokens
                 }
@@ -1473,7 +1483,8 @@ class TokensPlugin(Plugin):
         native_wei = pv["native_wei"]
         metadata = pv["metadata"]
         balances_raw = pv["balances_raw"]
-        block = pv.get("block")
+        block = pv.get("block")            # per-batch MIN — orders native
+        blocks = pv.get("blocks") or {}    # per-token heights — order each token
 
         # MERGE discovery's read into the cached set (do NOT replace it):
         #  - start from the current cache (carry every held token forward),
@@ -1510,10 +1521,15 @@ class TokensPlugin(Plugin):
         if not pv.get("read_failed"):
             for addr, raw in balances_raw.items():
                 cl = addr.lower()
+                # Order by the height THIS token's chunk ran at, not the batch
+                # min — a min dragged down by one lagging chunk otherwise
+                # rejects this token's fresh read forever (the stuck-balance
+                # bug). Falls back to `block` for a carried-forward value.
+                tblock = blocks.get(cl, block)
                 if self._ledger.is_token_stale(chain.chain_id, address, cl,
-                                               block):
+                                               tblock):
                     continue   # stale read for this token — keep cached value
-                self._ledger.stamp_token(chain.chain_id, address, cl, block)
+                self._ledger.stamp_token(chain.chain_id, address, cl, tblock)
                 if raw == 0 and not self._show_all:
                     merged.pop(cl, None)      # authoritative zero → drop
                     continue

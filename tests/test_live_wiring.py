@@ -289,7 +289,8 @@ def test_apply_targeted_balances_persists_then_renders_on_view(qtbot, monkeypatc
         lambda ch, acct: rerendered.append(acct))
     monkeypatch.setattr(
         tp, "_persist_targeted_balances",
-        lambda ch, acct, wei, bals, block=None: persisted.append((acct, bals)))
+        lambda ch, acct, wei, bals, block=None, blocks=None:
+        persisted.append((acct, bals)))
     ch = SimpleNamespace(chain_id=100)
 
     # on/off-view is decided from the HOST's selection, not _displayed_view.
@@ -479,6 +480,51 @@ def test_targeted_drop_repaints_via_host_view_not_stale_displayed_view(qtbot, tm
     assert wbtc not in visible()           # repainted from the host view
     assert tp._pending_rerender == set()   # treated as on-view, no deferral
     assert not tp._wallet_cache.load(1, acc).tokens
+
+
+def test_targeted_read_drops_spent_token_despite_a_lagging_chunk(qtbot, tmp_path):
+    """End-to-end guard for the Arbitrum stuck-balance bug: a token spent out
+    reads 0 in a FRESH chunk, but an unrelated token's chunk lags and drags the
+    batch min below the spent token's floor. Per-token block ordering still drops
+    the spent token (its own chunk is fresh) instead of rejecting its zero — the
+    plumbing from _apply_targeted_balances down to the ledger carries per-token
+    heights."""
+    from types import SimpleNamespace
+    from qeth.plugins.tokens import TokenListPanel, TokensPlugin
+    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.icons import IconCache
+    from qeth.store import Store
+    eth = SimpleNamespace(chain_id=42161, name="Arbitrum", symbol="ETH")
+    acc = "0xabc0000000000000000000000000000000000001"
+    spent = "0x" + "11" * 20
+    laggy = "0x" + "22" * 20
+    store = Store.load()
+    panel = TokenListPanel(IconCache(), store)
+    qtbot.addWidget(panel)
+    tp = TokensPlugin(store)
+    tp._panel = panel
+    tp._wallet_cache = WalletCache(cache_dir=tmp_path)
+    tp.host = SimpleNamespace(selected_address=acc, current_chain=lambda: eth)
+    tp._wallet_cache.save(CachedWallet(
+        chain_id=42161, address=acc, native_balance_wei=10**18, tokens=[
+            CachedToken(contract=spent, symbol="SPENT", name="S", decimals=18,
+                        balance_raw=5 * 10**18, price_usd="1", price_updated=1),
+            CachedToken(contract=laggy, symbol="LAGGY", name="L", decimals=18,
+                        balance_raw=7 * 10**18, price_usd="1", price_updated=1)]))
+    tp._displayed_view = (42161, acc)
+    # both stamped fresh at block 100
+    tp._apply_targeted_balances(
+        eth, acc, 10**18, {spent: 5 * 10**18, laggy: 7 * 10**18}, 100,
+        {spent: 100, laggy: 100})
+    # spent reads 0 at its OWN fresh block 110; laggy's chunk lags at 90, so the
+    # batch min is 90 < spent's floor 100. Per-token: spent uses 110 → drops.
+    tp._apply_targeted_balances(
+        eth, acc, 10**18, {spent: 0, laggy: 7 * 10**18}, 90,
+        {spent: 110, laggy: 90})
+    toks = {t.contract: t.balance_raw
+            for t in tp._wallet_cache.load(42161, acc).tokens}
+    assert spent not in toks               # dropped despite the laggy chunk
+    assert toks.get(laggy) == 7 * 10**18   # laggy kept
 
 
 def test_ws_reconnect_clears_freshness_floors(qtbot):

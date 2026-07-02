@@ -127,11 +127,12 @@ def test_head_balances_reads_at_latest_with_a_consistent_block(anvil):
     from qeth.chain import EthClient
     c = EthClient(anvil.chain)
     head = int(anvil.rpc("eth_blockNumber"), 16)
-    block, native, bals = c.head_balances([USDC], WHALE)
+    block, native, bals, blocks = c.head_balances([USDC], WHALE)
     assert block is not None and block >= head - 2      # co-read block, current
     assert native == c.get_balance(WHALE, "latest")     # co-read native matches
     assert USDC.lower() in bals                          # whale holds USDC
     assert bals[USDC.lower()] == anvil.erc20_balance(USDC, WHALE)
+    assert blocks[USDC.lower()] is not None and blocks[USDC.lower()] >= head - 2
 
 
 @pytest.mark.network
