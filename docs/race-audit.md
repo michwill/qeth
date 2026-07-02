@@ -25,8 +25,10 @@ Done and committed:
   read; signing-request setup rejects the bridge future on failure. (Finding
   6 intentionally skipped — can't-happen.)
 - **2a/2b** — `chain.head_balances` co-reads native (`getEthBalance`) and a
-  per-chunk block, returns the conservative min. (P2 step 0 / ledger
-  prerequisite.)
+  per-chunk block. (P2 step 0 / ledger prerequisite.) **Superseded by
+  per-token block-stamping** (see below): it now returns each token's own
+  chunk height in a `blocks` map; the conservative min is kept only for native
+  + the reconcile wait.
 - **4b** — `Store.save` copies `accounts` under the lock + seq-ordered writes.
 - **3a/3g** — ENS per-generation `_epoch` drops stale discovery/verify
   landings.
@@ -96,12 +98,19 @@ Deferred / not yet done:
 - **P5** — being picked off individually.
 
 Post-fix re-review notes (adversarial pass over the branch):
-- **min-block trade, verified**: the conservative min stamp means (i) a
-  value can be transiently regressed by a read in the [min, actual) window
-  and (ii) a true zero read alongside a badly lagging chunk can be skipped
-  until a later sweep (missed, not false, drop) — both self-healing, and
-  strictly safer than the pre-change over-stamping (which persistently
-  resurrected sent tokens). Accepted by design.
+- **min-block trade — REVISED, the min was wrong too.** The "self-healing"
+  claim for (ii) was false in practice: on a large multi-chunk read behind a
+  load balancer (Arbitrum), one *persistently*-lagging backend keeps the batch
+  min below a token's freshness floor, so that token's authoritative zero is
+  rejected as stale on *every* sweep — a spent token stuck showing its old
+  balance until a restart (a real user report). A single per-batch block is
+  wrong both ways (min under-claims → stuck; max/first over-claims →
+  resurrect). Fixed by **per-token block-stamping**: `head_balances` returns
+  each token's own chunk height (it already co-read `getBlockNumber` per
+  chunk), and value+block are co-located per chunk, so a lagging chunk's stale
+  value carries its own lagging block and is correctly rejected — closing 2a
+  *and* the stuck case. The min survives only for native ordering (protected by
+  the ws poll's own-block read) and the reconcile catch-up wait.
 - **native fallback mis-stamp** (BalanceWorker, rare chunk-failure path):
   the fallback `get_balance` isn't co-read with the surviving chunks' block,
   so the native stamp can be skewed — transient, self-healing, narrower than
