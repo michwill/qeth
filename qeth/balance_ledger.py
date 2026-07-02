@@ -72,6 +72,36 @@ class BalanceLedger:
         bkey = (chain_id, account.lower(), token.lower())
         self.balance_block[bkey] = int(block)
 
+    def native_stale(self, chain_id: int, account: str, block) -> bool:
+        """True if ``block`` is older than the last native read applied for the
+        account — a stale ws poll (an LB jumped backwards) that must not
+        regress the balance or re-trigger a 'received' notification."""
+        if block is None:
+            return False
+        return int(block) < self.native_block.get((chain_id, account.lower()), 0)
+
+    def apply_native(self, chain, account: str, native_wei, block) -> bool:
+        """Ordered native-ONLY cache write (the ws-poll counterpart to
+        apply_read): apply iff ``block`` isn't stale, stamping the native
+        block so a later out-of-order poll can't regress it. Leaves an absent
+        cache untouched (nothing to update in place). Returns whether the
+        cached native changed."""
+        nkey = (chain.chain_id, account.lower())
+        if block is not None and int(block) < self.native_block.get(nkey, 0):
+            return False
+        cache = self._get_cache()
+        cached = cache.load(chain.chain_id, account)
+        if cached is None:
+            return False
+        if block is not None:
+            self.native_block[nkey] = int(block)
+        if cached.native_balance_wei == int(native_wei):
+            return False
+        cached.native_balance_wei = int(native_wei)
+        cached.native_balance_updated = int(time.time())
+        cache.save(cached)
+        return True
+
     def note_nonzero(self, chain_id: int, account: str, contract: str,
                      block) -> None:
         """Mark a token as seen NON-ZERO at ``block`` so a later stale read

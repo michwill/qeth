@@ -860,17 +860,23 @@ class TokensPlugin(Plugin):
         callers / tests read naturally)."""
         self._ledger.apply_read(chain, account, native_wei, balances_raw, block)
 
-    def on_native_balance(self, chain, account: str, native_wei) -> None:
+    def on_native_balance(self, chain, account: str, native_wei,
+                          block=None) -> None:
         """The on-screen account's native balance, read over the live ws every
         ~minute (LiveWatcher.native_balance, relayed by TransactionsPlugin).
         Inbound ETH fires no Transfer log, so on_balance_dirty never sees it —
         this is the native counterpart. Apply in place (no discovery) and
-        freshen the cached native so the slow ws-live sweep stays a backstop
-        and the nothing-changed short-circuit settles."""
+        freshen the cached native. ``block`` orders it: a stale poll (an LB that
+        jumped backwards) is dropped so it can't regress the shown balance or
+        re-fire a 'received' notification for money that arrived earlier."""
         if self._displayed_view != (chain.chain_id, account.lower()):
             return
+        if self._ledger.native_stale(chain.chain_id, account, block):
+            return
+        # Panel first (it detects the change against the still-old cache), then
+        # the ordered cache write (stamps the native block).
         self._on_balance_refresh(chain.chain_id, native_wei, {})
-        self._touch_cached_native(chain.chain_id, account, native_wei)
+        self._ledger.apply_native(chain, account, native_wei, block)
         self._notify_native_delta(chain, account, int(native_wei))
 
     def _notify_native_delta(self, chain, account: str, native_wei: int) -> None:
@@ -940,19 +946,6 @@ class TokensPlugin(Plugin):
         notify = getattr(host, "notify", None) if host is not None else None
         if callable(notify):
             notify(title, body, icon)
-
-    def _touch_cached_native(self, chain_id: int, address: str, native_wei) -> None:
-        """Persist only the native balance to the wallet cache, leaving tokens
-        untouched. Without this a native-only ws refresh would update the panel
-        but not the cache, so the next full sweep's nothing_changed check (and
-        a cross-session reopen) would still see the stale native."""
-        import time
-        cached = self._wallet_cache.load(chain_id, address)
-        if cached is None or cached.native_balance_wei == int(native_wei):
-            return
-        cached.native_balance_wei = int(native_wei)
-        cached.native_balance_updated = int(time.time())
-        self._wallet_cache.save(cached)
 
     def _schedule_live_refresh(self, address: str) -> None:
         """Throttle: the first dirty event arms a one-shot timer; events

@@ -1257,15 +1257,17 @@ class TransactionsPlugin(Plugin):
             except Exception:
                 log.exception("on_balance_dirty failed")
 
-    def _on_native_balance(self, chain, account: str, native_wei) -> None:
+    def _on_native_balance(self, chain, account: str, native_wei,
+                           block=None) -> None:
         """The on-screen account's native balance, read over the live ws every
         ~minute (LiveWatcher.native_balance) — the inbound-ETH counterpart to
-        _on_balance_dirty (a plain ETH send fires no Transfer log). Relay to
+        _on_balance_dirty (a plain ETH send fires no Transfer log). ``block`` is
+        the height the read ran at, so the tokens plugin can order it. Relay to
         TokensPlugin for a lightweight native-only apply."""
         tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
         if tokens is not None and hasattr(tokens, "on_native_balance"):
             try:
-                tokens.on_native_balance(chain, account, native_wei)
+                tokens.on_native_balance(chain, account, native_wei, block)
             except Exception:
                 log.exception("on_native_balance failed")
 

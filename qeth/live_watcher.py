@@ -106,7 +106,7 @@ class LiveWatcher(QThread):
     # None if the ws read failed (e.g. the LB moved the socket to a backend that
     # doesn't have the block yet); the consumer then falls back to an http read.
     balance_dirty = Signal(object, str, str, object, object, object)
-    native_balance = Signal(object, str, object)  # (chain, account, wei)
+    native_balance = Signal(object, str, object, object)  # (chain, acct, wei, block)
     # (chain, account, token, counterparty, outgoing, raw_value) — a Transfer
     # touching the account, decoded for a sent/received desktop notification.
     # The value is the log's own (display only); balance_dirty drives the
@@ -421,16 +421,24 @@ class LiveWatcher(QThread):
         side of the Transfer-log subscription, which a plain ETH send never
         triggers. Failures are swallowed (retried next interval); the value is
         the node's authoritative balance, so we emit it directly (unlike a log,
-        whose value we never trust)."""
+        whose value we never trust).
+
+        Reads the block first, then the balance PINNED at it (same ws socket →
+        same backend), so the emitted (wei, block) pair is consistent and the
+        consumer can order it — a stale poll behind a load balancer that jumped
+        backwards must not regress the balance or re-fire a 'received' notice."""
         try:
-            raw = await self._rpc(w3, "eth_getBalance", [account, "latest"])
+            blk = await self._rpc(w3, "eth_blockNumber", [])
+            at = blk if blk is not None else "latest"
+            raw = await self._rpc(w3, "eth_getBalance", [account, at])
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.debug("[%s] native read: %s", chain.name, e)
             return
         if raw is not None:
-            self.native_balance.emit(chain, account, _to_int(raw))
+            block = _to_int(blk) if blk is not None else None
+            self.native_balance.emit(chain, account, _to_int(raw), block)
 
     async def _probe_pending(self, chain: "Chain", w3: Any) -> None:
         """Probe every pending tx the provider reports for this chain over

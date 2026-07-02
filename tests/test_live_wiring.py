@@ -107,8 +107,8 @@ def test_update_live_account_and_balance_dirty_relay(qtbot, monkeypatch):
     tokens.on_balance_dirty.assert_called_once_with(
         gnosis, "0xabc", "0xToken", 123, 10**18, 5)
 
-    plugin._on_native_balance(gnosis, "0xabc", 5 * 10**18)
-    tokens.on_native_balance.assert_called_once_with(gnosis, "0xabc", 5 * 10**18)
+    plugin._on_native_balance(gnosis, "0xabc", 5 * 10**18, 42)
+    tokens.on_native_balance.assert_called_once_with(gnosis, "0xabc", 5 * 10**18, 42)
 
     plugin._on_transfer_seen(gnosis, "0xabc", "0xtok", "0xcp", False, 7)
     tokens.on_transfer_seen.assert_called_once_with(
@@ -179,7 +179,7 @@ def test_on_native_balance_notifies_received_on_increase(qtbot, monkeypatch):
     tp.host = Mock()
     tp._displayed_view = (1, "0xme")
     monkeypatch.setattr(tp, "_on_balance_refresh", lambda *a: None)
-    monkeypatch.setattr(tp, "_touch_cached_native", lambda *a: None)
+    monkeypatch.setattr(tp._ledger, "apply_native", lambda *a, **k: False)
     ch = _chain_ns()
 
     # first sight seeds baseline — no notification
@@ -220,8 +220,8 @@ def test_maybe_notify_native_sent(qtbot):
 
 
 def test_tokens_on_native_balance_applies_only_for_current_view(qtbot, monkeypatch):
-    """on_native_balance applies a lightweight native-only refresh + cache
-    touch, but only when it's the on-screen view (the inbound-ETH path)."""
+    """on_native_balance applies a lightweight native-only refresh + ordered
+    cache write, but only when it's the on-screen view (the inbound-ETH path)."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokensPlugin
     tp = TokensPlugin(Mock())
@@ -232,17 +232,18 @@ def test_tokens_on_native_balance_applies_only_for_current_view(qtbot, monkeypat
         tp, "_on_balance_refresh",
         lambda cid, wei, bals: applied.append((cid, wei, bals)))
     monkeypatch.setattr(
-        tp, "_touch_cached_native",
-        lambda cid, addr, wei: touched.append((cid, addr, wei)))
+        tp._ledger, "apply_native",
+        lambda chain, acct, wei, block:
+            touched.append((chain.chain_id, acct, wei, block)) or False)
 
     # off-view: ignored
-    tp.on_native_balance(SimpleNamespace(chain_id=137), "0xABC", 7)
+    tp.on_native_balance(SimpleNamespace(chain_id=137), "0xABC", 7, 5)
     assert applied == [] and touched == []
 
-    # on-view: native-only apply (empty token map) + cache touch
-    tp.on_native_balance(SimpleNamespace(chain_id=100), "0xABC", 9 * 10**18)
+    # on-view: native-only apply (empty token map) + ordered cache write
+    tp.on_native_balance(SimpleNamespace(chain_id=100), "0xABC", 9 * 10**18, 5)
     assert applied == [(100, 9 * 10**18, {})]
-    assert touched == [(100, "0xABC", 9 * 10**18)]
+    assert touched == [(100, "0xABC", 9 * 10**18, 5)]
 
 
 def test_on_balance_dirty_targeted_runs_off_view(qtbot):
@@ -815,9 +816,11 @@ def test_persist_targeted_balances_writes_absolute(qtbot, tmp_path):
     assert [t.contract for t in reloaded.tokens] == ["0xtok"]
 
 
-def test_touch_cached_native_updates_only_native(qtbot, tmp_path):
-    """_touch_cached_native persists the new native balance while leaving the
-    cached tokens intact (so the slow sweep + cross-session reopen stay sane)."""
+def test_apply_native_updates_only_native_and_is_ordered(qtbot, tmp_path):
+    """The ordered native-only write (ledger.apply_native, driven by the ws
+    native poll) persists the new native while leaving cached tokens intact,
+    and a stale (older-block) poll can't regress it."""
+    from types import SimpleNamespace
     from qeth.plugins.tokens import TokensPlugin
     from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
@@ -826,21 +829,52 @@ def test_touch_cached_native_updates_only_native(qtbot, tmp_path):
         chain_id=100, address="0xabc", native_balance_wei=1,
         tokens=[CachedToken(contract="0xtok", symbol="T", name="Tok",
                             decimals=18, balance_raw=42)]))
+    ch = SimpleNamespace(chain_id=100)
 
-    tp._touch_cached_native(100, "0xABC", 5 * 10**18)
-
+    assert tp._ledger.apply_native(ch, "0xABC", 5 * 10**18, block=10) is True
     reloaded = tp._wallet_cache.load(100, "0xabc")
-    assert reloaded is not None
     assert reloaded.native_balance_wei == 5 * 10**18
     assert [(t.contract, t.balance_raw) for t in reloaded.tokens] == [("0xtok", 42)]
 
-    # no-op when unchanged (load returns same value; nothing re-saved is fine)
-    tp._touch_cached_native(100, "0xabc", 5 * 10**18)
+    # stale poll (older block) → no regression, no change
+    assert tp._ledger.apply_native(ch, "0xABC", 2 * 10**18, block=5) is False
     assert tp._wallet_cache.load(100, "0xabc").native_balance_wei == 5 * 10**18
 
-    # missing cache → silently ignored (no crash, nothing written)
-    tp._touch_cached_native(100, "0xdef", 3)
+    # unchanged value at a newer block → nothing re-saved
+    assert tp._ledger.apply_native(ch, "0xABC", 5 * 10**18, block=11) is False
+
+    # missing cache → silently ignored (nothing to update in place)
+    assert tp._ledger.apply_native(ch, "0xdef", 3, block=1) is False
     assert tp._wallet_cache.load(100, "0xdef") is None
+
+
+def test_stale_native_poll_does_not_regress_or_renotify(qtbot, monkeypatch,
+                                                        tmp_path):
+    """2d: an out-of-order ws native poll (LB jumped back) must not regress the
+    shown balance nor re-fire a 'received' notification for ETH seen earlier."""
+    from qeth.plugins.tokens import TokensPlugin
+    from qeth.wallet_cache import CachedWallet, WalletCache
+    tp = TokensPlugin(Mock())
+    tp.host = Mock()
+    tp._wallet_cache = WalletCache(cache_dir=tmp_path)
+    tp._wallet_cache.save(CachedWallet(
+        chain_id=100, address="0xme", native_balance_wei=10**18))
+    tp._displayed_view = (100, "0xme")
+    monkeypatch.setattr(tp, "_on_balance_refresh", lambda *a: None)
+    ch = _chain_ns(chain_id=100)
+
+    tp.on_native_balance(ch, "0xme", 12 * 10**18, 20)   # fresh: received 2 ETH
+    tp.host.notify.reset_mock()                          # drop the first-sight seed
+
+    # stale poll (older block) reporting the OLD balance → dropped entirely
+    tp.on_native_balance(ch, "0xme", 10 * 10**18, 15)
+    assert tp._wallet_cache.load(100, "0xme").native_balance_wei == 12 * 10**18
+    assert tp.host.notify.call_count == 0
+
+    # later fresh poll back to 12 → unchanged, no bogus "received" (the bug was
+    # a spurious notify after the stale value lowered the baseline)
+    tp.on_native_balance(ch, "0xme", 12 * 10**18, 21)
+    assert tp.host.notify.call_count == 0
 
 
 def test_tokens_on_balance_dirty_throttles_for_current_view(qtbot, monkeypatch):

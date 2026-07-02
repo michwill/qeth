@@ -416,15 +416,18 @@ def test_handle_log_without_topics_skips_transfer_seen(qapp):
     assert dirty == ["0xTok"] and seen == []
 
 
-def test_emit_native_emits_balance_from_hex(qapp):
-    """Native balance read over the ws → native_balance(chain, acct, wei),
-    hex normalised to int (the inbound-ETH path Transfer logs miss)."""
+def test_emit_native_emits_balance_and_coread_block(qapp):
+    """Native balance read over the ws → native_balance(chain, acct, wei,
+    block), hex normalised to int. The block is co-read on the same socket so
+    the consumer can order a stale poll out (the inbound-ETH path)."""
     w = _watcher()
     got: list = []
-    w.native_balance.connect(lambda c, acct, wei: got.append((acct, wei)))
-    w3 = _FakeW3(_FakeProvider({"eth_getBalance": hex(123 * 10**18)}))
+    w.native_balance.connect(
+        lambda c, acct, wei, blk: got.append((acct, wei, blk)))
+    w3 = _FakeW3(_FakeProvider({"eth_getBalance": hex(123 * 10**18),
+                                "eth_blockNumber": hex(0x1234)}))
     asyncio.run(w._emit_native(_chain(100), "0xacc", w3))
-    assert got == [("0xacc", 123 * 10**18)]
+    assert got == [("0xacc", 123 * 10**18, 0x1234)]
 
 
 def test_emit_native_swallows_missing_result(qapp):
@@ -432,7 +435,7 @@ def test_emit_native_swallows_missing_result(qapp):
     interval, never a bogus zero balance."""
     w = _watcher()
     got: list = []
-    w.native_balance.connect(lambda c, acct, wei: got.append(wei))
-    w3 = _FakeW3(_FakeProvider({}))   # eth_getBalance -> None
+    w.native_balance.connect(lambda c, acct, wei, blk: got.append(wei))
+    w3 = _FakeW3(_FakeProvider({"eth_blockNumber": hex(1)}))  # getBalance -> None
     asyncio.run(w._emit_native(_chain(100), "0xacc", w3))
     assert got == []
