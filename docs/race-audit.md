@@ -48,7 +48,21 @@ Done and committed:
 - **5d** — stale gas estimates dropped by emitting-worker identity.
 - **5e** — helios `_stop_all` snapshots under the lock; `ledger_hid.submit`
   enqueues under the lock; `_ensure_heavy_imports` / `_ensure_async_imports`
-  publish their guard symbol last.
+  publish their guard symbol last; **`RpcServer.stop()` schedules `loop.stop`
+  unconditionally** (the startup-window drop that left the port bound); **the
+  `_proxy` failover re-reads the clock per iteration** (a slow timeout no
+  longer backdates the next provider's cooldown).
+- **5a** — the ws handler dispatches each message as a task and serializes
+  sends through a per-ws lock: a signing prompt no longer head-of-line-blocks
+  the socket (Falkon's poll, a pipelined dapp call).
+- **5c** — the ENS reverse-lookup updates the row label in place (no rebuild),
+  and `_rebuild_tree` restores the user's selection instead of jumping to the
+  default — the async selection hijack is gone.
+- **4a** — single-instance guard (`qeth/single_instance.py`): a second launch
+  hands off to the running instance (raise its window) and exits, collapsing
+  the multi-instance data-loss class.
+- **4c** — `TokenMetadataCache.put_many` merges the on-disk file before
+  rewriting, so the two plugin instances stop clobbering each other.
 - **P2 BalanceLedger** — `qeth/balance_ledger.py` is now the single owner of
   the freshness stamps + ordered cache mutation (was two dicts + duplicated
   logic). Every balance write funnels through it: `apply_read` (absolute,
@@ -94,8 +108,22 @@ Deferred / not yet done:
   failed still emits the verified read unconditioned (block-wait's `not fast`
   path) — could drop a just-acquired name on a lagging proof; the safer policy
   (emit vs keep-unverified) is ambiguous.
-- **4a single-instance lock** — UX call (forbid vs focus-raise) for the user.
-- **P5** — being picked off individually.
+- **5b verified-sim floor bypass** — a dapp `eth_sendRawTransaction` is proxied
+  without recording it, so `fork_floor_block` doesn't know about the in-flight
+  tx and a follow-up verified preview forks behind head and can falsely revert.
+  Needs raw-tx sender/nonce recovery + a cross-thread record into the pending
+  tracker (the RPC runs on the aiohttp thread). MED, involved — a dedicated
+  pass.
+- **4d AbiCache sentinel TOCTOU** — LOW, self-healing (µs window, 14 d sentinel
+  expiry); accept + document, or `O_EXCL` for sentinels.
+- **5f leaks** (not races) — tx-details / composer dialogs connect to the shared
+  `IconCache.icon_ready` and are never destroyed; `_call_on_confirm` listeners
+  for dropped txs never disconnected.
+- **5g** — implicit-thread-safety comments on the `finished`-signal set-mutating
+  lambdas (single GIL-atomic ops today; a comment so nobody adds iteration).
+- **P2/P3 satellites (LOW)** — `_unpriced_since` account keying;
+  `_carry_forward_absent` shouldn't stamp; `_reconcile_up_to_block` shutdown
+  guard; `_force_reread` per-worker; verify-worker fast-read-failed emit.
 
 Post-fix re-review notes (adversarial pass over the branch):
 - **min-block trade — REVISED, the min was wrong too.** The "self-healing"
