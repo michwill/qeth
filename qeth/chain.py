@@ -99,6 +99,19 @@ class ChainError(Exception):
 # Multicall3 is deployed at the same address on every EVM chain we support.
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
+# ArbSys precompile (Arbitrum chains). Inside the Arbitrum EVM,
+# ``block.number`` — which is what Multicall3's getBlockNumber() returns — is
+# the L1 *Ethereum* block (~25M), while receipts, logs and eth_blockNumber all
+# carry L2 numbers (~479M). Mixing the two breaks any consumer that orders
+# reads by block: a floor stamped from a receipt (L2) rejects every
+# multicall-stamped read (L1) as stale, forever — the Arbitrum stuck-balance
+# bug. ArbSys.arbBlockNumber() returns the L2 number. On every other chain
+# address 0x64 has no code, so an aggregate3 sub-call to it trivially
+# "succeeds" with EMPTY returndata (decoded → None by the length guard) and we
+# fall back to getBlockNumber — probed live on ETH/OP/Polygon/Base/Gnosis
+# (empty success) and BNB (failure); no chain list to maintain.
+_ARBSYS = "0x0000000000000000000000000000000000000064"
+
 # 4-byte function selectors. Pre-computed (Keccak isn't in stdlib hashlib).
 # Verified against the published ABIs:
 #   aggregate3((address,bool,bytes)[]) -> 0x82ad56cb
@@ -106,7 +119,9 @@ MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 #   name()                             -> 0x06fdde03
 #   symbol()                           -> 0x95d89b41
 #   decimals()                         -> 0x313ce567
+#   arbBlockNumber()                   -> 0xa3b1b31d
 _SEL_AGGREGATE3 = bytes.fromhex("82ad56cb")
+_SEL_ARB_BLOCK_NUMBER = bytes.fromhex("a3b1b31d")
 _SEL_BALANCE_OF = bytes.fromhex("70a08231")
 _SEL_NAME = bytes.fromhex("06fdde03")
 _SEL_SYMBOL = bytes.fromhex("95d89b41")
@@ -625,9 +640,17 @@ class Multicall:
             batch = self._queued[start:start + self.batch_size]
             calls = [(target, True, data) for target, data, _ in batch]
             if self.track_blocks:
-                # Prepend getBlockNumber so THIS chunk reports the height it
-                # actually ran at. keccak256("getBlockNumber()")[:4] = 42cbb15c.
+                # Prepend getBlockNumber + ArbSys.arbBlockNumber() so THIS
+                # chunk reports the height it actually ran at — in the same
+                # number space the rest of the app uses (receipts / logs /
+                # eth_blockNumber). On Arbitrum block.number is the L1 block,
+                # so getBlockNumber alone under-reports by ~450M and every
+                # read looks older than a receipt-stamped floor (the stuck-
+                # balance bug); arbBlockNumber is the L2 height there and
+                # empty (→ fallback) everywhere else — see _ARBSYS above.
+                # keccak256("getBlockNumber()")[:4] = 42cbb15c.
                 calls.insert(0, (MULTICALL3, True, bytes.fromhex("42cbb15c")))
+                calls.insert(1, (_ARBSYS, True, _SEL_ARB_BLOCK_NUMBER))
             calldata = _SEL_AGGREGATE3 + abi_encode(
                 ["(address,bool,bytes)[]"], [calls]
             )
@@ -648,18 +671,23 @@ class Multicall:
                 continue
             chunk_block: int | None = None
             if self.track_blocks:
-                if not decoded:
-                    # A well-formed-but-empty result array (never seen from a
-                    # real Multicall3, which returns len(calls) entries) —
+                if len(decoded) < 2:
+                    # A well-formed-but-truncated result array (never seen from
+                    # a real Multicall3, which returns len(calls) entries) —
                     # treat the chunk as failed rather than IndexError below.
                     for _, _, pending in batch:
                         pending.success = False
                     self._chunk_blocks.append(None)
                     continue
                 blk_success, blk_ret = decoded[0]
+                arb_success, arb_ret = decoded[1]
                 chunk_block = _decode_uint256(blk_ret) if blk_success else None
+                arb_block = _decode_uint256(arb_ret) if arb_success else None
+                if arb_block:
+                    # Arbitrum: the L2 height (empty/absent → falsy elsewhere).
+                    chunk_block = arb_block
                 self._chunk_blocks.append(chunk_block)
-                decoded = decoded[1:]   # drop the injected block result
+                decoded = decoded[2:]   # drop the injected block results
             for (_, _, pending), (success, retdata) in zip(batch, decoded):
                 pending.block = chunk_block
                 pending.success = bool(success)

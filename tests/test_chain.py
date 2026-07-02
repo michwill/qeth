@@ -309,16 +309,20 @@ class TestMulticallContextManager:
     def test_track_blocks_stamps_each_pending_with_its_chunk_block(
             self, eth_client, monkeypatch):
         """With track_blocks, each chunk carries an injected getBlockNumber
-        (result 0); every pending in that chunk is stamped with it, and
-        min_block() is the lowest — the conservative whole-batch stamp."""
+        (result 0) + ArbSys probe (result 1, empty off-Arbitrum); every pending
+        in that chunk is stamped with the chunk height, and min_block() is the
+        lowest — the conservative whole-batch stamp."""
         tokens = ["0x" + c * 40 for c in "ab"]
         holder = "0x" + "d" * 40
         # batch_size=1 → one token per chunk; simulate an LB serving the two
-        # chunks at DIFFERENT heights.
+        # chunks at DIFFERENT heights. (True, b"") = the ArbSys probe hitting
+        # the codeless 0x64 address off-Arbitrum: trivial success, empty data.
         responses = iter([
             _aggregate3_response([(True, (50).to_bytes(32, "big")),   # block
+                                  (True, b""),                         # ArbSys
                                   (True, (1).to_bytes(32, "big"))]),   # bal a
             _aggregate3_response([(True, (60).to_bytes(32, "big")),   # block
+                                  (True, b""),                         # ArbSys
                                   (True, (2).to_bytes(32, "big"))]),   # bal b
         ])
         monkeypatch.setattr(eth_client, "call",
@@ -330,6 +334,29 @@ class TestMulticallContextManager:
         assert b.value == 2 and b.block == 60
         assert mc.min_block() == 50
 
+    def test_track_blocks_uses_arbsys_l2_height_on_arbitrum(
+            self, eth_client, monkeypatch):
+        """On Arbitrum, block.number (Multicall3.getBlockNumber) is the L1
+        Ethereum block (~25M) while receipts/logs/eth_blockNumber are L2
+        (~479M) — one ordering domain must not mix them (a receipt-stamped
+        floor at L2 rejects every L1-stamped read forever: the stuck-balance
+        bug). The injected ArbSys.arbBlockNumber() probe returns the L2 height
+        there, and the chunk block prefers it."""
+        token = "0x" + "a" * 40
+        holder = "0x" + "d" * 40
+        response = _aggregate3_response([
+            (True, (25_444_154).to_bytes(32, "big")),    # getBlockNumber (L1)
+            (True, (479_582_983).to_bytes(32, "big")),   # arbBlockNumber (L2)
+            (True, (11).to_bytes(32, "big")),            # balanceOf
+        ])
+        monkeypatch.setattr(eth_client, "call",
+                            lambda tx, block="latest": response)
+        with eth_client.multicall(track_blocks=True) as mc:
+            p = mc.balance_of(token, holder)
+        assert p.value == 11
+        assert p.block == 479_582_983       # the L2 height, not block.number
+        assert mc.min_block() == 479_582_983
+
     def test_head_balances_coreads_native_block_and_tokens(
             self, eth_client, monkeypatch):
         """head_balances co-reads getBlockNumber + getEthBalance + balanceOf in
@@ -339,6 +366,7 @@ class TestMulticallContextManager:
         holder = "0x" + "b" * 40
         response = _aggregate3_response([
             (True, (0x1234).to_bytes(32, "big")),   # getBlockNumber (injected)
+            (True, b""),                             # ArbSys probe (off-Arb)
             (True, (999).to_bytes(32, "big")),       # getEthBalance (native)
             (True, (500).to_bytes(32, "big")),       # balanceOf(token)
         ])
@@ -364,10 +392,13 @@ class TestMulticallContextManager:
         # batch_size=1 → chunks [native], [tokA], [tokB]; the tokA chunk lags.
         responses = iter([
             _aggregate3_response([(True, (100).to_bytes(32, "big")),   # block
+                                  (True, b""),                          # ArbSys
                                   (True, (7).to_bytes(32, "big"))]),    # native
             _aggregate3_response([(True, (98).to_bytes(32, "big")),    # LAGS
+                                  (True, b""),                          # ArbSys
                                   (True, (11).to_bytes(32, "big"))]),   # tokA
             _aggregate3_response([(True, (101).to_bytes(32, "big")),   # block
+                                  (True, b""),                          # ArbSys
                                   (True, (13).to_bytes(32, "big"))]),   # tokB
         ])
         monkeypatch.setattr(eth_client, "call",
