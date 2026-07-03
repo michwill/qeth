@@ -1,5 +1,5 @@
 Name:           qeth
-Version:        0.13.0
+Version:        0.14.0
 Release:        1%{?dist}
 Summary:        Qt Ethereum wallet with Ledger support and a Frame-compatible JSON-RPC server
 
@@ -116,6 +116,21 @@ install -Dm0644 qeth/assets/logos/qeth-icon-rounded.svg \
 %{_datadir}/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
 
 %changelog
+* Thu Jul 03 2026 Michael Egorov <michwill@yieldbasis.com> - 0.14.0-1
+- ENS name management: the ENS panel now shows owner + manager roles in the
+  tree, discovers names you own as registrant but don't manage (e.g. crv.eth)
+  and subdomains of your names, and lets you set the manager, transfer, extend,
+  and reassign an unwrapped subdomain's manager. Expiry is read from the
+  on-chain nameExpires (not the indexer's grace-inclusive date).
+- Race-condition audit and hardening pass across the transaction, ENS, store,
+  and lifecycle paths: block-ordered balance writes, per-generation epochs that
+  drop stale async landings, same-nonce collision fixes, and a single-instance
+  guard that hands off to the running window.
+- Token-balance correctness: every balance path is now block-ordered, discovery
+  merges instead of replacing, Arbitrum balances stamp the L2 block (fixes a
+  stuck-balance bug), and displayed balances reconcile on a timer so a silently
+  dropped WebSocket log subscription can't leave a stale ERC-20 balance.
+
 * Sat Jun 13 2026 Michael Egorov <michwill@yieldbasis.com> - 0.13.0-1
 - Desktop notifications for sent/received ETH and tokens, with the token/coin
   icon and a direction badge. Delivered via the freedesktop notification
