@@ -90,6 +90,28 @@ class VerifiedLogs(list):
     the type is the marker the UI uses to show the verified badge."""
 
 
+class RemoteLogs(list):
+    """Simulation logs from the UNVERIFIED fast path (``eth_simulateV1`` or a
+    plain fork), served *because a Helios sidecar exists for this chain but is
+    still behind the state we need to prove* — its head trails the fork floor
+    (a just-received token, or our own just-confirmed tx). Not proof-verified,
+    but the fork ran at the real head so it sees the fresh state a lagging
+    verified fork would have missed (and falsely reverted on). Distinct from a
+    plain ``list`` (no Helios on this chain → simply unverified) so the UI can
+    say 'verifying…' rather than silently dropping the badge; verified mode
+    resumes on its own once Helios catches up."""
+
+
+def _mark_remote(result, catching_up: bool):
+    """Tag an unverified list result as ``RemoteLogs`` when it was served only
+    because Helios was behind the fork floor. Non-list outcomes (a revert, a
+    note, or ``None``) pass through untouched — the 'verifying…' badge is about
+    a shown preview, not a failure."""
+    if catching_up and type(result) is list:
+        return RemoteLogs(result)
+    return result
+
+
 # Calldata sent to an address with no contract code: the EVM ignores it
 # (simulates as a clean no-op), but on chains with NATIVE system
 # contracts (e.g. TAC's 0x08xx precompile range) the node acts on it
@@ -467,6 +489,9 @@ def simulate_logs(chain, from_addr: str, to_addr, data, value,
         return None   # contract creation — not previewed
     import time as _time
     deadline = _time.monotonic() + budget_s if budget_s else None
+    # Set when a Helios sidecar exists but is behind our fork floor, so we serve
+    # an unverified (remote) preview this round — the UI badges it 'verifying…'.
+    catching_up = False
     if fork_reader is None:
         # Verified mode: when a Helios sidecar can serve this chain,
         # prefer the local fork over PROOF-VERIFIED state to the
@@ -484,15 +509,19 @@ def simulate_logs(chain, from_addr: str, to_addr, data, value,
         helios_chain = verified_chain(chain) if fork_available() else None
         if helios_chain is not None and _floor_ahead_of_head(
                 helios_chain, floor_block):
-            # The Helios head is still behind this wallet's own latest confirmed
-            # tx (it catches up within ~30s). A verified fork would run before
-            # that tx and miss its state, falsely reverting the follow-up — so
-            # fall through to the unverified sim, which forks at the real head
-            # and sees it. A correct (unverified) preview beats a wrong verified
-            # one; verified mode resumes automatically once Helios catches up.
-            log.info("helios head behind wallet's last tx (block %s); using "
+            # The Helios head is still behind the fork floor — this wallet's
+            # latest confirmed tx OR the block a just-received token last
+            # changed at (it catches up within ~30s). A verified fork is capped
+            # at Helios's head, so it would run BEFORE that block and miss the
+            # state — falsely reverting e.g. a send of the token that just
+            # arrived. Fall through to the unverified sim, which forks at the
+            # real head and sees it: a correct (unverified) preview beats a
+            # wrong verified one. Flagged catching_up so the UI shows a
+            # 'verifying…' badge; verified mode resumes once Helios catches up.
+            log.info("helios head behind fork floor (block %s); using "
                      "unverified sim this round", floor_block)
             helios_chain = None
+            catching_up = True
         if helios_chain is not None:
             log.info("simulating on helios-verified state (%s)",
                      helios_chain.rpc_url)
@@ -523,7 +552,9 @@ def simulate_logs(chain, from_addr: str, to_addr, data, value,
                                      retries=retries, sleep=sleep,
                                      deadline=deadline)
             _SIMV1_SUPPORT[chain.rpc_url] = True
-            return logs   # list (success) or None (definitive revert)
+            # list (success) or None (definitive revert); tagged remote when
+            # served only because Helios was behind the floor.
+            return _mark_remote(logs, catching_up)
         except _SimV1Unsupported:
             _SIMV1_SUPPORT[chain.rpc_url] = False
             log.info("eth_simulateV1 not on %s; using local fork",
@@ -531,6 +562,8 @@ def simulate_logs(chain, from_addr: str, to_addr, data, value,
         except Exception as e:
             log.warning("eth_simulateV1 failed on %s (%s); trying local fork",
                         chain.rpc_url, e)
-    return _simulate_via_fork(chain, from_addr, to_addr, data, value,
-                              fork_reader=fork_reader, fork_block=fork_block,
-                              retries=retries, sleep=sleep, deadline=deadline)
+    return _mark_remote(
+        _simulate_via_fork(chain, from_addr, to_addr, data, value,
+                           fork_reader=fork_reader, fork_block=fork_block,
+                           retries=retries, sleep=sleep, deadline=deadline),
+        catching_up)

@@ -547,6 +547,25 @@ def test_verified_skipped_when_helios_behind_floor(monkeypatch):
     out = simulate_logs(CHAIN, FROM, USDC, "0x1234", 0, floor_block=105)
     assert used == ["rpc"]          # unverified path taken, verified fork skipped
     assert out == ["unverified"]
+    # ...and tagged RemoteLogs so the UI badges it 'verifying…' (Helios behind,
+    # not a plain unverified chain).
+    assert isinstance(out, sim.RemoteLogs)
+
+
+def test_unverified_without_helios_is_not_tagged_remote(monkeypatch):
+    """No Helios on this chain → a plain unverified simV1 preview, NOT the
+    'verifying…' remote tag (which is only for a Helios that's merely behind
+    the floor). Otherwise every unverified chain would falsely claim to be
+    verifying."""
+    import qeth.helios as helios_mod
+    from qeth.simulate import RemoteLogs
+    monkeypatch.setattr(sim, "_SIMV1_SUPPORT", {})
+    monkeypatch.setattr(sim, "fork_available", lambda: True)
+    monkeypatch.setattr(helios_mod, "verified_chain", lambda chain: None)
+    monkeypatch.setattr(sim, "_simulate_via_rpc", lambda *a, **k: ["plain"])
+    out = simulate_logs(CHAIN, FROM, USDC, "0x1234", 0, floor_block=105)
+    assert out == ["plain"]
+    assert not isinstance(out, RemoteLogs)
 
 
 def test_simv1_rpc_raises_unsupported_on_minus_32601(monkeypatch):

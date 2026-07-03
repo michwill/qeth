@@ -136,6 +136,36 @@ def test_floor_ignores_pending_from_others_and_dropped():
     assert _plugin_with_cache(txs).fork_floor_block(1, ADDR) == 100
 
 
+def test_floor_includes_the_sent_tokens_balance_block():
+    """Sending a JUST-RECEIVED token: the fork floor rises to the block that
+    token's balance last changed at (the tokens plugin's ledger stamp), so a
+    verified preview doesn't fork before the inbound transfer and revert on a
+    zero balance. Takes the max with our own sent-tx floor."""
+    from types import SimpleNamespace
+    token = "0x" + "ab" * 20
+    plug = _plugin_with_cache([_tx(100)])          # our last sent tx at 100
+    plug.host = SimpleNamespace(tokens_plugin=SimpleNamespace(
+        last_balance_block=lambda cid, addr, tok:
+        150 if tok.lower() == token.lower() else None))
+    # sim_target is the token contract (an ERC-20 transfer's `to`).
+    assert plug.fork_floor_block(1, ADDR, token) == 150
+    # A target we hold no stamp for → floor unaffected (stays our tx block).
+    assert plug.fork_floor_block(1, ADDR, OTHER) == 100
+    # No target (native send / provider called with 2 args) → unchanged.
+    assert plug.fork_floor_block(1, ADDR) == 100
+
+
+def test_pending_sentinel_beats_the_token_block():
+    """An in-flight sent tx still demands head — the token stamp can't pull the
+    floor below the 'fork at head' sentinel."""
+    from types import SimpleNamespace
+    token = "0x" + "ab" * 20
+    plug = _plugin_with_cache([_tx(0, pending=True)])
+    plug.host = SimpleNamespace(tokens_plugin=SimpleNamespace(
+        last_balance_block=lambda cid, addr, tok: 150))
+    assert plug.fork_floor_block(1, ADDR, token) == _FORK_FLOOR_HEAD
+
+
 # --- GasSuggestionWorker: applies the floor over the MINED count -----------
 
 class _StubClient:

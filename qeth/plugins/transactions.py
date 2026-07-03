@@ -1181,10 +1181,10 @@ class TransactionsPlugin(Plugin):
         ]
         return max(nonces) + 1 if nonces else None
 
-    def fork_floor_block(self, chain_id: int, address: str) -> int | None:
-        """The block a verified preview must not fork BEFORE, so an
-        approve-then-swap sees the approval. The latest block this wallet's
-        own sent activity may have touched on ``chain_id``:
+    def fork_floor_block(self, chain_id: int, address: str,
+                         sim_target: str | None = None) -> int | None:
+        """The block a verified preview must not fork BEFORE, so a follow-up
+        call sees the state that already landed. The latest of:
 
           - an in-flight (pending, not dropped) sent tx → ``_FORK_FLOOR_HEAD``,
             a sentinel meaning "fork at the freshest state (head)". The tx may
@@ -1192,20 +1192,41 @@ class TransactionsPlugin(Plugin):
             confirmed (the ~30 s window that hid an approval from the next
             swap) — forking behind the head would still miss it, so demand
             head; ``_latest_block`` clamps the sentinel down to the live head.
-          - else the highest CONFIRMED sent-tx block.
+          - the highest CONFIRMED sent-tx block (an approve-then-swap sees the
+            approval). Only txs we *sent* (``from == address``) count there.
+          - the block a JUST-RECEIVED token last changed at, when ``sim_target``
+            is that token (an ERC-20 transfer's ``to`` is the token contract) —
+            so sending a token that arrived seconds ago doesn't fork before the
+            inbound transfer and falsely revert on a zero balance.
           - else ``None`` (the fork uses its per-chain lag alone).
 
-        Only txs we *sent* (``from == address``) count — those are the ones
-        whose omission would make a follow-up call falsely revert."""
+        When the floor exceeds Helios's synced head the caller serves an
+        unverified (remote) preview until it catches up — see ``simulate_logs``."""
         addr = address.lower()
         txs = self._cache.get((chain_id, addr))
         if txs is None:
             txs = self._disk_cache.load(chain_id, addr) or []
         sent = [t for t in txs if (t.from_addr or "").lower() == addr]
         if any(t.pending and not getattr(t, "dropped", False) for t in sent):
-            return _FORK_FLOOR_HEAD
+            return _FORK_FLOOR_HEAD   # already "fork at head"; nothing's fresher
         blocks = [t.block_number for t in sent if t.block_number]
+        token_block = self._sent_asset_floor(chain_id, address, sim_target)
+        if token_block is not None:
+            blocks.append(token_block)
         return max(blocks) if blocks else None
+
+    def _sent_asset_floor(self, chain_id: int, address: str,
+                          sim_target: str | None) -> int | None:
+        """The block the asset being sent last changed at, from the tokens
+        plugin's BalanceLedger. ``sim_target`` is the simulation's ``to`` — the
+        token contract for an ERC-20 transfer; for a native send or a dapp call
+        it's some other address the ledger has no stamp for, so this is ``None``
+        and the floor is unaffected."""
+        if not sim_target:
+            return None
+        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        getter = getattr(tokens, "last_balance_block", None)
+        return getter(chain_id, address, sim_target) if callable(getter) else None
 
     def _rebuild_live_snapshot(self) -> None:
         """Main-thread rebuild of the pending snapshot the LiveWatcher reads,
@@ -3083,6 +3104,21 @@ class _EventsView(QWidget):
         self.verified_lbl.setToolTip("Cryptographically verified simulation")
         self.verified_lbl.hide()
         header.addWidget(self.verified_lbl)
+        # Shown instead of ✓ verified when the preview is an UNVERIFIED remote
+        # sim served only because the Helios light client is still behind this
+        # block (a just-received token / our own just-confirmed tx). Amber (the
+        # _IDENTITY_TINT "caution" pair) — not the reassuring green, not a red
+        # revert. See _EventPreviewMixin / simulate.RemoteLogs.
+        self.remote_lbl = QLabel("⧗ verifying…")
+        self.remote_lbl.setStyleSheet(
+            "background:#fff3cd; color:#664d03; "
+            "padding:1px 6px; border-radius:4px;")
+        self.remote_lbl.setToolTip(
+            "Unverified remote preview — the Helios light client is still "
+            "catching up to this block. It verifies on its own shortly; "
+            "reopen or edit the transaction to re-check.")
+        self.remote_lbl.hide()
+        header.addWidget(self.remote_lbl)
         header.addStretch(1)
         self.show_all_events_btn = QPushButton("Show &all events")
         self.show_all_events_btn.setCheckable(True)
@@ -3121,6 +3157,7 @@ class _EventsView(QWidget):
         self._spin_text = text
         self.show_all_events_btn.setEnabled(False)
         self.verified_lbl.hide()
+        self.remote_lbl.hide()
         self._spin_i = 0
         self.events_view.setPlainText(f"{self._spin_frames[0]}  {text}")
         self._spin_timer.start()
@@ -3130,11 +3167,23 @@ class _EventsView(QWidget):
         self.events_view.setPlainText(text)
         self.show_all_events_btn.setEnabled(False)
         self.verified_lbl.hide()
+        self.remote_lbl.hide()
 
     def set_verified(self, on: bool) -> None:
-        """Show/hide the '⚡ verified' badge. Only the simulation path
-        sets it (receipt-log views never call this)."""
+        """Show/hide the '✓ verified' badge. Only the simulation path
+        sets it (receipt-log views never call this). Mutually exclusive with
+        the amber 'verifying…' badge."""
+        if on:
+            self.remote_lbl.hide()
         self.verified_lbl.setVisible(on)
+
+    def set_remote(self, on: bool) -> None:
+        """Show/hide the amber '⧗ verifying…' badge — an unverified remote
+        preview shown because Helios is still behind this block. Mutually
+        exclusive with the green '✓ verified' badge."""
+        if on:
+            self.verified_lbl.hide()
+        self.remote_lbl.setVisible(on)
 
     def set_logs(self, logs) -> None:
         self._spin_timer.stop()
@@ -3300,7 +3349,7 @@ class _EventPreviewMixin:
         _abi_source: AnyAbiSource | None
         _abi_cache: AbiCache
         _start_worker: Any
-        _sim_floor_provider: Callable[[int, str], int | None] | None
+        _sim_floor_provider: Callable[[int, str, str | None], int | None] | None
 
         def _sim_params(self) -> Any: ...
         def fontMetrics(self) -> Any: ...   # noqa: N802 — the host QWidget's
@@ -3441,7 +3490,8 @@ class _EventPreviewMixin:
         from_addr, to_addr, data, value = params
         floor_block = None
         if self._sim_floor_provider is not None:
-            floor_block = self._sim_floor_provider(self.chain.chain_id, from_addr)
+            floor_block = self._sim_floor_provider(
+                self.chain.chain_id, from_addr, to_addr)
         worker = SimulateWorker(self.chain, from_addr, to_addr, data, value,
                                 floor_block=floor_block)
         self._sim_worker = worker
@@ -3484,7 +3534,8 @@ class _EventPreviewMixin:
             return   # superseded by a newer sim, or already timed out
         self._sim_done = True
         self._detach_sim()
-        from ..simulate import RevertNote, SimulationNote, VerifiedLogs
+        from ..simulate import (
+            RemoteLogs, RevertNote, SimulationNote, VerifiedLogs)
         if isinstance(logs, RevertNote):
             # Definitive revert — warn in red above Confirm (warn-only, send
             # stays enabled) and mirror the reason in the Events tab.
@@ -3502,6 +3553,7 @@ class _EventPreviewMixin:
             self._events.set_placeholder(logs.text)
             return
         self._events.set_verified(isinstance(logs, VerifiedLogs))
+        self._events.set_remote(isinstance(logs, RemoteLogs))
         if logs is None:
             # No definitive answer — the worker may have just *learned* this
             # endpoint can't simulate (no eth_simulateV1, no py-evm), or a

@@ -405,6 +405,20 @@ class TokensPlugin(Plugin):
     def icon_cache(self) -> IconCache:
         return self._icon_cache
 
+    def last_balance_block(self, chain_id: int, address: str,
+                           token: str) -> int | None:
+        """The block at which we last applied a confirmed ``balanceOf`` read
+        for ``(chain, wallet, token)`` — the BalanceLedger's freshness stamp.
+        A verified preview uses this as a fork floor so sending a token that
+        just arrived doesn't fork BEFORE the inbound transfer (which would make
+        it falsely revert on a zero balance). ERC-20 contract only; ``None``
+        when we've never stamped this token (then the floor is unaffected).
+        Idle tokens are only stamped by the periodic sweeps (which lag the
+        head), so this reads near the head ONLY right after a live transfer —
+        exactly when the floor should bite."""
+        return self._ledger.balance_block.get(
+            (chain_id, address.lower(), token.lower()))
+
     def _native_chain_icon(self, chain_id: int):
         """Chain logo for the native-asset row, via the host's chain-icon
         cache (kicks a fetch on miss). None until attached / fetched."""
