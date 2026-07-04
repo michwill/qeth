@@ -1475,15 +1475,21 @@ class WalletsPlugin(Plugin):
     def _show_qr_info(self) -> None:
         """QR button → modal popup with the receive QR plus the
         account's address / path / source / scheme."""
-        addr = self.selected_address
-        if not addr:
+        key = self._selected_key()
+        if key is None:
             return
+        addr, path = key
+        # The exact selected record (not first-match by address) so a repeat
+        # address shows the branch the user picked; with its effective label.
         acct = next(
-            (a for a in self._store.accounts if a["address"] == addr), None,
+            (a for a in self._store.accounts
+             if a["address"] == addr and a.get("path", "") == path), None,
         )
         if acct is None:
             return
-        dlg = AccountInfoDialog(acct, parent=self._container)
+        dlg = AccountInfoDialog(
+            {**acct, "label": self._effective_label(addr)},
+            parent=self._container)
         dlg.exec()
 
     def _edit_label(self) -> None:
@@ -1492,10 +1498,10 @@ class WalletsPlugin(Plugin):
         addr = self.selected_address
         if not addr:
             return
-        acct = next(
-            (a for a in self._store.accounts if a["address"] == addr), None,
-        )
-        current = (acct.get("label") if acct else "") or ""
+        # Pre-fill the EFFECTIVE label (what the row actually shows) so editing a
+        # repeat address doesn't start from a blank when only its twin carried
+        # the label. The save (set_label) writes it to every record either way.
+        current = self._effective_label(addr)
         new, ok = prompt_text(
             self._container, "Edit Label", f"Label for {addr}:", current,
         )

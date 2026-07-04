@@ -654,9 +654,22 @@ class MainWindow(QMainWindow):
         """(address, label) for every account the user owns — the Send
         dialog's recipient autocomplete + own-wallet label. Scoped to the
         user's own wallets only (no arbitrary saved contacts), so the
-        picker can never suggest an address you didn't add yourself."""
-        return [(a["address"], a.get("label") or "")
-                for a in self.store.accounts]
+        picker can never suggest an address you didn't add yourself.
+
+        One entry per ADDRESS, carrying its effective label — a repeat address
+        (held in two branches, one unlabelled) still resolves by its label,
+        instead of the empty-label twin winning the de-dup."""
+        book: dict[str, tuple[str, str]] = {}
+        for a in self.store.accounts:
+            addr = a["address"]
+            low = addr.lower()
+            label = a.get("label") or ""
+            existing = book.get(low)
+            if existing is None:
+                book[low] = (addr, label)
+            elif not existing[1] and label:      # fill an empty label from a twin
+                book[low] = (existing[0], label)
+        return list(book.values())
 
     def icon_cache(self):
         return self.tokens_plugin.icon_cache
