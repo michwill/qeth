@@ -54,6 +54,13 @@ simulate = ["py-evm>=0.10"]
 # (incl. signing) works without it. Install with:
 #   uv pip install -e '.[frame]'
 frame = ["cryptography>=42"]
+# Air-gapped QR signer (Keystone / Keycard Shell — BC-UR + EIP-4527). The
+# headless codec (qeth/qr/: bytewords + single-part UR + the eth-sign-request /
+# eth-signature registry) needs only CBOR here; the camera + QR-decode stack
+# (zxing-cpp, system QtMultimedia) is pulled in with the exchange dialog later.
+# See docs/signers-qr.md. Install with:
+#   uv pip install -e '.[qr]'
+qr = ["cbor2>=5.4"]
 
 [dependency-groups]
 dev = [
@@ -68,6 +75,8 @@ dev = [
     # The frame extra, mirrored so the Frame-import decrypt tests run
     # against the real cryptography rather than relying on system packages.
     "cryptography>=42",
+    # The qr extra, mirrored so the BC-UR / EIP-4527 codec tests run.
+    "cbor2>=5.4",
 ]
 
 [tool.uv]
@@ -174,6 +183,10 @@ files = [
     "qeth/signers/hot.py",
     "qeth/signers/watch_only.py",
     "qeth/signer_interaction.py",
+    "qeth/qr/__init__.py",
+    "qeth/qr/bytewords.py",
+    "qeth/qr/ur.py",
+    "qeth/qr/eth.py",
     "qeth/alerts.py",
     "qeth/dialog.py",
     "qeth/branding.py",
