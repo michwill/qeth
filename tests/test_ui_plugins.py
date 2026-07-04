@@ -3240,6 +3240,39 @@ class TestEventPreviewTab:
         assert fin.nonce == 7                        # fixed, not the suggested 99
         assert fin.max_fee_per_gas == 60_000_000_000
 
+    def test_expected_fee_field_grows_for_async_value(self, qtbot, tmp_qeth):
+        """The Expected-fee value arrives async, after the field was already
+        sized to its "—" placeholder. macOS QFormLayout defaults to
+        FieldsStayAtSizeHint + AlignHCenter, so the word-wrapping fee wrapped
+        into that tiny field and rendered as a bare, centered "≈". Pin the
+        growing + left-aligned behaviour so the estimate shows everywhere."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QFormLayout
+        _, started = self._started()
+        dlg = self._sign(qtbot, started)
+        dlg._on_gas_suggested({
+            "base_fee": 20_000_000_000, "estimated_gas": 21000, "gas": 21000,
+            "max_fee_per_gas": 25_000_000_000,
+            "max_priority_fee_per_gas": 1_000_000_000, "nonce": 1,
+        })
+        fee = dlg.max_total_lbl.text()
+        assert fee.startswith("≈") and "ETH" in fee \
+            and any(c.isdigit() for c in fee), fee   # a real value, not a bare "≈"
+
+        def _form_of(target):
+            for form in dlg.findChildren(QFormLayout):
+                for r in range(form.rowCount()):
+                    it = form.itemAt(r, QFormLayout.ItemRole.FieldRole)
+                    if it is not None and it.widget() is target:
+                        return form
+            return None
+
+        form = _form_of(dlg.max_total_lbl)
+        assert form is not None
+        assert (form.fieldGrowthPolicy()
+                == QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        assert bool(form.formAlignment() & Qt.AlignmentFlag.AlignLeft)
+
     def test_nonce_reresolved_at_signing_time(self, qtbot, tmp_qeth):
         """Two composer dialogs for one account can be open at once (a dapp
         sign alongside a GUI Send). Each captured its nonce at open; the

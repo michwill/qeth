@@ -4572,6 +4572,12 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setFormAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        # See the fee-summary note below: on macOS fields stay at sizeHint, so an
+        # async-updated row (the Contract identity badge) would clip. Today the
+        # long From/To addresses widen the shared field column enough to hide it;
+        # pin the growth policy so it doesn't depend on that.
+        header.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         header.setHorizontalSpacing(16)
         header.setVerticalSpacing(6)
         outer.addLayout(header)
@@ -4614,6 +4620,17 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         summary = QFormLayout()
         summary.setLabelAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        # macOS QFormLayout defaults differ from every other style: formAlignment
+        # is AlignHCenter (centers the row) and fieldGrowthPolicy is
+        # FieldsStayAtSizeHint (the field is sized ONCE to the initial "—"
+        # placeholder and never grows). The fee arrives async and is a word-
+        # wrapping label, so on a Mac it wrapped into the "—"-wide field and
+        # showed just "≈", centered. Pin the non-macOS behaviour so the fee
+        # renders in full and left-aligns everywhere.
+        summary.setFormAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        summary.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         summary.setHorizontalSpacing(16)
         self.max_total_lbl = self._value_label("—")
         summary.addRow("Expected fee:", self.max_total_lbl)
