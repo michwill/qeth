@@ -46,7 +46,14 @@ from .transactions import _render_decoded, _TxComposerDialog
 log = logging.getLogger("qeth.plugins.ens")
 
 ENS_CHAIN_ID = 1                       # ENS lives on Ethereum mainnet
-_OWNERSHIP_WAIT_S = 25.0                # cold-sidecar grace for the ownership pass
+# Cold-sidecar grace for the ownership pass. Helios's cold-sync time is
+# variable (the --load-external-fallback checkpoint fetch): usually a few
+# seconds, but sometimes tens. This is a ONE-SHOT wait — if it loses the race
+# the verify returns unverified and the worker gives up, so the ✓ never lands
+# until a manual refresh (the "helios is ready but no badge" bug). wait_ready
+# polls until synced, so a generous timeout just returns as soon as it's ready
+# and only actually blocks that long on a genuinely slow/failing sync.
+_OWNERSHIP_WAIT_S = 90.0
 # After a write confirms we re-read at the chain head. The fast RPC read already
 # reflects the new value, but Helios's *verified* head lags the execution RPC by
 # a few slots, so its first proof can still show the OLD value. On a post-write
@@ -399,20 +406,21 @@ class EnsVerifyWorker(QThread):
                 wait_s=self._wait_s if attempt == 0 else 0.0)
             if not verified:           # no sidecar / can't prove → stop trying
                 return
-            # Emit once the verified read reflects the SAME-OR-NEWER chain state
-            # as the fast read (its block ≥ the fast read's), by BLOCK rather than
-            # by value agreement. A block-wait can't be defeated by one name
-            # changing (externally, or served by a lagging failover backend)
-            # between the two reads — the old all-names _states_agree suppressed
-            # the WHOLE verified pass in that case (finding 3d).
-            if not fast:
-                # The fast read failed — no fresh head to order against. On a
-                # post-write CATCHUP we can't confirm the proof has reached the
-                # change, so a lagging verified read could drop a just-acquired
-                # name — don't emit it (the ✓ lands on a later refresh, when a
-                # fast read lands). On a normal load there's no pending change to
-                # lag behind, so the verified read IS the current state (satellite 5).
-                caught_up = not self._catchup
+            # When to accept the verified proof. The block-ordering below (verified
+            # block ≥ the fast read's) exists ONLY to guard a just-made change on a
+            # post-write CATCHUP — a lagging proof must not regress it. On a NORMAL
+            # load there's no pending change, and helios's verified head trails the
+            # fast read's execution head by slots, so requiring vblock ≥ fast_block
+            # there dropped the ✓ on nearly every load (the proof was computed but
+            # never emitted → "helios ready but no badge"). A lagging proof of a
+            # STABLE owner is still the current owner, so just emit it.
+            if not self._catchup:
+                caught_up = True
+            elif not fast:
+                # Catchup with no fresh head to order against: can't confirm the
+                # proof reached the change → don't emit a possibly-stale owner; the
+                # ✓ lands on a later refresh once a fast read does (satellite 5).
+                caught_up = False
             else:
                 caught_up = (fast_block is None or vblock is None
                              or vblock >= fast_block)

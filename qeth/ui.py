@@ -141,6 +141,15 @@ class MainWindow(QMainWindow):
         # already verified-warm instead of paying spawn+sync inline.
         from .helios import prewarm as _helios_prewarm
         _helios_prewarm(self.store.current_chain())
+        # Also warm the MAINNET sidecar now, even when it isn't the current
+        # chain: the ENS ✓ (name ownership) always proves on mainnet via Helios,
+        # and Helios's cold-sync time is variable. Warming it at app start —
+        # rather than only when the ENS tab first opens — gives it a long head
+        # start, so the ownership proof is usually ready by the time the user
+        # looks, instead of the verify racing the sync and dropping the badge.
+        _mainnet = next((c for c in self.store.chains if c.chain_id == 1), None)
+        if _mainnet is not None:
+            _helios_prewarm(_mainnet)
 
         # Restore prior window geometry + splitter states.
         if self.store.window_geometry:

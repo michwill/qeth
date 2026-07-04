@@ -585,6 +585,24 @@ class TestEnsPanel:
         w.run()
         assert emits == [True]                 # verified read emitted
 
+    def test_verify_worker_normal_load_emits_even_when_proof_lags(self, monkeypatch):
+        # THE "helios ready but no badge" bug: on a normal load helios's verified
+        # head TRAILS the fast read's execution head by slots, so the verified
+        # block is usually BEHIND the fast read's. The proof of a stable owner is
+        # still the current owner, so it must land its ✓ — the old block-order
+        # gate (vblock >= fast_block) dropped the ✓ on nearly every load.
+        import qeth.plugins.ens as ens
+        states = {"crv.eth": OwnershipCheck(controller="0x394", registrant="0x7a",
+                                            owner_known=True)}
+        monkeypatch.setattr(ens, "read_name_states", lambda c, n: (states, 101))
+        monkeypatch.setattr(ens, "verify_names",
+                            lambda c, n, wait_s=0: (states, True, 99))  # proof LAGS
+        w = ens.EnsVerifyWorker(None, "0x394", ["crv.eth"], catchup=False)
+        emits = []
+        w.ready.connect(lambda a, s, v: emits.append(v))
+        w.run()
+        assert emits == [False, True]          # fast, THEN the verified ✓ despite the lag
+
     def _role_rows(self, item):
         """The manager/owner rows under a name → {label: shown-address}."""
         return {item.child(i).text(0): item.child(i).text(2)
