@@ -39,6 +39,31 @@ def test_qr_account_shows_air_gapped_root_with_full_path_subgroup(qtbot, tmp_qet
         "BIP44 (m/44'/60'/0'/0/i)"]
 
 
+def test_branch_order_follows_store_and_persists(qtbot, tmp_qeth):
+    from qeth.plugins.wallets import ROOT_SOURCE_ROLE
+    plugin, store = _plugin(qtbot, [
+        {"address": "0x" + "11" * 20, "source": "ledger",
+         "path": "m/44'/60'/0'/0/0", "scheme": "Legacy", "label": ""},
+        {"address": "0x" + "22" * 20, "source": "qr",
+         "path": "m/44'/60'/0'/0/0", "scheme": "BIP44 (…/0/i)", "label": ""},
+    ])
+    tree = plugin._tree
+
+    def root_order():
+        return [tree.topLevelItem(i).data(0, ROOT_SOURCE_ROLE)
+                for i in range(tree.topLevelItemCount())]
+
+    assert root_order() == ["ledger", "qr"]        # built-in default order
+    # A stored order reorders the branches on rebuild.
+    store.account_source_order = ["qr", "ledger"]
+    plugin._rebuild_tree()
+    assert root_order() == ["qr", "ledger"]
+    # …and the plugin persists the current top-to-bottom branch order.
+    store.account_source_order = []
+    plugin._on_branches_reordered()
+    assert store.account_source_order == ["qr", "ledger"]
+
+
 def test_ledger_scheme_labels_show_full_paths():
     from qeth.plugins.wallets import _ledger_scheme_label, _scheme_label
     assert _ledger_scheme_label("Legacy") == "Legacy (m/44'/60'/0'/i)"

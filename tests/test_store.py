@@ -216,6 +216,11 @@ class TestReorderAccounts:
         assert [(a["address"], a["path"]) for a in s.accounts] == [
             ("0xAA", "p3"), ("0xAA", "p1"), ("0xBB", "p2")]
 
+    def test_source_order_persists(self, tmp_qeth):
+        s = Store()
+        s.set_source_order(["qr", "ledger", "hot"])
+        assert Store.load().account_source_order == ["qr", "ledger", "hot"]
+
     def test_noop_update_returns_false_and_does_not_resave(
         self, tmp_qeth, monkeypatch,
     ):

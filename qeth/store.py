@@ -86,6 +86,10 @@ class Store:
         self._save_seq = 0
         self._last_written_seq = 0
         self.accounts: list[dict] = []  # {address, path, source, scheme, label}
+        # Display order of the top-level account branches (source keys, e.g.
+        # ["qr", "ledger", …]). Empty = the built-in default order. The tree
+        # lets the user drag branches to reorder their priority.
+        self.account_source_order: list[str] = []
         self.chains: list[Chain] = list(DEFAULT_CHAINS)
         self.current_chain_id: int = 1
         self.default_account: str | None = None
@@ -130,6 +134,7 @@ class Store:
             except json.JSONDecodeError:
                 return s
             s.accounts = data.get("accounts", [])
+            s.account_source_order = list(data.get("account_source_order", []))
             s.current_chain_id = data.get("current_chain_id", 1)
             s.default_account = data.get("default_account")
             chains_data = data.get("chains")
@@ -192,6 +197,7 @@ class Store:
                 # iteration" mid-serialize (everything else here is already a
                 # fresh list/dict).
                 "accounts": [dict(a) for a in self.accounts],
+                "account_source_order": list(self.account_source_order),
                 "chains": [c.to_dict() for c in self.chains],
                 "current_chain_id": self.current_chain_id,
                 "default_account": self.default_account,
@@ -286,6 +292,14 @@ class Store:
                         break
             new_list.extend(remaining)   # unreferenced, in original order
             self.accounts = new_list
+        self.save()
+
+    def set_source_order(self, order: list[str]) -> None:
+        """Persist the display order of the top-level account branches (source
+        keys). The tree passes the roots' current top-to-bottom order after a
+        branch drag."""
+        with self._lock:
+            self.account_source_order = list(order)
         self.save()
 
     def set_label(self, address: str, label: str) -> bool:

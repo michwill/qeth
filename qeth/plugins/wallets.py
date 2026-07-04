@@ -69,6 +69,19 @@ EXPAND_KEY_ROLE = Qt.ItemDataRole.UserRole + 2
 # because the SAME address can sit in two branches, so address alone can't tell
 # rows apart (used to re-select the right row after a drag, and to reorder).
 ACCOUNT_PATH_ROLE = Qt.ItemDataRole.UserRole + 3
+# The source key ("ledger" / "hot" / "watch_only" / "qr") on a top-level branch
+# root, so a branch drag can be persisted as a source order.
+ROOT_SOURCE_ROLE = Qt.ItemDataRole.UserRole + 4
+
+# Top-level branches in their built-in default order:
+# (source key, root label, add-action attribute, grouped-by-scheme). The user
+# can drag branches to reorder them; the order is stored in the Store.
+_SECTIONS: list[tuple[str, str, str, bool]] = [
+    ("ledger", "Ledger", "act_add_ledger", True),
+    ("hot", "Hot wallet", "act_add_hot", False),
+    ("watch_only", "Watch only", "act_add_watch", False),
+    ("qr", "Air-gapped", "act_add_qr", True),
+]
 
 
 def _ledger_scheme_label(name: str) -> str:
@@ -126,6 +139,9 @@ class _ReorderTree(QTreeWidget):
     the on-disk account list to match."""
 
     reorder_committed = Signal()
+    # Fired after the user drags a top-level BRANCH (group root) to a new
+    # position, so the plugin can persist the new branch order.
+    branches_reordered = Signal()
     # Fired when the user presses Return / Enter while a row is
     # selected. The plugin connects this to "connect to browser"
     # (same as double-clicking the address). Carries the address.
@@ -154,6 +170,14 @@ class _ReorderTree(QTreeWidget):
         source_items = self.selectedItems()
         if not source_items:
             return super().dropEvent(event)
+        # Dragging top-level BRANCH roots → reorder branches among themselves.
+        if all(it.parent() is None for it in source_items):
+            self._drop_branches(event, source_items)
+            return
+        # A mixed root+leaf drag makes no sense — refuse.
+        if any(it.parent() is None for it in source_items):
+            event.ignore()
+            return
         # All selected items must share a parent — otherwise we can't
         # honour "same parent only" cleanly.
         source_parent = source_items[0].parent()
@@ -207,6 +231,41 @@ class _ReorderTree(QTreeWidget):
             if first is not None:
                 self.setCurrentItem(first)
         self.reorder_committed.emit()
+
+    def _drop_branches(self, event, source_items) -> None:
+        """Reorder top-level branch roots among themselves. The drop must land AT
+        the top level — above/below another root, or on empty space — never ONTO
+        a root (would nest) or inside a group. Re-selects the moved branch by its
+        source key and emits ``branches_reordered`` to persist the order."""
+        target = self.itemAt(event.position().toPoint())
+        indicator = self.dropIndicatorPosition()
+        if target is not None and target.parent() is not None:
+            event.ignore()          # would drop inside a group, not at top level
+            return
+        if indicator == QAbstractItemView.DropIndicatorPosition.OnItem:
+            event.ignore()          # would nest this branch into the target root
+            return
+        sources = [it.data(0, ROOT_SOURCE_ROLE) for it in source_items]
+        super().dropEvent(event)
+        self.clearSelection()
+        first = None
+        for src in sources:
+            it = self._find_root_by_source(src)
+            if it is not None:
+                it.setSelected(True)
+                if first is None:
+                    first = it
+        if first is not None:
+            self.setCurrentItem(first)
+        self.branches_reordered.emit()
+
+    def _find_root_by_source(self, src):
+        """The top-level branch root carrying ``src`` in ROOT_SOURCE_ROLE."""
+        for i in range(self.topLevelItemCount()):
+            it = self.topLevelItem(i)
+            if it is not None and it.data(0, ROOT_SOURCE_ROLE) == src:
+                return it
+        return None
 
     def _find_by_key(self, addr: str, path):
         """Depth-first search for the leaf carrying ``(addr, path)`` — the
@@ -448,6 +507,7 @@ class WalletsPlugin(Plugin):
         self._tree.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._tree.itemSelectionChanged.connect(self._on_tree_selection)
         self._tree.reorder_committed.connect(self._on_tree_reordered)
+        self._tree.branches_reordered.connect(self._on_branches_reordered)
         # Double-click an address leaf = "Connect to browser". The
         # button + right-click menu offer the same action; this is
         # just the no-friction path for the user's primary
@@ -743,6 +803,17 @@ class WalletsPlugin(Plugin):
         )
         return it, is_default
 
+    def _ordered_sections(self) -> list[tuple[str, str, str, bool]]:
+        """The branch specs ``(source, label, add-action attr, grouped-by-scheme)``
+        in the user's saved order (``store.account_source_order``), with any not
+        listed appended in the built-in default order."""
+        by_key = {s[0]: s for s in _SECTIONS}
+        ordered = [by_key[k] for k in self._store.account_source_order
+                   if k in by_key]
+        seen = {s[0] for s in ordered}
+        ordered.extend(s for s in _SECTIONS if s[0] not in seen)
+        return ordered
+
     def _rebuild_tree(self) -> None:
         if self._tree is None:
             return
@@ -753,102 +824,74 @@ class WalletsPlugin(Plugin):
         prior = self.selected_address
         expanded = self._capture_expansion()
         self._tree.clear()
-        # Each source's root row is shown only when it HAS accounts — an empty
-        # "Watch only (0)" / "Hot wallet (0)" root is just noise (the Add button
-        # below the tree is the discovery affordance, not these roots). With no
-        # accounts at all the tree is simply empty.
         default_item: QTreeWidgetItem | None = None
-
-        ledger_accts = [a for a in self._store.accounts if a.get("source") == "ledger"]
-        if ledger_accts:
-            ledger_root = QTreeWidgetItem([f"Ledger ({len(ledger_accts)})"])
-            # Reuse the add-account menu icons so the tree groups and the
-            # picker stay visually consistent (hardware device / key / eye).
-            ledger_root.setIcon(0, self.act_add_ledger.icon())
-            # Group containers: not draggable, not drop targets (we only
-            # allow re-ordering inside scheme subgroups).
-            ledger_root.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self._tree.addTopLevelItem(ledger_root)
-            groups: dict[str, QTreeWidgetItem] = {}
-            for a in ledger_accts:
-                scheme = a.get("scheme", "Custom")
-                grp = groups.get(scheme)
-                if grp is None:
-                    grp = QTreeWidgetItem([_scheme_label(a)])
-                    # Scheme group: drop-enabled so children can be
-                    # reordered between siblings via the parent, but not
-                    # draggable itself.
-                    grp.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
-                    ledger_root.addChild(grp)
-                    groups[scheme] = grp
-                it, is_default = self._make_account_item(a)
-                grp.addChild(it)
-                if is_default:
-                    default_item = it
-            self._restore_expand(ledger_root, "ledger", expanded)
-            for scheme, g in groups.items():
-                self._restore_expand(g, f"ledger/{scheme}", expanded)
-
-        hot_accts = [a for a in self._store.accounts
-                      if a.get("source") == "hot"]
-        if hot_accts:
-            hot_root = QTreeWidgetItem([f"Hot wallet ({len(hot_accts)})"])
-            hot_root.setIcon(0, self.act_add_hot.icon())
-            hot_root.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
-            self._tree.addTopLevelItem(hot_root)
-            for a in hot_accts:
-                it, is_default = self._make_account_item(a)
-                hot_root.addChild(it)
-                if is_default:
-                    default_item = it
-            self._restore_expand(hot_root, "hot", expanded)
-
-        watch_accts = [a for a in self._store.accounts
-                        if a.get("source") == "watch_only"]
-        if watch_accts:
-            watch_root = QTreeWidgetItem([f"Watch only ({len(watch_accts)})"])
-            watch_root.setIcon(0, self.act_add_watch.icon())
-            # Top-level group: not draggable, not a drop target — same
-            # treatment as the Ledger root.
-            watch_root.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
-            self._tree.addTopLevelItem(watch_root)
-            for a in watch_accts:
-                it, is_default = self._make_account_item(a)
-                watch_root.addChild(it)
-                if is_default:
-                    default_item = it
-            self._restore_expand(watch_root, "watch", expanded)
-
-        qr_accts = [a for a in self._store.accounts
-                    if a.get("source") == "qr"]
-        if qr_accts:
-            qr_root = QTreeWidgetItem([f"Air-gapped ({len(qr_accts)})"])
-            qr_root.setIcon(0, self.act_add_qr.icon())
-            qr_root.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
-            self._tree.addTopLevelItem(qr_root)
-            # Group by derivation scheme, like Ledger — an air-gapped wallet can
-            # hold several (BIP44, Legacy, …). The subgroup label is the full
-            # path (origin expanded), so distinct paths read as distinct groups.
-            qr_groups: dict[str, QTreeWidgetItem] = {}
-            for a in qr_accts:
-                label = _scheme_label(a) or "Custom"
-                grp = qr_groups.get(label)
-                if grp is None:
-                    grp = QTreeWidgetItem([label])
-                    grp.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
-                    qr_root.addChild(grp)
-                    qr_groups[label] = grp
-                it, is_default = self._make_account_item(a)
-                grp.addChild(it)
-                if is_default:
-                    default_item = it
-            self._restore_expand(qr_root, "qr", expanded)
-            for label, g in qr_groups.items():
-                self._restore_expand(g, f"qr/{label}", expanded)
-
+        for source, label, action_attr, grouped in self._ordered_sections():
+            got = self._build_source_section(
+                source, label, action_attr, grouped, expanded)
+            if got is not None:
+                default_item = got
         if not (prior and self.select_address(prior)):
             if default_item is not None:
                 self._tree.setCurrentItem(default_item)
+
+    def _build_source_section(
+        self, source: str, label: str, action_attr: str, grouped: bool,
+        expanded: dict,
+    ) -> QTreeWidgetItem | None:
+        """Build one top-level branch (root + its accounts). Returns the
+        default-account row if it falls in this branch, else None; a source with
+        no accounts builds nothing (an empty "Watch only (0)" root is just
+        noise). The root is draggable so branches can be reordered; a FLAT
+        branch's root is also a drop target for its address leaves, a GROUPED
+        branch's isn't (its scheme subgroups are)."""
+        assert self._tree is not None    # _rebuild_tree guards before calling
+        accts = [a for a in self._store.accounts if a.get("source") == source]
+        if not accts:
+            return None
+        root = QTreeWidgetItem([f"{label} ({len(accts)})"])
+        action = getattr(self, action_attr, None)
+        if action is not None:
+            root.setIcon(0, action.icon())   # same icon as the add menu / picker
+        root.setData(0, ROOT_SOURCE_ROLE, source)
+        # Selectable + draggable so the user can drag the whole branch to
+        # reorder priority. Grouped branches drop into their scheme subgroups;
+        # a flat branch drops leaves straight into the root.
+        flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                 | Qt.ItemFlag.ItemIsDragEnabled)
+        if not grouped:
+            flags |= Qt.ItemFlag.ItemIsDropEnabled
+        root.setFlags(flags)
+        self._tree.addTopLevelItem(root)
+
+        default_item: QTreeWidgetItem | None = None
+        if grouped:
+            # Group by derivation scheme — a Ledger / air-gapped wallet can hold
+            # several (BIP44, Legacy, …). The subgroup label is the full path.
+            groups: dict[str, QTreeWidgetItem] = {}
+            for a in accts:
+                key = _scheme_label(a) or "Custom"
+                grp = groups.get(key)
+                if grp is None:
+                    grp = QTreeWidgetItem([key])
+                    grp.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+                    root.addChild(grp)
+                    groups[key] = grp
+                it, is_default = self._make_account_item(a)
+                grp.addChild(it)
+                if is_default:
+                    default_item = it
+            self._restore_expand(root, source, expanded)
+            for key, g in groups.items():
+                self._restore_expand(g, f"{source}/{key}", expanded)
+        else:
+            for a in accts:
+                it, is_default = self._make_account_item(a)
+                root.addChild(it)
+                if is_default:
+                    default_item = it
+            self._restore_expand(root, source, expanded)
+        return default_item
 
     # --- selection / action handlers ---------------------------------------
 
@@ -872,6 +915,19 @@ class WalletsPlugin(Plugin):
         for i in range(self._tree.topLevelItemCount()):
             walk(self._tree.topLevelItem(i))
         self._store.reorder_accounts(ordered)
+
+    def _on_branches_reordered(self) -> None:
+        """The user dragged a branch to a new position — persist the top-level
+        branch order (their source keys, top to bottom)."""
+        if self._tree is None:
+            return
+        order: list[str] = []
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            src = item.data(0, ROOT_SOURCE_ROLE) if item is not None else None
+            if isinstance(src, str) and src:
+                order.append(src)
+        self._store.set_source_order(order)
 
     def _on_tree_double_clicked(self, item, _column: int) -> None:
         """Double-click on an address leaf connects that account to
