@@ -1,6 +1,8 @@
 #!/bin/bash
-# Build PySide6 6.4.2 (Core/Gui/Widgets, abi3) from source against the SYSTEM
-# Qt 6.4 for python3.11, into the venv given as $1. ~15 min. See ./README.md.
+# Build PySide6 6.4.2 (Core/Gui/Widgets/Multimedia/MultimediaWidgets, abi3) from
+# source against the SYSTEM Qt 6.4 for python3.11, into the venv given as $1.
+# ~15 min. See ./README.md. (Multimedia is the QR signer's live camera; it needs
+# qt6-multimedia-dev installed at build time.)
 #
 # Ubuntu 24.04 / Mint 22 ship no PySide6 that fits their Qt6.4 + py3.12 combo,
 # so we compile 6.4 for the deadsnakes python3.11. The bindings are abi3 (stable
@@ -28,7 +30,10 @@ PY=python3.11
 #    aborting the whole build — even though qeth never touches QML.
 cd "$SRC"
 rm -rf build
-COMMON="--qmake=/usr/bin/qmake6 --module-subset=Core,Gui,Widgets --skip-docs --ignore-git"
+# Multimedia + MultimediaWidgets carry the QR signer's live camera (QCamera →
+# QVideoSink). They link the system libQt6Multimedia (added to the .deb Depends),
+# and need qt6-multimedia-dev present here so shiboken can parse their headers.
+COMMON="--qmake=/usr/bin/qmake6 --module-subset=Core,Gui,Widgets,Multimedia,MultimediaWidgets --skip-docs --ignore-git"
 # shellcheck disable=SC2086
 LLVM_INSTALL_DIR=/usr/lib/llvm-14 "$VENV/bin/$PY" setup.py build $COMMON --parallel="$(nproc)"
 # shellcheck disable=SC2086

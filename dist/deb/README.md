@@ -27,6 +27,7 @@ Qt, so `Depends: libqt6*` and theming is native.
 sudo add-apt-repository -y ppa:deadsnakes/ppa
 sudo apt-get install -y python3.11 python3.11-venv python3.11-dev \
     qt6-base-dev qt6-base-private-dev qt6-declarative-private-dev \
+    qt6-multimedia-dev \
     libclang-14-dev clang-14 cmake ninja-build dpkg-dev
 
 # 2. build the .deb (compiles PySide6 the first time, ~15 min; reused after)
