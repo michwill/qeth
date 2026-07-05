@@ -22,20 +22,25 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from typing import Any, cast
-from collections.abc import Callable, Iterable
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable, Iterable, Mapping
 
 from . import USER_AGENT
 from .abi import AnyAbiSource, BlockscoutAbiSource, selector_names
 from .abi_cache import AbiCache
-from .chains import Chain
+from .chains import DEFAULT_CHAINS, Chain
 from .tokens import BLOCKSCOUT_INSTANCES
 from .transactions import Transaction
+
+if TYPE_CHECKING:
+    from .chain import EthClient
 
 log = logging.getLogger("qeth.tx_activity")
 
 _APPROVE = "0x095ea7b3"
+_TRANSFER = "0xa9059cbb"          # ERC-20 transfer(address,uint256)
+_TRANSFERFROM = "0x23b872dd"      # ERC-20 transferFrom(address,address,uint256)
 
 
 @dataclass(frozen=True)
@@ -285,6 +290,86 @@ def _coins(tx: Transaction, viewer: str, native: str,
     return out_legs, in_legs
 
 
+def _hex_wei(v: object) -> int:
+    """A callTracer ``value`` (a 0x-quantity string; some nodes send an int)."""
+    if isinstance(v, int):
+        return v
+    s = str(v or "0")
+    try:
+        return int(s, 16) if s.startswith("0x") else int(s or "0")
+    except ValueError:
+        return 0
+
+
+def native_in_from_trace(node: object, viewer: str) -> int:
+    """Sum the wei that internal calls in a ``callTracer`` frame send **to**
+    ``viewer`` (recursively). ``viewer`` must be lower-case. A reverted frame
+    moved nothing, so its whole subtree is skipped; the top-level call is the
+    viewer's own outbound call (``to`` = the contract), so it never matches."""
+    if not isinstance(node, Mapping) or node.get("error"):
+        return 0
+    total = 0
+    if (str(node.get("to") or "").lower() == viewer
+            and str(node.get("from") or "").lower() != viewer):
+        total += _hex_wei(node.get("value"))
+    subs = node.get("calls")
+    if isinstance(subs, list):
+        for sub in subs:
+            total += native_in_from_trace(sub, viewer)
+    return total
+
+
+def _trace_capable_chain(chain: Chain) -> Chain:
+    """``chain`` with a trace-capable RPC preferred. The user's configured RPC
+    may not whitelist ``debug_traceTransaction`` — the official
+    ``mainnet.optimism.io`` answers ``-32601 "rpc method is not whitelisted"``,
+    and the failover provider treats that as a real answer (it doesn't rotate),
+    so the internal-ETH leg would silently never resolve. Prepend the bundled
+    default endpoints for this chain (DRPC, which does expose the tracer) ahead
+    of the user's, so the trace lands on a capable node first and only falls
+    back to the user's RPC on a transport failure. Chains with no bundled
+    default (added via chainlist) keep the user's RPC — best-effort there."""
+    default = next((c for c in DEFAULT_CHAINS if c.chain_id == chain.chain_id), None)
+    urls: list[str] = []
+    if default is not None:
+        urls += [default.rpc_url, *default.fallback_rpcs]
+    urls += [chain.rpc_url, *chain.fallback_rpcs]
+    ordered = list(dict.fromkeys(u for u in urls if u))
+    if not ordered:
+        return chain
+    return replace(chain, rpc_url=ordered[0], fallback_rpcs=tuple(ordered[1:]))
+
+
+def _trace_native_in(client: EthClient, tx_hash: str, viewer: str) -> int:
+    """Native wei ``viewer`` received via internal calls in ``tx_hash``, read
+    from the node's ``callTracer``. Best-effort: any RPC/parse failure (the
+    endpoint doesn't expose ``debug_traceTransaction``, a transient error, an
+    unexpected shape) returns 0, so the native-in leg simply isn't added."""
+    try:
+        trace = client.rpc("debug_traceTransaction",
+                           [tx_hash, {"tracer": "callTracer"}])
+    except Exception as e:            # unsupported / transient — best-effort
+        log.debug("trace fallback failed for %s: %s", tx_hash, e)
+        return 0
+    return native_in_from_trace(trace, viewer)
+
+
+def _wants_native_trace(out_legs: list[AssetLeg], in_legs: list[AssetLeg],
+                        sel: str, tx: Transaction) -> bool:
+    """A one-sided contract call where the viewer handed over an ERC-20 and
+    got nothing back — very likely a TOKEN->native swap whose received ETH is
+    missing (a WETH unwrap credits native ETH by an internal tx, and
+    Blockscout's internal-tx index lags: minutes on mainnet, hours-to-never on
+    L2s). Worth a node trace to recover the native-in leg. A tx that already
+    shows an incoming leg (token->token, ETH->token), a plain transfer, or an
+    approve is skipped, so token->token swaps and sends never trigger a trace."""
+    if not tx.success or in_legs:
+        return False
+    if sel in (_APPROVE, _TRANSFER, _TRANSFERFROM):
+        return False
+    return any(leg.contract is not None for leg in out_legs)
+
+
 def _make_activity(verb: str, out_legs: list[AssetLeg],
                    in_legs: list[AssetLeg], sel: str, tx: Transaction,
                    sym_of: dict[str, str]) -> Activity:
@@ -305,11 +390,17 @@ def fetch_activities(
     abi_source: AnyAbiSource | None = None,
     abi_cache: AbiCache | None = None,
     on_batch: Callable[[dict[str, Activity]], None] | None = None,
+    trace_native_in: Callable[[str], int] | None = None,
 ) -> dict[str, Activity]:
     """Build ``{tx_hash: Activity}`` for ``txs``. Best-effort: a failed
     transfers/internal fetch yields verb-only activities (still useful);
     chains without a Blockscout instance yield ``{}`` (the list falls back
-    to showing the hash)."""
+    to showing the hash).
+
+    ``trace_native_in(tx_hash) -> wei`` recovers the received-ETH leg of a
+    one-sided TOKEN->native swap that Blockscout's internal-tx index hasn't
+    indexed (see :func:`_wants_native_trace`); it defaults to a node
+    ``callTracer`` read over the chain's RPC and is injectable for tests."""
     base = BLOCKSCOUT_INSTANCES.get(chain.chain_id)
     if base is None:
         return {}
@@ -425,5 +516,43 @@ def fetch_activities(
                     batch[tx.hash] = act
                 if on_batch:
                     on_batch(batch)
+
+    # Pass 3 — native-in fallback via node trace. A TOKEN->native swap unwraps
+    # WETH and receives the ETH by an internal tx; Blockscout's internal-tx
+    # index lags that (minutes on mainnet, and on L2s the row can stay
+    # one-sided indefinitely — status 2 "not yet processed"), so the swap shows
+    # "OP ->" with nothing in. For those rows read the internal ETH transfers
+    # to the viewer straight from the node's callTracer and add the native-in
+    # leg, so it reads "OP -> ETH". Bounded: only one-sided ERC-20-out swaps.
+    targets = [tx for tx in txs if _wants_native_trace(*coins[tx.hash.lower()], tx)]
+    if targets:
+        fetch = trace_native_in
+        if fetch is None:
+            try:
+                from .chain import EthClient
+                client = EthClient(_trace_capable_chain(chain), timeout=timeout)
+                fetch = lambda h: _trace_native_in(client, h, viewer)  # a closure
+            except Exception as e:            # web3 missing / bad RPC — skip
+                log.debug("trace client unavailable on %s: %s", chain.name, e)
+                fetch = None
+        if fetch is not None:
+            do_fetch = fetch
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                tfuts = {ex.submit(do_fetch, tgt.hash): tgt for tgt in targets}
+                tbatch: dict[str, Activity] = {}
+                for tf in as_completed(tfuts):
+                    tgt = tfuts[tf]
+                    try:
+                        wei = tf.result()
+                    except Exception:         # best-effort — no leg on failure
+                        wei = 0
+                    if wei > 0:
+                        a = out[tgt.hash]
+                        a = Activity(a.verb, a.out, a.inn + (AssetLeg(native, None),),
+                                     show_arrow=a.show_arrow, muted=a.muted)
+                        out[tgt.hash] = a
+                        tbatch[tgt.hash] = a
+                if tbatch and on_batch:
+                    on_batch(tbatch)
 
     return out

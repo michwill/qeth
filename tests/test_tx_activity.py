@@ -190,3 +190,173 @@ def test_transfers_touching_skips_untouched_and_malformed():
         {"topics": [TRANSFER_TOPIC0], "address": USDC},    # malformed (short topics)
     ]
     assert transfers_touching(logs, VIEWER) == []
+
+
+# --- pass 3: native-in fallback via node trace (TOKEN->native swap) ----------
+#
+# A TOKEN->ETH swap unwraps WETH and receives the native ETH by an internal tx.
+# Blockscout's internal-tx index lags that — minutes on mainnet, and on L2s the
+# row can stay one-sided indefinitely — so the swap shows "OP ->" with nothing
+# in. fetch_activities recovers the received-ETH leg from the node's callTracer.
+
+OP = "0x4200000000000000000000000000000000000042"
+ROUTER = "0x0dcded3545d565ba3b19e683431381007245d983"
+
+
+def _swap_tx(method_id="0x5c9c18e2", hash_="0x" + "ab" * 32):
+    """A viewer-initiated contract call (a swap) carrying no native value."""
+    from qeth.transactions import Transaction
+    return Transaction(
+        chain_id=10, hash=hash_, block_number=200, timestamp=0, nonce=0,
+        from_addr=VIEWER, to_addr=ROUTER, value_wei=0, gas_used=0,
+        gas_price_wei=0, method_id=method_id, input_data="0x", success=True)
+
+
+def _tokentx(sym, contract, frm, to, tx_hash):
+    return {"hash": tx_hash, "contractAddress": contract, "tokenSymbol": sym,
+            "from": frm, "to": to}
+
+
+def _op_chain():
+    from qeth.chains import DEFAULT_CHAINS
+    return next(c for c in DEFAULT_CHAINS if c.chain_id == 10)
+
+
+def _rows_op_out(tx):
+    """_account_rows stub: OP leaves the viewer (tokentx), no internals — the
+    one-sided shape a TOKEN->ETH swap has while the internal index is behind."""
+    def rows(base, action, address, timeout, **k):
+        if action == "tokentx":
+            return [_tokentx("OP", OP, VIEWER, ROUTER, tx.hash)]
+        return []
+    return rows
+
+
+def test_trace_capable_chain_prefers_bundled_endpoint():
+    """The user may point Optimism at mainnet.optimism.io, which refuses
+    debug_traceTransaction (-32601). The trace must route to the bundled
+    default (DRPC) first, with the user's RPC kept only as a fallback."""
+    from dataclasses import replace
+    from qeth.chains import DEFAULT_CHAINS
+    from qeth.tx_activity import _trace_capable_chain
+
+    default = next(c for c in DEFAULT_CHAINS if c.chain_id == 10)
+    user = replace(default, rpc_url="https://mainnet.optimism.io",
+                   fallback_rpcs=())
+    routed = _trace_capable_chain(user)
+    # DRPC (the bundled default) leads; the user's RPC is a fallback, not dropped
+    assert routed.rpc_url == default.rpc_url
+    assert "https://mainnet.optimism.io" in routed.fallback_rpcs
+    assert routed.rpc_url not in routed.fallback_rpcs   # no dupes
+
+
+def test_trace_capable_chain_unknown_chain_keeps_user_rpc():
+    """A chain with no bundled default (added via chainlist) keeps the user's
+    RPC — there's no known-capable endpoint to prefer."""
+    from qeth.chains import Chain
+    from qeth.tx_activity import _trace_capable_chain
+
+    custom = Chain(name="Custom", chain_id=999999, rpc_url="https://custom.example",
+                   symbol="X")
+    routed = _trace_capable_chain(custom)
+    assert routed.rpc_url == "https://custom.example"
+
+
+def test_native_in_from_trace_sums_viewer_calls():
+    from qeth.tx_activity import native_in_from_trace
+    frame = {
+        "from": VIEWER, "to": ROUTER, "value": "0x0", "calls": [
+            {"from": ROUTER, "to": OTHER, "value": "0x64"},         # not the viewer
+            {"from": ROUTER, "to": VIEWER, "value": "0x56", "calls": [
+                {"from": VIEWER, "to": ROUTER, "value": "0x1"},     # viewer's own out
+            ]},
+        ],
+    }
+    # only the 0x56 credited TO the viewer counts (0x64 → other; 0x1 → viewer-out)
+    assert native_in_from_trace(frame, VIEWER) == 0x56
+
+
+def test_native_in_from_trace_skips_reverted_subtree():
+    from qeth.tx_activity import native_in_from_trace
+    frame = {"from": VIEWER, "to": ROUTER, "value": "0x0", "calls": [
+        {"from": ROUTER, "to": VIEWER, "value": "0x99", "error": "reverted",
+         "calls": [{"from": ROUTER, "to": VIEWER, "value": "0x5"}]},
+    ]}
+    assert native_in_from_trace(frame, VIEWER) == 0
+
+
+def test_one_sided_swap_gains_native_leg_from_trace(tmp_path, monkeypatch):
+    """OP out, nothing from the internal-tx index → read the received ETH from
+    the trace and show it: "OP ->" becomes "OP -> ETH"."""
+    import qeth.tx_activity as ta
+    from qeth.abi_cache import AbiCache
+    from qeth.tx_activity import AssetLeg
+
+    tx = _swap_tx()
+    monkeypatch.setattr(ta, "_account_rows", _rows_op_out(tx))
+    monkeypatch.setattr(ta._Verbs, "resolve", lambda self, c: {})   # no network
+
+    result = ta.fetch_activities(
+        _op_chain(), VIEWER, [tx], abi_cache=AbiCache(root=tmp_path),
+        trace_native_in=lambda h: 24252677217318157)
+
+    assert result[tx.hash].out == (AssetLeg("OP", OP),)
+    assert result[tx.hash].inn == (AssetLeg("ETH", None),)
+
+
+def test_swap_with_zero_trace_stays_one_sided(tmp_path, monkeypatch):
+    """No internal ETH to the viewer (trace returns 0) → no phantom ETH leg."""
+    import qeth.tx_activity as ta
+    from qeth.abi_cache import AbiCache
+    from qeth.tx_activity import AssetLeg
+
+    tx = _swap_tx()
+    monkeypatch.setattr(ta, "_account_rows", _rows_op_out(tx))
+    monkeypatch.setattr(ta._Verbs, "resolve", lambda self, c: {})
+
+    result = ta.fetch_activities(
+        _op_chain(), VIEWER, [tx], abi_cache=AbiCache(root=tmp_path),
+        trace_native_in=lambda h: 0)
+
+    assert result[tx.hash].out == (AssetLeg("OP", OP),)
+    assert result[tx.hash].inn == ()
+
+
+def test_two_sided_swap_is_not_traced(tmp_path, monkeypatch):
+    """A token->token swap already shows an in-leg, so it must NOT trigger a
+    trace — otherwise every ordinary swap re-traces for nothing."""
+    import qeth.tx_activity as ta
+    from qeth.abi_cache import AbiCache
+
+    tx = _swap_tx()
+
+    def rows(base, action, address, timeout, **k):
+        if action == "tokentx":
+            return [_tokentx("OP", OP, VIEWER, ROUTER, tx.hash),
+                    _tokentx("WBTC", WBTC, ROUTER, VIEWER, tx.hash)]
+        return []
+    monkeypatch.setattr(ta, "_account_rows", rows)
+    monkeypatch.setattr(ta._Verbs, "resolve", lambda self, c: {})
+
+    calls: list[str] = []
+    ta.fetch_activities(_op_chain(), VIEWER, [tx],
+                        abi_cache=AbiCache(root=tmp_path),
+                        trace_native_in=lambda h: calls.append(h) or 1)
+    assert calls == []
+
+
+def test_plain_transfer_is_not_traced(tmp_path, monkeypatch):
+    """A plain ERC-20 transfer is one-sided too, but it's a send, not a swap —
+    it must not be traced (nor an approve)."""
+    import qeth.tx_activity as ta
+    from qeth.abi_cache import AbiCache
+
+    tx = _swap_tx(method_id="0xa9059cbb")     # transfer(address,uint256)
+    monkeypatch.setattr(ta, "_account_rows", _rows_op_out(tx))
+    monkeypatch.setattr(ta._Verbs, "resolve", lambda self, c: {})
+
+    calls: list[str] = []
+    ta.fetch_activities(_op_chain(), VIEWER, [tx],
+                        abi_cache=AbiCache(root=tmp_path),
+                        trace_native_in=lambda h: calls.append(h) or 1)
+    assert calls == []

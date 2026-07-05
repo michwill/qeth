@@ -33,7 +33,13 @@ ACTIVITIES_DIR = CONFIG_DIR / "activities"
 # pinning the stale result forever.
 # v3: clear rows cached with a one-sided result (a TOKEN->ETH swap whose
 # received native ETH was missing while Blockscout's internal-tx index lagged).
-_BUILD_VERSION = 3
+# v4: rebuild so one-sided TOKEN->native swaps gain their received-ETH leg from
+# the node-trace fallback (Blockscout's internal-tx index stays behind on L2s,
+# so on Optimism etc. the row never self-healed from the index alone).
+# v5: the v4 trace ran against the user's configured RPC, which may refuse
+# debug_traceTransaction (mainnet.optimism.io → -32601), so those rows re-cached
+# one-sided; rebuild now that the trace routes to a trace-capable endpoint.
+_BUILD_VERSION = 5
 
 
 def _leg_to_json(leg: AssetLeg) -> list:
