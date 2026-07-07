@@ -607,6 +607,13 @@ class MainWindow(QMainWindow):
     def selected_address(self) -> "str | None":
         return self.wallets_plugin.selected_address
 
+    @property
+    def selected_key(self) -> "tuple[str, str] | None":
+        """(address, path) of the single selected account row — used to route
+        a UI-driven send/sign to the exact signer record the user selected when
+        an address is held by two signers (Ledger + Air-gapped)."""
+        return self.wallets_plugin.selected_key
+
     def current_chain(self):
         return self.store.current_chain()
 
@@ -808,18 +815,23 @@ class MainWindow(QMainWindow):
         )
 
     def _launch_sign_flow(self, dialog, chain, *,
-                          on_broadcast, on_cancel, on_fail) -> None:
+                          on_broadcast, on_cancel, on_fail,
+                          signing_key: "tuple[str, str] | None" = None) -> None:
         """Wire a sign-style dialog (SignTransactionDialog or
         SendTokenDialog — both expose ``sign_requested`` /
         ``finalised_request`` / ``set_signing_in_progress`` /
         ``accept``) to the worker pipeline. Callbacks fire on
         broadcast success / dialog cancel / signing failure so the
         same code path serves both the RPC-driven and the locally
-        UI-driven signing flows."""
+        UI-driven signing flows. ``signing_key`` is the (address, path) of
+        the account row a UI-driven opener was launched for; it disambiguates
+        the signer when one address is held by two signers (Ledger +
+        Air-gapped). The RPC flow leaves it None (signs as the connected
+        default)."""
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.sign_requested.connect(
-            lambda d=dialog, c=chain, ob=on_broadcast, of=on_fail:
-                self._begin_sign(d, c, ob, of)
+            lambda d=dialog, c=chain, ob=on_broadcast, of=on_fail, sk=signing_key:
+                self._begin_sign(d, c, ob, of, signing_key=sk)
         )
         dialog.rejected.connect(on_cancel)
         dialog.show()
@@ -860,6 +872,7 @@ class MainWindow(QMainWindow):
         )
         self._launch_sign_flow(
             dialog, chain,
+            signing_key=self.selected_key,
             on_broadcast=lambda h: self.status_message(
                 f"Broadcast {h}", 6000,
             ),
@@ -907,6 +920,7 @@ class MainWindow(QMainWindow):
         )
         self._launch_sign_flow(
             dialog, chain,
+            signing_key=self.selected_key,
             on_broadcast=lambda h: self.status_message(f"{verb} {h}", 6000),
             on_cancel=lambda: None,
             on_fail=lambda msg: self.status_message(
@@ -930,7 +944,7 @@ class MainWindow(QMainWindow):
             replace_label=label,
             parent=self,
         )
-        self._launch_composer(dialog, chain, label=label,
+        self._launch_composer(dialog, chain, label=label, signing_key=self.selected_key,
                               on_broadcast=on_broadcast, on_confirmed=on_confirmed)
 
     def open_ens_composer(self, name: str, op, chain, from_addr: str, *,
@@ -950,15 +964,18 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self._launch_composer(dialog, chain, label=op.confirm_label,
-                              on_confirmed=on_confirmed)
+                              signing_key=self.selected_key, on_confirmed=on_confirmed)
 
     def _launch_composer(self, dialog, chain, *, label: str,
-                         on_broadcast=None, on_confirmed=None) -> None:
+                         on_broadcast=None, on_confirmed=None,
+                         signing_key: "tuple[str, str] | None" = None) -> None:
         """Drive a composer / sign-style dialog through the shared
         sign+broadcast pipeline with status-bar feedback. ``on_confirmed`` is
         wired (once) to the tx mining; ``on_broadcast`` fires on a successful
-        broadcast. Used by ``request_transaction`` and the ENS composer
-        opener — both build their own dialog, then hand it here."""
+        broadcast. ``signing_key`` (the selected account row) is forwarded so
+        signing resolves to that exact record. Used by ``request_transaction``
+        and the ENS composer opener — both build their own dialog, then hand
+        it here."""
         def _bcast(h: str) -> None:
             self.status_message(f"{label}: {h[:12]}…", 6000)
             if on_confirmed is not None:
@@ -973,6 +990,7 @@ class MainWindow(QMainWindow):
 
         self._launch_sign_flow(
             dialog, chain,
+            signing_key=signing_key,
             on_broadcast=_bcast,
             on_cancel=lambda: None,
             on_fail=lambda msg: self.status_message(f"{label} failed: {msg}", 6000),
@@ -1016,7 +1034,8 @@ class MainWindow(QMainWindow):
         plugin.tx_confirmed.connect(_on_confirmed)
         plugin.tx_dropped.connect(_on_dropped)
 
-    def _begin_sign(self, dialog, chain, on_broadcast, on_fail) -> None:
+    def _begin_sign(self, dialog, chain, on_broadcast, on_fail,
+                    signing_key: "tuple[str, str] | None" = None) -> None:
         """Start one sign-and-broadcast attempt. Called every time
         the user clicks Confirm — including retries after a
         previous attempt failed. ``on_broadcast(tx_hash)`` /
@@ -1036,9 +1055,17 @@ class MainWindow(QMainWindow):
         # signer.sign()); it also marshals a worker-side backend's UI (step 3's
         # QR) onto the main loop. (None, None) means no signer or the user
         # cancelled the unlock — _pick_signer_for already warned if needed.
+        #
+        # When one address is held by two signers (Ledger + Air-gapped), the
+        # exact record is the SELECTED tree row (``signing_key``), captured at
+        # open time by the UI-driven opener. Use its path only when it matches
+        # the from-address; otherwise leave it None so account_for_signing falls
+        # back to the connected default (the dapp/RPC flow passes no key, so it
+        # always signs as the default).
         interaction = DialogInteraction(dialog, title="Signing Transaction")
+        signing_path = self._signing_path_for(signing_key, finalised.from_addr)
         signer, progress_text = self._pick_signer_for(
-            dialog, finalised.from_addr, interaction)
+            dialog, finalised.from_addr, interaction, path=signing_path)
         if signer is None:
             return
         if not signer.can_sign(finalised.from_addr):
@@ -1066,6 +1093,21 @@ class MainWindow(QMainWindow):
                     msg, dialog=d, interaction=it, on_fail=of)
         )
         self.start_worker(worker)
+
+    def _signing_path_for(
+        self, signing_key: "tuple[str, str] | None", from_addr: str,
+    ) -> str | None:
+        """The derivation path of the account record this sign should use, or
+        None. ``signing_key`` is the SELECTED tree row's ``(address, path)``,
+        captured by a UI-driven opener; when its address matches ``from_addr``
+        we return that exact path so ``account_for_signing`` resolves to the
+        record the user selected — the disambiguator when one address is held
+        by two signers (Ledger + Air-gapped). Returns None when there is no key
+        (dapp/RPC flow) or the selection has moved to a different address, so
+        signing falls back to the connected default."""
+        if signing_key is not None and signing_key[0].lower() == from_addr.lower():
+            return signing_key[1]
+        return None
 
     def _pick_signer_for(
         self, dialog, address: str, interaction, path: str | None = None,

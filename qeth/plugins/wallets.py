@@ -374,6 +374,15 @@ class WalletsPlugin(Plugin):
                 out.append(addr)
         return out
 
+    @property
+    def selected_key(self) -> tuple[str, str] | None:
+        """(address, path) of the single selected account row — the exact
+        signer record — or None for a zero/multi/group selection. Lets the
+        host route signing to the SELECTED record when one address is held by
+        two signers (Ledger + Air-gapped), rather than the connected default
+        or first-in-list (which ``account_for_signing`` falls back to)."""
+        return self._selected_key()
+
     def _selected_key(self) -> tuple[str, str] | None:
         """(address, path) of the single selected account row, or None for a
         zero/multi/group selection. Identifies the exact record across a rebuild."""
