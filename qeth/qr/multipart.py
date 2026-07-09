@@ -91,11 +91,15 @@ def frame_source(
     then a batch of fresh rateless fountain parts, and REPEATS — re-injecting the
     pure fragments every cycle rather than only once.
 
-    The pure fragments are the self-contained, immediately-usable ones; re-showing
-    them lets a device that locked on after the first pass — or lost its
-    accumulated state — recover in ~seqLen frames instead of rebuilding the whole
-    message from rateless mixes (a Keycard Shell, which discards accumulated parts
-    on a transient bad frame, otherwise sat at 0% on a large tx). The rateless
+    The pure fragments are the self-contained, immediately-usable ones (each
+    yields one fragment the instant it's scanned, no peeling). Re-showing them
+    means a device that locks on AFTER the first pure block — likely on a big,
+    slow-to-scan sequence — keeps getting those fast, guaranteed fragments instead
+    of only the slower-to-peel rateless mixes, so it converges without depending
+    on lock-on timing. (This is a convergence aid for large transfers, e.g. a
+    Keycard Shell scanning a ~120-part tx; it is NOT recovery from a decoder
+    state-wipe — a Keycard maintainer confirmed a mis-read frame is simply
+    dropped, not thrown back. See keycard-tech/keycard-shell#219.) The rateless
     batch between pure blocks still removes the coupon-collector tail. The order
     is wire-compatible: the parts are byte-identical and spec-valid, so a decoder
     that does not need the re-injection (e.g. Keystone) reads it unchanged.
