@@ -1756,6 +1756,137 @@ class TestEnsWriteActions:
         plugin._on_remove_record("vitalik.eth", "url", "https://x")
         assert host.ens_ops == []                         # nothing to target
 
+    # --- optimistic (synchronous) record reflection on confirm ------------
+    # These prove the tree updates on confirm WITHOUT the async re-read landing
+    # (the async worker is disabled), which is what made records reliably show.
+
+    def test_set_addr_confirm_updates_tree_without_async(self, qtbot):
+        from eth_utils import to_checksum_address
+        plugin, host, store = self._plugin(qtbot)        # vitalik.eth in tree
+        plugin._on_records_requested = lambda *a, **k: None   # kill the async path
+        plugin._write_addr("vitalik.eth")
+        _name, op, _chain, _from, on_confirmed = host.ens_ops[0]
+        dlg = self._composer(op)
+        qtbot.addWidget(dlg)
+        dlg._fields.value.setText(self.OTHER)
+        dlg._build_request()                             # records the change
+        on_confirmed({"status": "0x1"})
+        item = plugin.widget()._items_by_name["vitalik.eth"]
+        want = to_checksum_address(self.OTHER)
+        assert item.text(2) == want                      # Resolves-to column
+        rows = {item.child(i).text(0): item.child(i).text(2)
+                for i in range(item.childCount())}
+        assert rows.get("address") == want               # the address record row
+
+    def test_set_text_confirm_adds_row_without_async(self, qtbot):
+        plugin, host, store = self._plugin(qtbot)
+        plugin._on_records_requested = lambda *a, **k: None
+        plugin._write_text("vitalik.eth")
+        _name, op, _chain, _from, on_confirmed = host.ens_ops[0]
+        dlg = self._composer(op)
+        qtbot.addWidget(dlg)
+        dlg._fields.key.setCurrentText("url")
+        dlg._fields.value.setText("https://x")
+        dlg._build_request()
+        on_confirmed({"status": "0x1"})
+        item = plugin.widget()._items_by_name["vitalik.eth"]
+        rows = {item.child(i).text(0): item.child(i).text(2)
+                for i in range(item.childCount())}
+        assert rows.get("url") == "https://x"
+
+    def test_remove_record_confirm_clears_row_without_async(self, qtbot):
+        from qeth.ens_app import EnsRecords
+        plugin, host, store = self._plugin(qtbot)
+        plugin._rec_cache["vitalik.eth"] = (
+            EnsRecords(texts={"url": "https://x"}), 100, True)
+        plugin.widget().add_records(
+            "vitalik.eth", EnsRecords(texts={"url": "https://x"}))
+        plugin._on_records_requested = lambda *a, **k: None
+        plugin._on_remove_record("vitalik.eth", "url", "https://x")
+        _name, _op, _chain, _from, on_confirmed = host.ens_ops[0]
+        on_confirmed({"status": "0x1"})
+        item = plugin.widget()._items_by_name["vitalik.eth"]
+        labels = [item.child(i).text(0) for i in range(item.childCount())]
+        assert "url" not in labels                       # cleared on confirm
+
+    def test_apply_record_change_keeps_block_for_async_supersede(self, qtbot):
+        # The optimistic anchor keeps the prior block (verified→False) so a later
+        # async re-read at a newer block still wins and can re-earn the ✓.
+        from qeth.ens_app import EnsRecords
+        plugin, host, store = self._plugin(qtbot)
+        plugin._rec_cache["vitalik.eth"] = (EnsRecords(), 500, True)
+        plugin._apply_record_change(
+            "vitalik.eth", {"kind": "Text record", "extra": "url",
+                            "value": "https://y"})
+        rec, block, verified = plugin._rec_cache["vitalik.eth"]
+        assert rec.texts["url"] == "https://y"
+        assert block == 500 and verified is False        # block kept, unverified
+
+    # --- optimistic ownership / expiry reflection on confirm --------------
+
+    def test_apply_role_sets_manager_and_owner_rows(self, qtbot):
+        from eth_utils import to_checksum_address
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        panel.populate(build_tree([EnsName("vitalik.eth")]), NOW)
+        mgr, own = "0x" + "11" * 20, "0x" + "22" * 20
+        panel.apply_role("vitalik.eth", controller=mgr, registrant=own)
+        item = panel._items_by_name["vitalik.eth"]
+        rows = {item.child(i).text(0): item.child(i).text(2)
+                for i in range(item.childCount())}
+        assert rows.get("manager") == to_checksum_address(mgr)
+        assert rows.get("owner") == to_checksum_address(own)
+
+    def test_set_manager_confirm_updates_row_without_async(self, qtbot):
+        from eth_utils import to_checksum_address
+        plugin, host, store = self._plugin(qtbot)        # vitalik.eth in tree
+        plugin._on_refresh = lambda **k: None            # kill async rediscover/verify
+        plugin._set_manager("vitalik.eth")
+        _name, op, _chain, _from, on_confirmed = host.ens_ops[0]
+        dlg = self._composer(op)
+        qtbot.addWidget(dlg)
+        dlg._fields.recipient.setText(self.OTHER)
+        dlg._build_request()
+        on_confirmed({"status": "0x1"})
+        item = plugin.widget()._items_by_name["vitalik.eth"]
+        mgr = next((item.child(i) for i in range(item.childCount())
+                    if item.child(i).text(0) == "manager"), None)
+        assert mgr is not None
+        assert mgr.text(2) == to_checksum_address(self.OTHER)
+
+    def test_transfer_confirm_updates_owner_row_without_async(self, qtbot):
+        from eth_utils import to_checksum_address
+        plugin, host, store = self._plugin(qtbot)
+        plugin._on_refresh = lambda **k: None
+        plugin._transfer("vitalik.eth")
+        _name, op, _chain, _from, on_confirmed = host.ens_ops[0]
+        dlg = self._composer(op)
+        qtbot.addWidget(dlg)
+        dlg._fields.recipient.setText(self.OTHER)
+        dlg._build_request()
+        on_confirmed({"status": "0x1"})
+        item = plugin.widget()._items_by_name["vitalik.eth"]
+        own = next((item.child(i) for i in range(item.childCount())
+                    if item.child(i).text(0) == "owner"), None)
+        assert own is not None
+        assert own.text(2) == to_checksum_address(self.OTHER)
+
+    def test_renew_confirm_updates_expiry_without_async(self, qtbot):
+        from qeth.plugins.ens import _NAME_ROLE
+        plugin, host, store = self._plugin(qtbot)
+        plugin._names_by_l["vitalik.eth"].expiry_ts = self.OWNED_EXP
+        plugin._on_refresh = lambda **k: None
+        plugin._renew("vitalik.eth")
+        _name, op, _chain, _from, on_confirmed = host.ens_ops[0]
+        dlg = self._composer(op)
+        qtbot.addWidget(dlg)
+        dlg._fields.set_quote(1_000_000_000, None)       # price it so build works
+        target = dlg._fields.target_ts()
+        dlg._build_request()
+        on_confirmed({"status": "0x1"})
+        item = plugin.widget()._items_by_name["vitalik.eth"]
+        assert item.data(0, _NAME_ROLE).expiry_ts == target   # new expiry reflected
+
     def test_remove_subdomain_builds_setsubnoderecord(self, qtbot):
         from eth_abi import encode as abi_encode
         from qeth.ens_app import ENS_REGISTRY, _labelhash, namehash

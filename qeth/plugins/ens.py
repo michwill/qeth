@@ -1075,6 +1075,24 @@ class EnsPanel(QWidget):
             item.addChild(ch)
         item.setExpanded(was_expanded)   # mutating children can't toggle the fold
 
+    def apply_role(self, name: str, *, controller: str | None = None,
+                   registrant: str | None = None) -> None:
+        """Optimistically set a name's manager (controller) / owner (registrant)
+        row from a just-confirmed ownership write (set-manager, transfer),
+        without waiting on the verify pass. Unverified (no ✓) until the proof
+        lands and re-earns it."""
+        import dataclasses
+        nl = name.lower()
+        st = self._ownership.get(nl) or OwnershipCheck(owner_known=True)
+        self._ownership[nl] = dataclasses.replace(
+            st, owner_known=True,
+            controller=controller if controller is not None else st.controller,
+            registrant=registrant if registrant is not None else st.registrant)
+        self._ownership_verified.discard(nl)     # unproven until re-verified
+        item = self._items_by_name.get(nl)
+        if item is not None:
+            self._render_ownership_rows(item, nl)
+
     def update_resolved(self, name: str, address: str | None) -> None:
         """Update a name row's 'Resolves to' column from a fresh head read of its
         ETH address record — so a setAddr change shows on the (possibly
@@ -2448,7 +2466,9 @@ class EnsPlugin(Plugin):
         res = self._resolver_for(name)
         if res is None:
             return
-        self._open_composer(name, self._remove_record_op(name, res, label, value))
+        self._open_composer(
+            name, self._remove_record_op(name, res, label, value),
+            after_confirm=lambda: self._apply_record_removal(name, label))
 
     def _remove_subdomain(self, name: str) -> None:
         """Delete a subdomain. Three authorised paths, by how the name is held:
@@ -2483,6 +2503,105 @@ class EnsPlugin(Plugin):
         c = self._rec_cache.get(name.lower())
         return c[0] if c is not None else None
 
+    def _push_records(self, name: str, new_rec: EnsRecords, *,
+                      set_resolved: bool = False,
+                      resolved: str | None = None) -> None:
+        """Show a record change NOW (unverified), off the value we just wrote —
+        no wait on the async re-read. Keeps the anchor's block so that re-read
+        (a newer block) still supersedes and earns the ✓; a lone async refresh
+        can be lost to timing or a concurrent tree rebuild, which is why the
+        change wasn't appearing on confirm."""
+        nl = name.lower()
+        prev = self._rec_cache.get(nl)
+        block = prev[1] if prev is not None else 0
+        self._rec_cache[nl] = (new_rec, block, False)
+        if self._panel is not None:
+            self._panel.add_records(name, new_rec, verified=False)
+            if set_resolved:
+                self._panel.update_resolved(name, resolved)
+
+    def _apply_record_change(self, name: str, changed: dict[str, str]) -> None:
+        """Merge a just-confirmed record write into the shown records + Resolves-
+        to column at once (``changed`` = the confirmed kind/key-or-coin/value)."""
+        if self._panel is None or not changed:
+            return
+        from .. import ens_write
+        from ..ens_app import EnsRecords
+        kind = changed.get("kind", "")
+        extra = changed.get("extra", "")
+        value = changed.get("value", "")
+        cur = self._cur_records(name)
+        addresses = dict(cur.addresses) if cur is not None else {}
+        texts = dict(cur.texts) if cur is not None else {}
+        contenthash = cur.contenthash if cur is not None else None
+        set_resolved = False
+        resolved: str | None = None
+        if kind == "ETH address":
+            set_resolved = True
+            resolved = _checksum(value) or (value or None)
+            if resolved:
+                addresses["60"] = resolved
+            else:
+                addresses.pop("60", None)
+        elif kind == "Content (IPFS)":
+            contenthash = value or None
+        elif kind == "Text record":
+            if value:
+                texts[extra] = value
+            else:
+                texts.pop(extra, None)
+        else:                                    # Other-chain address
+            ct = ens_write.COIN_TYPES.get(extra)
+            if ct is not None:
+                key = str(ct)
+                if value:
+                    addresses[key] = _checksum(value) or value
+                else:
+                    addresses.pop(key, None)
+        self._push_records(
+            name, EnsRecords(addresses=addresses, texts=texts,
+                             contenthash=contenthash),
+            set_resolved=set_resolved, resolved=resolved)
+
+    def _apply_record_removal(self, name: str, label: str) -> None:
+        """Drop a just-removed record from the shown records at once. ``label``
+        is the tree row label (``address`` / ``address (COIN)`` / ``content`` /
+        a text key), same forms ``_record_rows`` renders."""
+        if self._panel is None:
+            return
+        from ..ens_app import EnsRecords
+        lab = label.strip()
+        cur = self._cur_records(name)
+        addresses = dict(cur.addresses) if cur is not None else {}
+        texts = dict(cur.texts) if cur is not None else {}
+        contenthash = cur.contenthash if cur is not None else None
+        set_resolved = False
+        if lab == "address":
+            addresses.pop("60", None)
+            set_resolved = True
+        elif lab == "content":
+            contenthash = None
+        elif lab.startswith("address (") and lab.endswith(")"):
+            addresses.pop(lab[len("address ("):-1], None)
+        else:
+            texts.pop(lab, None)
+        self._push_records(
+            name, EnsRecords(addresses=addresses, texts=texts,
+                             contenthash=contenthash),
+            set_resolved=set_resolved, resolved=None)
+
+    def _open_record_composer(self, name: str, res: str, **op_kwargs) -> None:
+        """Open a record-write composer that reflects its change in the tree the
+        instant the tx confirms (like add/remove subdomain), then lets the async
+        re-read confirm it (earn the ✓). Not waiting on that read is what makes
+        the change appear reliably — a lone async refresh could be lost to
+        timing or a concurrent tree rebuild."""
+        changed: dict[str, str] = {}
+        op = self._record_op(name, res, changed=changed, **op_kwargs)
+        self._open_composer(
+            name, op,
+            after_confirm=lambda: self._apply_record_change(name, changed))
+
     def _write_addr(self, name: str, prefill: str = "") -> None:
         if self._panel is None:
             return
@@ -2493,9 +2612,9 @@ class EnsPlugin(Plugin):
         if not cur:
             n = self._names_by_l.get(name.lower())
             cur = (n.resolved_address or "") if n is not None else ""
-        self._open_composer(name, self._record_op(
+        self._open_record_composer(
             name, res, preset="ETH address", value=cur,
-            confirm_label="Set address"))
+            confirm_label="Set address")
 
     def _write_content(self, name: str, prefill: str = "") -> None:
         if self._panel is None:
@@ -2507,9 +2626,9 @@ class EnsPlugin(Plugin):
         if not cur:
             rec = self._cur_records(name)
             cur = (rec.contenthash or "") if rec is not None else ""
-        self._open_composer(name, self._record_op(
+        self._open_record_composer(
             name, res, preset="Content (IPFS)", value=cur,
-            confirm_label="Set content"))
+            confirm_label="Set content")
 
     def _write_text(self, name: str, key: str = "", value: str = "") -> None:
         if self._panel is None:
@@ -2517,9 +2636,9 @@ class EnsPlugin(Plugin):
         res = self._ensure_resolver(name)
         if res is None:
             return
-        self._open_composer(name, self._record_op(
+        self._open_record_composer(
             name, res, preset="Text record", key=key, value=value,
-            confirm_label="Set text record"))
+            confirm_label="Set text record")
 
     def _write_record(self, name: str, *, preset: str | None = None,
                       coin: str = "", value: str = "") -> None:
@@ -2528,9 +2647,9 @@ class EnsPlugin(Plugin):
         res = self._ensure_resolver(name)
         if res is None:
             return
-        self._open_composer(name, self._record_op(
+        self._open_record_composer(
             name, res, preset=preset, coin=coin, value=value,
-            confirm_label="Save record"))
+            confirm_label="Save record")
 
     def _add_subdomain(self, name: str) -> None:
         if self._panel is None:
@@ -2555,7 +2674,15 @@ class EnsPlugin(Plugin):
         chain = self._mainnet()
         if chain is None:
             return
-        self._open_composer(name, self._renew_op(name, chain))
+        changed: dict[str, str] = {}
+        op = self._renew_op(name, chain, changed)
+        self._open_composer(
+            name, op, after_confirm=lambda: self._apply_renew(name, changed))
+
+    def _apply_renew(self, name: str, changed: dict[str, str]) -> None:
+        ts = changed.get("expiry")
+        if ts and self._panel is not None:
+            self._panel.update_expiry(name, int(ts))
 
     # --- transfer ----------------------------------------------------------
 
@@ -2567,7 +2694,20 @@ class EnsPlugin(Plugin):
         addr = host.selected_address if host is not None else None
         if not addr:
             return
-        self._open_composer(name, self._transfer_op(name, addr))
+        changed: dict[str, str] = {}
+        op = self._transfer_op(name, addr, changed)
+        self._open_composer(
+            name, op, after_confirm=lambda: self._apply_transfer(name, changed))
+
+    def _apply_transfer(self, name: str, changed: dict[str, str]) -> None:
+        to = changed.get("to")
+        if not to or self._panel is None:
+            return
+        # Wrapped moves BOTH roles; unwrapped moves the registrant (NFT) only —
+        # the manager stays with you until the new owner reclaims it.
+        wrapped = bool(changed.get("wrapped"))
+        self._panel.apply_role(
+            name, registrant=to, controller=to if wrapped else None)
 
     # --- set manager (reclaim) --------------------------------------------
 
@@ -2579,27 +2719,38 @@ class EnsPlugin(Plugin):
         addr = host.selected_address if host is not None else ""
         self_addr = _checksum(addr or "") or ""
         nl = name.lower()
+        changed: dict[str, str] = {}
         if EnsName(name).is_subdomain:
             # Subdomain: (re)assign its manager through the parent, if we own the
             # parent. Wrapped subnodes go through the NameWrapper — not yet.
             if nl in self._subnode_manageable:
                 self._open_composer(
-                    name, self._set_subnode_manager_op(name, self_addr))
+                    name, self._set_subnode_manager_op(name, self_addr, changed),
+                    after_confirm=lambda: self._apply_set_manager(name, changed))
         elif _is_eth_2ld(name) and nl not in self._wrapped:
             # 2LD: the registrant reclaims via the BaseRegistrar.
             self._open_composer(
-                name, self._set_manager_op(name, self_addr))
+                name, self._set_manager_op(name, self_addr, changed),
+                after_confirm=lambda: self._apply_set_manager(name, changed))
+
+    def _apply_set_manager(self, name: str, changed: dict[str, str]) -> None:
+        mgr = changed.get("manager")
+        if mgr and self._panel is not None:
+            self._panel.apply_role(name, controller=mgr)
 
     # --- op construction ---------------------------------------------------
 
     def _record_op(self, name: str, res: str, *, preset: str | None = None,
                    key: str = "", coin: str = "", value: str = "",
-                   confirm_label: str = "Save record") -> _EnsOp:
+                   confirm_label: str = "Save record",
+                   changed: dict[str, str] | None = None) -> _EnsOp:
         """One op covering every resolver-record write (addr / content / text /
         coin). ``preset`` locks the type; the build/validate/decoded callables
         dispatch on the field group's chosen kind, mirroring the old
         ``_write_record`` logic — but now lazily, on Confirm, inside the rich
-        composer (validation surfaces as a disabled Confirm, not a popup)."""
+        composer (validation surfaces as a disabled Confirm, not a popup).
+        ``changed`` (when given) captures the confirmed (kind, key/coin, value)
+        so the post-confirm hook can reflect it in the tree at once."""
         from .. import ens_write
 
         def make_fields(_composer: _EnsWriteComposer) -> QWidget:
@@ -2608,6 +2759,9 @@ class EnsPlugin(Plugin):
 
         def build(nm: str, fields: Any) -> tuple[str, str]:
             kind, extra, val = fields.result_values()
+            if changed is not None:
+                changed["kind"], changed["extra"], changed["value"] = \
+                    kind, extra, val
             if kind == "ETH address":
                 addr = _checksum(val)
                 if val and addr is None:
@@ -2698,7 +2852,8 @@ class EnsPlugin(Plugin):
             make_fields=make_fields, build=build, decoded=decoded,
             rediscover=True)
 
-    def _renew_op(self, name: str, chain) -> _EnsOp:
+    def _renew_op(self, name: str, chain,
+                  changed: dict[str, str] | None = None) -> _EnsOp:
         from .. import ens_write
         label = name.split(".")[0]
         expiry_ts = self._expiry_of(name)
@@ -2716,6 +2871,8 @@ class EnsPlugin(Plugin):
             return fields
 
         def build(nm: str, fields: Any) -> tuple[str, str]:
+            if changed is not None:
+                changed["expiry"] = str(fields.target_ts())
             return ens_write.renew(label, fields.duration_seconds())
 
         def value_wei(fields: Any) -> int:
@@ -2748,7 +2905,8 @@ class EnsPlugin(Plugin):
             value_wei=value_wei, validate=validate, rediscover=True,
             payable=True)
 
-    def _transfer_op(self, name: str, from_addr: str) -> _EnsOp:
+    def _transfer_op(self, name: str, from_addr: str,
+                     changed: dict[str, str] | None = None) -> _EnsOp:
         from eth_utils import to_checksum_address
 
         from .. import ens_write
@@ -2763,6 +2921,9 @@ class EnsPlugin(Plugin):
             to = _checksum(fields.value())
             if to is None:
                 raise ValueError("The recipient must be a valid 0x address.")
+            if changed is not None:
+                changed["to"] = to
+                changed["wrapped"] = "1" if wrapped else ""
             return ens_write.transfer_name(nm, sender, to, wrapped=wrapped)
 
         def decoded(nm: str, fields: Any) -> dict:
@@ -2785,7 +2946,8 @@ class EnsPlugin(Plugin):
             confirm_icon_names=("go-next",),
             confirm_fallback=QStyle.StandardPixmap.SP_ArrowForward)
 
-    def _set_manager_op(self, name: str, self_addr: str) -> _EnsOp:
+    def _set_manager_op(self, name: str, self_addr: str,
+                        changed: dict[str, str] | None = None) -> _EnsOp:
         from .. import ens_write
 
         def make_fields(composer: _EnsWriteComposer) -> QWidget:
@@ -2800,6 +2962,8 @@ class EnsPlugin(Plugin):
             mgr = _checksum(fields.value())
             if mgr is None:
                 raise ValueError("The manager must be a valid 0x address.")
+            if changed is not None:
+                changed["manager"] = mgr
             return ens_write.set_manager(nm, mgr)
 
         def decoded(nm: str, fields: Any) -> dict:
@@ -2816,7 +2980,8 @@ class EnsPlugin(Plugin):
                  "resolver, records and subdomains. As the owner you can "
                  "reclaim it — to yourself or anyone else.")
 
-    def _set_subnode_manager_op(self, name: str, self_addr: str) -> _EnsOp:
+    def _set_subnode_manager_op(self, name: str, self_addr: str,
+                                changed: dict[str, str] | None = None) -> _EnsOp:
         """Set the manager of a subdomain you own the PARENT of, via
         registry.setSubnodeOwner — the parent controller's power to reassign a
         subnode. Defaults to yourself (so you can then edit its records)."""
@@ -2834,6 +2999,8 @@ class EnsPlugin(Plugin):
             mgr = _checksum(fields.value())
             if mgr is None:
                 raise ValueError("The manager must be a valid 0x address.")
+            if changed is not None:
+                changed["manager"] = mgr
             return ens_write.set_subnode_manager(parent, label, mgr)
 
         def decoded(_nm: str, fields: Any) -> dict:
