@@ -335,7 +335,8 @@ class EnsRecordsWorker(QThread):
 
     def __init__(self, chain, name: str, parent=None,
                  *, wait_s: float = VERIFY_WAIT_S, client=None,
-                 resolver: str | None = None, catchup: bool = False):
+                 resolver: str | None = None, catchup: bool = False,
+                 extra_text_keys: tuple[str, ...] = ()):
         super().__init__(parent)
         self._chain = chain
         self._name = name
@@ -350,19 +351,25 @@ class EnsRecordsWorker(QThread):
         # up to the value the fast read already saw, so the ✓ lands on the NEW
         # value rather than the sidecar's momentarily-stale older one.
         self._catchup = catchup
+        # ENS text records can't be enumerated on-chain (no listKeys) — you must
+        # query each key. So beyond the standard set, also query the CUSTOM keys
+        # we already know this name has (from the cache), else a re-read drops
+        # them (e.g. a custom "lt" record vanishing after an account switch).
+        self._text_keys = TEXT_KEYS + tuple(
+            k for k in extra_text_keys if k and k not in TEXT_KEYS)
 
     def run(self) -> None:
         # _catchup is set iff this worker was spawned for a post-write re-read
         # (catchup=force), so it doubles as this worker's "forced" flag.
         forced = self._catchup
         rec, ok, fast_block = read_records(
-            self._chain, self._name,
+            self._chain, self._name, text_keys=self._text_keys,
             client=self._client, resolver=self._resolver)
         self.ready.emit(self._name, rec, fast_block, False, ok, forced)
         tries = _VERIFY_CATCHUP_TRIES if self._catchup else 1
         for attempt in range(tries):
             vrec, verified, vblock = verified_read_records(
-                self._chain, self._name,
+                self._chain, self._name, text_keys=self._text_keys,
                 wait_s=self._wait_s if attempt == 0 else 0.0)
             if not verified:           # no sidecar / can't prove → stop trying
                 return
@@ -2440,6 +2447,15 @@ class EnsPlugin(Plugin):
         chain = self._mainnet()
         if chain is None:
             return
+        # Custom text keys can't be enumerated on-chain, so a plain re-read only
+        # sees the standard set — dropping a custom record (e.g. "lt") we already
+        # know about. Re-query both the keys we currently show for THIS name and
+        # every custom key the user has ever set (persisted in the store) — so a
+        # re-set of one key recovers the same key on other names too.
+        cached = self._rec_cache.get(nl) or self._cache.load_records(
+            ENS_CHAIN_ID, name)
+        known_keys = tuple(cached[0].texts.keys()) if cached is not None else ()
+        known_keys += tuple(self._store.custom_text_keys)
         # No shared EthClient: each worker creates its own inside run() (on its
         # own thread). EthClient owns a requests.Session + web3 provider stack +
         # mutable failover state, none thread-safe — sharing one across the
@@ -2447,8 +2463,8 @@ class EnsPlugin(Plugin):
         # session/failover state (issue #6). A fresh client per expand costs a
         # TLS handshake; correctness wins, and expands are user-paced.
         worker = EnsRecordsWorker(
-            chain, name,
-            resolver=self._resolver_cache.get(nl), catchup=force)
+            chain, name, resolver=self._resolver_cache.get(nl),
+            catchup=force, extra_text_keys=known_keys)
         worker.ready.connect(self._on_records_ready)
         self._start(worker)
 
@@ -2606,6 +2622,10 @@ class EnsPlugin(Plugin):
         prev_block = prev[1] if prev is not None else 0
         b = max(int(block) if block is not None else 0, prev_block)
         self._rec_cache[nl] = (new_rec, b, False)
+        # Persist now (we only get here on a SUCCEEDED tx): a custom text key we
+        # just set must reach disk so it survives an account switch, even if the
+        # async re-read lands at the same block (skipped) or never persists.
+        self._cache.save_records(ENS_CHAIN_ID, name, new_rec, b, False)
         if self._panel is not None:
             self._panel.add_records(name, new_rec, verified=False)
             if set_resolved:
@@ -2641,6 +2661,10 @@ class EnsPlugin(Plugin):
         elif kind == "Text record":
             if value:
                 texts[extra] = value
+                if extra and extra not in TEXT_KEYS:
+                    # A custom key can't be enumerated on-chain — remember it
+                    # (persisted) so every future read re-queries it.
+                    self._store.add_custom_text_key(extra)
             else:
                 texts.pop(extra, None)
         else:                                    # Other-chain address

@@ -63,11 +63,15 @@ class _StubHost:
 class _StubStore:
     def __init__(self):
         self.custom_ens_names: set[str] = set()
+        self.custom_text_keys: set[str] = set()
         # Accounts the wallet can sign for; _can_sign() reads source.
         self.accounts: list[dict] = []
 
     def add_custom_ens_name(self, name: str) -> None:
         self.custom_ens_names.add(name.strip().lower())
+
+    def add_custom_text_key(self, key: str) -> None:
+        self.custom_text_keys.add((key or "").strip())
 
 
 # --- EnsPanel --------------------------------------------------------------
@@ -1723,6 +1727,63 @@ class TestEnsWriteActions:
         labels = [item.child(i).text(0) for i in range(item.childCount())]
         assert "lt" not in labels                            # not shown
         assert forced == []                                  # no refresh either
+
+    # --- custom text keys survive (can't be enumerated on-chain) ----------
+
+    def test_custom_text_key_is_requeried_on_reread(self, qtbot, tmp_path):
+        # A custom key we already show ("lt") must be fed back into the re-read,
+        # else the standard-keys-only read drops it.
+        from qeth.ens_app import EnsCache, EnsRecords
+        from qeth.plugins.ens import EnsRecordsWorker, TEXT_KEYS
+        plugin, host, store = self._plugin(qtbot)
+        plugin._cache = EnsCache(tmp_path)
+        plugin._rec_cache["vitalik.eth"] = (
+            EnsRecords(texts={"lt": "0xabc"}), 100, False)
+        started: list = []
+        plugin._start = started.append                       # capture, don't run
+        plugin._on_records_requested("vitalik.eth", force=True)
+        worker = started[0]
+        assert isinstance(worker, EnsRecordsWorker)
+        assert "lt" in worker._text_keys                     # custom key re-queried
+        assert set(TEXT_KEYS) <= set(worker._text_keys)      # + the standard set
+
+    def test_setting_custom_text_key_remembers_it(self, qtbot):
+        plugin, host, store = self._plugin(qtbot)
+        plugin._apply_record_change(
+            "vitalik.eth",
+            {"kind": "Text record", "extra": "lt", "value": "0xabc"}, 100)
+        assert "lt" in store.custom_text_keys                # remembered (persisted)
+        # a STANDARD key isn't stored as custom
+        plugin._apply_record_change(
+            "vitalik.eth",
+            {"kind": "Text record", "extra": "url", "value": "https://x"}, 101)
+        assert "url" not in store.custom_text_keys
+
+    def test_stored_custom_key_requeried_even_without_cache(self, qtbot, tmp_path):
+        # A key the user set before (persisted) is re-queried on ANY name, even
+        # one with no cached record — recovering the same key across names.
+        from qeth.ens_app import EnsCache
+        from qeth.plugins.ens import EnsRecordsWorker
+        plugin, host, store = self._plugin(qtbot)
+        plugin._cache = EnsCache(tmp_path)
+        store.custom_text_keys = {"lt"}
+        started: list = []
+        plugin._start = started.append
+        plugin._on_records_requested("vitalik.eth")          # no cached record
+        assert isinstance(started[0], EnsRecordsWorker)
+        assert "lt" in started[0]._text_keys
+
+    def test_push_records_persists_custom_key_to_disk(self, qtbot, tmp_path):
+        # The optimistic value reaches disk immediately, so a custom key survives
+        # an account switch even before any re-read persists it.
+        from qeth.ens_app import EnsCache, EnsRecords
+        from qeth.plugins.ens import ENS_CHAIN_ID
+        plugin, host, store = self._plugin(qtbot)
+        plugin._cache = EnsCache(tmp_path)
+        plugin._push_records(
+            "vitalik.eth", EnsRecords(texts={"lt": "0xabc"}), block=100)
+        loaded = plugin._cache.load_records(ENS_CHAIN_ID, "vitalik.eth")
+        assert loaded is not None and loaded[0].texts.get("lt") == "0xabc"
 
     def test_add_then_stale_verify_keeps_name_and_manager(self, qtbot, tmp_path):
         # The reported cbbtc case: a just-added subnode must survive a LAGGING

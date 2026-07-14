@@ -109,6 +109,11 @@ class Store:
         # Custom-pinned ENS names (lower-case) for the ENS plugin — shown in
         # addition to whatever the indexer discovers. ENS is mainnet-only.
         self.custom_ens_names: set[str] = set()
+        # Non-standard ENS text-record keys the user has set (e.g. "lt"). ENS
+        # text records can't be enumerated on-chain, so a read only sees a fixed
+        # standard set; we remember custom keys here (persisted) and query them
+        # too, else a custom record vanishes on the next read.
+        self.custom_text_keys: set[str] = set()
         # Hex-encoded QByteArray from QMainWindow.saveGeometry(), so size +
         # position + maximized state all round-trip.
         self.window_geometry: str | None = None
@@ -190,6 +195,10 @@ class Store:
                 str(n).lower() for n in data.get("custom_ens_names", [])
                 if isinstance(n, str) and n
             }
+            s.custom_text_keys = {
+                str(k) for k in data.get("custom_text_keys", [])
+                if isinstance(k, str) and k
+            }
         return s
 
     def save(self) -> None:
@@ -227,6 +236,7 @@ class Store:
                 "etherscan_api_key": self.etherscan_api_key,
                 "notifications_enabled": self.notifications_enabled,
                 "custom_ens_names": sorted(self.custom_ens_names),
+                "custom_text_keys": sorted(self.custom_text_keys),
             }
         ensure_private_root()
         payload = json.dumps(data, indent=2)
@@ -442,6 +452,18 @@ class Store:
     def remove_custom_ens_name(self, name: str) -> None:
         with self._lock:
             self.custom_ens_names.discard(name.strip().lower())
+        self.save()
+
+    def add_custom_text_key(self, key: str) -> None:
+        """Remember a non-standard ENS text-record key so future reads query it
+        (a no-op for the standard keys). Persisted; only ever grows."""
+        k = (key or "").strip()
+        if not k:
+            return
+        with self._lock:
+            if k in self.custom_text_keys:
+                return
+            self.custom_text_keys.add(k)
         self.save()
 
     def hide_token(self, chain_id: int, address: str) -> None:
