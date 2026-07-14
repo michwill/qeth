@@ -201,3 +201,16 @@ class TestRemoveSubnode:
             ["bytes32", "bytes32", "address", "address", "uint64"],
             [namehash(NAME), _labelhash("ops"),
              ens_write.ZERO_ADDRESS, ens_write.ZERO_ADDRESS, 0])
+
+    def test_relinquish_subnode_self_setrecord_on_the_node(self):
+        # A subdomain's OWN manager gives it up via setRecord(node, 0, 0, 0) —
+        # same zeroed slots as remove_subnode, authorised against the subnode
+        # itself (the full subdomain name, not parent + label).
+        full = "ops." + NAME
+        to, data = ens_write.relinquish_subnode(full)
+        assert to == ENS_REGISTRY
+        assert _selector(data) == "cf408823"           # setRecord
+        assert _body(data) == abi_encode(
+            ["bytes32", "address", "address", "uint64"],
+            [namehash(full), ens_write.ZERO_ADDRESS,
+             ens_write.ZERO_ADDRESS, 0])

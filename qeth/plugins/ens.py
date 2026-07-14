@@ -507,6 +507,7 @@ class EnsPanel(QWidget):
         self._transferable: set[str] = set()   # names the user can transfer (NFT owner)
         self._reclaimable: set[str] = set()    # owner can reclaim manager (unwrapped)
         self._subnode_manageable: set[str] = set()  # subdomains you own the parent of
+        self._subnode_removable: set[str] = set()   # subdomains you can delete
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.tree = _EnsTree()
@@ -778,9 +779,10 @@ class EnsPanel(QWidget):
         self._b_content.setEnabled(manages)
         self._b_record.setEnabled(manages)
         self._b_subdomain.setEnabled(manages)
-        # Remove a subdomain: only for a subdomain whose parent you own.
+        # Remove a subdomain: whenever you can delete it (own the parent, or
+        # manage the unwrapped subnode itself).
         self._b_remove.setEnabled(
-            n.is_subdomain and nl in self._subnode_manageable)
+            n.is_subdomain and nl in self._subnode_removable)
 
     def _set_record_mode(self, item: QTreeWidgetItem) -> None:
         for b in self._name_btns:
@@ -848,7 +850,7 @@ class EnsPanel(QWidget):
         n = item.data(0, _NAME_ROLE)
         if isinstance(n, EnsName):
             nl = n.name.lower()
-            if n.is_subdomain and nl in self._subnode_manageable:
+            if n.is_subdomain and nl in self._subnode_removable:
                 return ("subdomain", n.name)
             return None
         if item.data(0, _VALUE_ROLE) is None or item.data(0, _OWNERSHIP_ROLE):
@@ -1248,6 +1250,14 @@ class EnsPanel(QWidget):
         self._subnode_manageable = set(names)
         self._update_action_bar()
 
+    def set_subnode_removable(self, names: set[str]) -> None:
+        """Subdomains (lower-case) the user can DELETE — either owning the parent
+        (a parent-side ``setSubnodeRecord``) or managing the unwrapped subnode
+        itself (a self ``setRecord``). Gates the "Remove subdomain" button/menu/
+        DEL. A superset of ``_subnode_manageable`` (which is parent-owned only)."""
+        self._subnode_removable = set(names)
+        self._update_action_bar()
+
     def _write_menu_groups(self, n: EnsName) -> list[list[tuple[str, str]]]:
         """The write actions available for ``n`` as ``(label, kind)`` pairs,
         split into the groups the menu separates. Registration-level actions
@@ -1279,9 +1289,9 @@ class EnsPanel(QWidget):
                 ("Add / change record", "record"),
             ])
             groups.append([("Add subdomain", "subdomain")])
-        # Deleting a subdomain (you own its parent) is destructive → its own
-        # trailing group, separated from everything above.
-        if n.is_subdomain and nl in self._subnode_manageable:
+        # Deleting a subdomain (you own its parent, or manage the subnode
+        # itself) is destructive → its own trailing group, separated from above.
+        if n.is_subdomain and nl in self._subnode_removable:
             groups.append([("Remove subdomain", "remove")])
         return groups
 
@@ -2033,6 +2043,7 @@ class EnsPlugin(Plugin):
                 self._panel.set_transferable(set())
                 self._panel.set_reclaimable(set())
                 self._panel.set_subnode_manageable(set())
+                self._panel.set_subnode_removable(set())
         self._loaded_for = address
         if not address:
             self._panel.populate([], int(time.time()))
@@ -2217,6 +2228,15 @@ class EnsPlugin(Plugin):
             and nl not in self._wrapped
         }
         subnode_mgr = self._subnode_manageable
+        # Deletable subdomains: own the parent (a clean parent-side
+        # setSubnodeRecord delete) OR manage the unwrapped subnode itself (a
+        # self setRecord relinquish). The self case means "if you can edit its
+        # records, you can remove it" even without owning the parent name.
+        subnode_removable = set(subnode_mgr) | {
+            nl for nl, n in self._names_by_l.items()
+            if n.is_subdomain and nl in self._controller
+            and nl not in self._wrapped
+        }
         if self._panel is not None:
             self._panel.set_writable(self._controller if can_sign else set())
             self._panel.set_transferable(
@@ -2225,6 +2245,8 @@ class EnsPlugin(Plugin):
                 (self._registrant - self._wrapped) if can_sign else set())
             self._panel.set_subnode_manageable(
                 subnode_mgr if can_sign else set())
+            self._panel.set_subnode_removable(
+                subnode_removable if can_sign else set())
 
     # --- records (lazy) ---------------------------------------------------
 
@@ -2372,13 +2394,24 @@ class EnsPlugin(Plugin):
         self._open_composer(name, self._remove_record_op(name, res, label, value))
 
     def _remove_subdomain(self, name: str) -> None:
-        """Delete a subdomain whose parent this account owns (unwrapped), via
-        registry.setSubnodeRecord(parent, label, 0, 0, 0)."""
-        if self._panel is None or name.lower() not in self._subnode_manageable:
+        """Delete a subdomain (unwrapped). Two authorised paths:
+          • own the PARENT → registry.setSubnodeRecord(parent, label, 0,0,0)
+            (the authoritative parent-side delete);
+          • manage the SUBNODE itself → registry.setRecord(node, 0,0,0)
+            (relinquish it — so a subdomain's own manager can remove it even
+            without owning the parent name).
+        Same end state either way; the caller the chain authorises differs."""
+        if self._panel is None:
+            return
+        nl = name.lower()
+        if nl in self._subnode_manageable:
+            op = self._remove_subnode_op(name)
+        elif nl in self._controller and nl not in self._wrapped:
+            op = self._relinquish_subnode_op(name)
+        else:
             return
         self._open_composer(
-            name, self._remove_subnode_op(name),
-            after_confirm=lambda: self._purge_name_from_caches(name))
+            name, op, after_confirm=lambda: self._purge_name_from_caches(name))
 
     # --- per-kind editors --------------------------------------------------
 
@@ -2827,6 +2860,36 @@ class EnsPlugin(Plugin):
             rediscover=True,
             note=f"This deletes {name}. As the owner of {parent} you can remove "
                  "the subdomain — clearing its owner, resolver and records.",
+            confirm_icon_names=("edit-delete", "user-trash", "list-remove"),
+            confirm_fallback=QStyle.StandardPixmap.SP_TrashIcon)
+
+    def _relinquish_subnode_op(self, name: str) -> _EnsOp:
+        """Give up a subdomain you MANAGE (but whose parent you don't own), via
+        registry.setRecord(node, 0, 0, 0) — the same owner/resolver/ttl clear as
+        the parent-side delete, authorised against the subnode itself."""
+        from .. import ens_write
+        parent = name.split(".", 1)[1]
+
+        def build(_nm: str, _fields: Any) -> tuple[str, str]:
+            return ens_write.relinquish_subnode(name)
+
+        def decoded(_nm: str, _fields: Any) -> dict:
+            return {"function": "setRecord", "args": [
+                {"name": "node", "type": "bytes32", "value": name},
+                {"name": "owner", "type": "address",
+                 "value": ens_write.ZERO_ADDRESS},
+                {"name": "resolver", "type": "address",
+                 "value": ens_write.ZERO_ADDRESS},
+                {"name": "ttl", "type": "uint64", "value": "0"}]}
+
+        return _EnsOp(
+            title=f"Remove subdomain · {name}",
+            confirm_label="Remove subdomain",
+            make_fields=lambda _composer: None, build=build, decoded=decoded,
+            rediscover=True,
+            note=f"This gives up {name} — clearing its owner, resolver and "
+                 f"records. You manage this subdomain; {parent}'s owner could "
+                 "recreate it later.",
             confirm_icon_names=("edit-delete", "user-trash", "list-remove"),
             confirm_fallback=QStyle.StandardPixmap.SP_TrashIcon)
 

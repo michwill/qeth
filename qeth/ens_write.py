@@ -35,6 +35,9 @@ _SEL_SUBNODE_RECORD = bytes.fromhex("5ef2c7f0")
 # registry.setSubnodeOwner(bytes32,bytes32,address) — reassign a subnode's owner
 # (manager) without touching its resolver/records.
 _SEL_SUBNODE_OWNER = bytes.fromhex("06ab5923")
+# registry.setRecord(bytes32,address,address,uint64) — set a node's own owner,
+# resolver and ttl in one call (used zeroed to relinquish a subnode you manage).
+_SEL_SET_RECORD = bytes.fromhex("cf408823")
 # NameWrapper.setSubnodeRecord(bytes32,string,address,address,uint64,uint32,uint64)
 _SEL_WRAPPED_SUBNODE = bytes.fromhex("24c1af44")
 _SEL_RENEW = bytes.fromhex("acf1a841")             # controller.renew(string,uint256)
@@ -250,6 +253,25 @@ def remove_subnode(parent_name: str, label: str) -> Tx:
                 [namehash(parent_name), _labelhash(label),
                  ZERO_ADDRESS, ZERO_ADDRESS, 0])
     return _tx(ENS_REGISTRY, _SEL_SUBNODE_RECORD, body)
+
+
+def relinquish_subnode(name: str) -> Tx:
+    """Delete an *unwrapped* subdomain you MANAGE (are the registry controller
+    of) — clear its own owner, resolver and TTL via
+    ``registry.setRecord(node, 0, 0, 0)``.
+
+    Reaches the SAME registry state as ``remove_subnode`` (owner = resolver =
+    ttl = 0 → the node stops existing), but authorised against the SUBDOMAIN
+    itself rather than its parent — so a subdomain's manager can give it up even
+    when the parent name belongs to someone else. (``setSubnodeRecord`` on the
+    parent and ``setRecord`` on the child compute the same node and write the
+    same slots; only the authorised caller differs.) The parent's owner can
+    recreate the subnode afterwards — inherent to subdomains. Wrapped names are
+    held by the NameWrapper, not the caller, so this is unwrapped-only (mirrors
+    ``remove_subnode``)."""
+    body = _abi(["bytes32", "address", "address", "uint64"],
+                [namehash(name), ZERO_ADDRESS, ZERO_ADDRESS, 0])
+    return _tx(ENS_REGISTRY, _SEL_SET_RECORD, body)
 
 
 def eth_addr_bytes(address: str) -> bytes:

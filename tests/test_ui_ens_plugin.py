@@ -710,12 +710,14 @@ class TestEnsPanel:
     # --- removal (records + subdomains) -----------------------------------
 
     def _subnode_panel(self, qtbot, *, manageable=("ops.swiss.eth",),
-                       writable=()):
+                       removable=None, writable=()):
         panel = EnsPanel()
         qtbot.addWidget(panel)
         panel.populate(build_tree(
             [EnsName("swiss.eth"), EnsName("ops.swiss.eth")]), NOW)
         panel.set_subnode_manageable(set(manageable))
+        panel.set_subnode_removable(
+            set(manageable) if removable is None else set(removable))
         panel.set_writable(set(writable))
         sub = panel._items_by_name["ops.swiss.eth"]
         return panel, sub
@@ -741,6 +743,18 @@ class TestEnsPanel:
         panel, sub = self._subnode_panel(qtbot, manageable=())
         panel.tree.setCurrentItem(sub)
         assert not panel._b_remove.isEnabled()
+
+    def test_remove_button_enabled_on_self_managed_subnode(self, qtbot):
+        # A subdomain you MANAGE but don't own the parent of (removable via the
+        # self-relinquish path) still enables Remove.
+        panel, sub = self._subnode_panel(
+            qtbot, manageable=(), removable={"ops.swiss.eth"})
+        panel.tree.setCurrentItem(sub)
+        assert panel._b_remove.isEnabled()
+        seen: list = []
+        panel.write_requested.connect(lambda nm, k: seen.append((nm, k)))
+        panel._b_remove.click()
+        assert seen == [("ops.swiss.eth", "remove")]
 
     def test_remove_record_button_emits(self, qtbot):
         panel, root = self._bar_panel(qtbot, writable={"crv.eth"})
@@ -1028,6 +1042,7 @@ class TestEnsPanel:
         panel = EnsPanel()
         qtbot.addWidget(panel)
         panel.set_subnode_manageable({"ops.parent.eth"})
+        panel.set_subnode_removable({"ops.parent.eth"})
         assert self._menu_kinds(panel, "ops.parent.eth") == ["manager", "remove"]
         assert self._menu_kinds(panel, "nope.parent.eth") == []   # not ours
 
@@ -1685,11 +1700,74 @@ class TestEnsWriteActions:
              ens_write.ZERO_ADDRESS, ens_write.ZERO_ADDRESS, 0]).hex()
 
     def test_remove_subdomain_gated_on_ownership(self, qtbot):
+        # Neither the parent-owner nor the subnode-manager → no removal at all.
         plugin, host, store = self._plugin(qtbot, owned=("swiss.eth",))
         plugin._render([EnsName("swiss.eth"), EnsName("ops.swiss.eth")])
         plugin._subnode_manageable = set()               # we don't own the parent
+        plugin._controller = set()                       # nor manage the subnode
         plugin._remove_subdomain("ops.swiss.eth")
         assert host.ens_ops == []
+
+    def test_remove_subdomain_self_managed_uses_setrecord(self, qtbot):
+        # Manage the subnode but DON'T own the parent → the self-relinquish
+        # setRecord(node, 0, 0, 0), not the parent-side setSubnodeRecord.
+        from eth_abi import encode as abi_encode
+        from qeth.ens_app import ENS_REGISTRY, namehash
+        from qeth import ens_write
+        plugin, host, store = self._plugin(qtbot, owned=("ops.swiss.eth",))
+        plugin._render([EnsName("swiss.eth"), EnsName("ops.swiss.eth")])
+        plugin._controller = {"ops.swiss.eth"}
+        plugin._subnode_manageable = set()
+        plugin._remove_subdomain("ops.swiss.eth")
+        assert len(host.ens_ops) == 1
+        _name, op, *_rest = host.ens_ops[0]
+        dlg = self._composer(op, "ops.swiss.eth")
+        qtbot.addWidget(dlg)
+        assert dlg._fields is None
+        req = dlg._build_request()
+        assert req.to_addr.lower() == ENS_REGISTRY.lower()
+        assert req.data[2:10] == "cf408823"              # setRecord
+        assert req.data[10:] == abi_encode(
+            ["bytes32", "address", "address", "uint64"],
+            [namehash("ops.swiss.eth"),
+             ens_write.ZERO_ADDRESS, ens_write.ZERO_ADDRESS, 0]).hex()
+
+    def test_remove_subdomain_prefers_parent_delete(self, qtbot):
+        # Own the parent AND manage the subnode → the authoritative parent-side
+        # setSubnodeRecord, not the self setRecord.
+        plugin, host, store = self._plugin(qtbot, owned=("swiss.eth",))
+        plugin._render([EnsName("swiss.eth"), EnsName("ops.swiss.eth")])
+        plugin._subnode_manageable = {"ops.swiss.eth"}
+        plugin._controller = {"ops.swiss.eth", "swiss.eth"}
+        plugin._remove_subdomain("ops.swiss.eth")
+        _name, op, *_rest = host.ens_ops[0]
+        dlg = self._composer(op, "ops.swiss.eth")
+        qtbot.addWidget(dlg)
+        assert dlg._build_request().data[2:10] == "5ef2c7f0"   # setSubnodeRecord
+
+    def test_remove_subdomain_wrapped_self_managed_not_offered(self, qtbot):
+        # A wrapped subnode is held by the NameWrapper, not the caller, so the
+        # registry self-relinquish can't apply → no removal.
+        plugin, host, store = self._plugin(qtbot, owned=("ops.swiss.eth",))
+        plugin._render([EnsName("swiss.eth"), EnsName("ops.swiss.eth")])
+        plugin._controller = {"ops.swiss.eth"}
+        plugin._wrapped = {"ops.swiss.eth"}
+        plugin._subnode_manageable = set()
+        plugin._remove_subdomain("ops.swiss.eth")
+        assert host.ens_ops == []
+
+    def test_refresh_writable_marks_self_managed_subnode_removable(self, qtbot):
+        plugin, host, store = self._plugin(qtbot, owned=("ops.swiss.eth",))
+        plugin._render([EnsName("swiss.eth"), EnsName("ops.swiss.eth")])
+        plugin._controller = {"ops.swiss.eth"}           # manage subnode, not parent
+        plugin._refresh_writable(ADDR)
+        panel = plugin.widget()
+        assert "ops.swiss.eth" in panel._subnode_removable      # deletable
+        assert "ops.swiss.eth" not in panel._subnode_manageable  # not parent-owned
+        # a wrapped one it manages is NOT removable (NameWrapper holds it)
+        plugin._wrapped = {"ops.swiss.eth"}
+        plugin._refresh_writable(ADDR)
+        assert "ops.swiss.eth" not in plugin.widget()._subnode_removable
 
     def test_remove_subdomain_confirm_purges_caches_and_rediscovers(
             self, qtbot, tmp_path):
