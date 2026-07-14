@@ -1605,6 +1605,84 @@ class TestEnsWriteActions:
         on_confirmed({"status": "0x1"})
         assert refreshed == [True]
 
+    def test_subnode_op_records_created_name(self, qtbot):
+        plugin, host, store = self._plugin(qtbot)
+        created: dict = {}
+        op = plugin._subnode_op("vitalik.eth", ADDR, created)
+        dlg = self._composer(op, "vitalik.eth")
+        qtbot.addWidget(dlg)
+        dlg._fields.label.setText("blog")
+        dlg._fields.owner.setText(self.OTHER)
+        op.build("vitalik.eth", dlg._fields)
+        assert created["name"] == "blog.vitalik.eth"
+        assert created["owner"].lower() == self.OTHER.lower()
+
+    def test_add_subdomain_confirm_injects_new_subnode(self, qtbot, tmp_path):
+        # A just-added subnode shows on confirmation — nested under its parent —
+        # WITHOUT waiting on the indexer to return it.
+        from qeth.ens_app import EnsCache
+        from qeth.plugins.ens import ENS_CHAIN_ID
+        plugin, host, store = self._plugin(qtbot, owned=("vitalik.eth",))
+        plugin._cache = EnsCache(tmp_path)
+        plugin._loaded_for = ADDR
+        plugin._cache.save(ENS_CHAIN_ID, ADDR, [EnsName("vitalik.eth")])
+        plugin._on_refresh = lambda **k: None        # don't spawn a real rediscover
+        plugin._add_subdomain("vitalik.eth")
+        _name, op, _chain, _from, on_confirmed = host.ens_ops[0]
+        dlg = self._composer(op, "vitalik.eth")
+        qtbot.addWidget(dlg)
+        dlg._fields.label.setText("blog")
+        dlg._fields.owner.setText(ADDR)
+        dlg._build_request()                          # op.build → records `created`
+        on_confirmed({"status": "0x1"})
+        panel = plugin.widget()
+        assert "blog.vitalik.eth" in plugin._pending_adds
+        assert "blog.vitalik.eth" in panel._items_by_name          # shown now
+        sub = panel._items_by_name["blog.vitalik.eth"]
+        assert sub.parent() is panel._items_by_name["vitalik.eth"]  # nested
+
+    def test_pending_add_survives_lagging_rediscovery(self, qtbot):
+        # A rediscover whose result LACKS the just-added name still shows it.
+        plugin, host, store = self._plugin(qtbot)
+        plugin._verify = lambda *a, **k: None
+        plugin._pending_adds["blog.vitalik.eth"] = EnsName(
+            "blog.vitalik.eth", source="owned")
+        plugin._on_names_ready(ADDR, [EnsName("vitalik.eth")], epoch=plugin._epoch)
+        assert "blog.vitalik.eth" in plugin.widget()._items_by_name
+        assert "blog.vitalik.eth" in plugin._pending_adds          # still merging
+
+    def test_pending_add_self_drops_when_indexer_catches_up(self, qtbot):
+        plugin, host, store = self._plugin(qtbot)
+        plugin._verify = lambda *a, **k: None
+        plugin._pending_adds["blog.vitalik.eth"] = EnsName(
+            "blog.vitalik.eth", source="owned")
+        plugin._on_names_ready(                       # BENS now returns it
+            ADDR, [EnsName("vitalik.eth"), EnsName("blog.vitalik.eth")],
+            epoch=plugin._epoch)
+        assert "blog.vitalik.eth" not in plugin._pending_adds      # stops merging
+        assert "blog.vitalik.eth" in plugin.widget()._items_by_name
+
+    def test_pending_add_is_cached_for_reload(self, qtbot, tmp_path):
+        from qeth.ens_app import EnsCache
+        from qeth.plugins.ens import ENS_CHAIN_ID
+        plugin, host, store = self._plugin(qtbot)
+        plugin._cache = EnsCache(tmp_path)
+        plugin._verify = lambda *a, **k: None
+        plugin._pending_adds["blog.vitalik.eth"] = EnsName(
+            "blog.vitalik.eth", source="owned")
+        plugin._on_names_ready(ADDR, [EnsName("vitalik.eth")], epoch=plugin._epoch)
+        cached = {n.name for n in (plugin._cache.load(ENS_CHAIN_ID, ADDR) or [])}
+        assert "blog.vitalik.eth" in cached          # persisted before BENS catches up
+
+    def test_re_added_then_removed_name_not_re_injected(self, qtbot):
+        # Delete a name that was pending-added → it must not resurface.
+        plugin, host, store = self._plugin(qtbot)
+        plugin._pending_adds["blog.vitalik.eth"] = EnsName(
+            "blog.vitalik.eth", source="owned")
+        plugin._mark_removed("blog.vitalik.eth")
+        assert "blog.vitalik.eth" not in plugin._pending_adds
+        assert "blog.vitalik.eth" in plugin._denied
+
     # --- removal (records + subdomains) -----------------------------------
 
     def test_remove_record_clears_eth_address(self, qtbot):

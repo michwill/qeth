@@ -1958,6 +1958,11 @@ class EnsPlugin(Plugin):
         # drop and keep filtered out of re-renders this session. Reset per
         # account; never persisted (a stale denial must never hide a real name).
         self._denied: set[str] = set()
+        # Names we just CREATED (add-subdomain) that the indexer hasn't returned
+        # yet — merged into every render so a new subnode shows on confirmation
+        # instead of waiting on BENS to index it. Self-drops once discovery
+        # returns the name; reset per account. The additive twin of ``_denied``.
+        self._pending_adds: dict[str, EnsName] = {}
         # Write state: the EnsName + on-chain ownership facts per name, so the
         # write actions know the resolver, wrapped flag, and parent expiry.
         self._names_by_l: dict[str, EnsName] = {}
@@ -2052,6 +2057,7 @@ class EnsPlugin(Plugin):
             return
         if address != self._loaded_for:
             self._denied.clear()              # denials are per-account
+            self._pending_adds.clear()        # ...as are pending adds
             self._owned.clear()
             self._wrapped.clear()
             self._registrant.clear()
@@ -2111,13 +2117,20 @@ class EnsPlugin(Plugin):
         host = self.host
         if host is None or host.selected_address != address:
             return                                  # view moved on
-        # Cache only the account's OWN discovered names (the cross-account
-        # surfacing below is derived, not this account's), and never re-cache a
-        # name we've denied this session (a just-deleted subdomain a lagging
-        # indexer still returns) — else it would flash back on the next reload.
-        self._cache.save(ENS_CHAIN_ID, address,
-                         [n for n in names if n.name.lower() not in self._denied])
-        self._render(names)                          # augments + sets _names_by_l
+        # The indexer caught up to a pending add → stop force-merging it (it's
+        # now in the discovery result on its own).
+        bens_have = {n.name.lower() for n in names}
+        for nl in list(self._pending_adds):
+            if nl in bens_have:
+                del self._pending_adds[nl]
+        self._render(names)                          # merges pending, sets _names_by_l
+        # Cache the account's OWN names — the discovery result plus any still-
+        # pending local adds (so a new subnode survives a reload before the
+        # indexer catches up), never a denied name or a derived cross-account
+        # subnode (source "subnode").
+        own = [n for n in self._names_by_l.values()
+               if n.source != "subnode" and n.name.lower() not in self._denied]
+        self._cache.save(ENS_CHAIN_ID, address, own)
         self._verify(address, list(self._names_by_l))  # verify the surfaced set too
 
     def _with_cross_account_subdomains(
@@ -2154,6 +2167,12 @@ class EnsPlugin(Plugin):
         names = [n for n in names
                  if n.source in ("custom", "subnode")
                  or n.name.lower() not in self._denied]
+        # Merge names we just created that the indexer hasn't returned yet, so a
+        # freshly-added subnode shows now instead of after BENS catches up.
+        have = {n.name.lower() for n in names}
+        for nl, pending in self._pending_adds.items():
+            if nl not in have and nl not in self._denied:
+                names.append(pending)
         names = self._with_cross_account_subdomains(names)
         self._names_by_l = {n.name.lower(): n for n in names}
         self._panel.populate(build_tree(names), int(time.time()))
@@ -2518,8 +2537,10 @@ class EnsPlugin(Plugin):
             return
         host = self.host
         self_addr = host.selected_address if host is not None else ""
+        created: dict[str, str] = {}
+        op = self._subnode_op(name, _checksum(self_addr or "") or "", created)
         self._open_composer(
-            name, self._subnode_op(name, _checksum(self_addr or "") or ""))
+            name, op, after_confirm=lambda: self._mark_added(created))
 
     # --- renewal -----------------------------------------------------------
 
@@ -2632,7 +2653,8 @@ class EnsPlugin(Plugin):
             title=f"{confirm_label} · {name}", confirm_label=confirm_label,
             make_fields=make_fields, build=build, decoded=decoded)
 
-    def _subnode_op(self, name: str, self_addr: str) -> _EnsOp:
+    def _subnode_op(self, name: str, self_addr: str,
+                    created: dict[str, str] | None = None) -> _EnsOp:
         from .. import ens_write
         wrapped = name.lower() in self._wrapped
 
@@ -2655,6 +2677,12 @@ class EnsPlugin(Plugin):
 
         def build(nm: str, fields: Any) -> tuple[str, str]:
             label, owner = _parse(fields)
+            # Record the name being created so the post-confirm hook can inject
+            # it (the indexer lags on new names). The final Confirm-time build
+            # wins (validation may build repeatedly while editing).
+            if created is not None:
+                created["name"] = f"{label}.{nm}"
+                created["owner"] = owner
             return ens_write.add_subnode(nm, label, owner, wrapped=wrapped)
 
         def decoded(nm: str, fields: Any) -> dict:
@@ -3070,9 +3098,29 @@ class EnsPlugin(Plugin):
         a re-owned name from ``_denied``)."""
         nl = name.lower()
         self._denied.add(nl)
+        self._pending_adds.pop(nl, None)         # a re-created-then-deleted name
         self._purge_name_from_caches(name)
         if self._panel is not None:
             self._panel.drop_name(nl)
+
+    def _mark_added(self, created: dict[str, str]) -> None:
+        """A subdomain ADD just confirmed. BENS lags on brand-new names, and the
+        verify pass only re-checks names already in the tree — so a plain
+        rediscover wouldn't surface it. We KNOW the name we created, so inject it
+        now (source "owned"): un-deny it, add it to the pending-adds merged into
+        every render, and re-render immediately. The rediscover that follows
+        verifies it (earns the ✓); once discovery returns it, it self-drops from
+        pending. The additive counterpart of ``_mark_removed``."""
+        name = created.get("name")
+        if not name or self._panel is None:
+            return
+        nl = name.lower()
+        self._denied.discard(nl)
+        self._pending_adds[nl] = EnsName(
+            name, owner=created.get("owner"), source="owned")
+        # Re-render from the account's cache (holds the parent, so build_tree
+        # nests the new subnode under it) + the pending merge.
+        self._render(self._cache.load(ENS_CHAIN_ID, self._loaded_for or "") or [])
 
     def _purge_name_from_caches(self, name: str) -> None:
         """Drop a just-deleted subdomain from EVERY account's disk cache, so the
