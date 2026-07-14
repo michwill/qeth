@@ -166,7 +166,7 @@ class TestBeginSignWiring:
         signer = SimpleNamespace(can_sign=lambda a: True)
         monkeypatch.setattr(
             mainwindow, "_pick_signer_for",
-            lambda dlg, addr, it: (signer, "Signing…"))
+            lambda dlg, addr, it, path=None: (signer, "Signing…"))
         started = []
         monkeypatch.setattr(mainwindow, "start_worker", started.append)
         sip = []
