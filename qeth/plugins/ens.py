@@ -391,7 +391,7 @@ class EnsVerifyWorker(QThread):
     Helios to agree with the fresh read before emitting, so a lagging proof
     can't overwrite the change the user just made."""
 
-    ready = Signal(str, object, bool)        # (address, states, verified)
+    ready = Signal(str, object, bool, object)  # (address, states, verified, block)
 
     # Generation the worker was spawned in (set by EnsPlugin._verify); the
     # landing slot drops a result from a superseded generation.
@@ -409,7 +409,7 @@ class EnsVerifyWorker(QThread):
     def run(self) -> None:
         fast, fast_block = read_name_states(self._chain, self._names)
         if fast:
-            self.ready.emit(self._address, fast, False)
+            self.ready.emit(self._address, fast, False, fast_block)
         tries = _VERIFY_CATCHUP_TRIES if self._catchup else 1
         for attempt in range(tries):
             states, verified, vblock = verify_names(
@@ -436,7 +436,7 @@ class EnsVerifyWorker(QThread):
                 caught_up = (fast_block is None or vblock is None
                              or vblock >= fast_block)
             if caught_up:
-                self.ready.emit(self._address, states, True)
+                self.ready.emit(self._address, states, True, vblock)
                 return
             if attempt < tries - 1:
                 self.msleep(int(_VERIFY_CATCHUP_DELAY_S * 1000))
@@ -508,6 +508,12 @@ class EnsPanel(QWidget):
         self._reclaimable: set[str] = set()    # owner can reclaim manager (unwrapped)
         self._subnode_manageable: set[str] = set()  # subdomains you own the parent of
         self._subnode_removable: set[str] = set()   # subdomains you can delete
+        # name_lower → the block its shown ownership/presence is known-as-of. A
+        # write stamps the tx's block; each read carries its own — and a read
+        # only wins when its block is ≥ what's shown (highest block wins), so a
+        # lagging/failed async read can never regress a just-confirmed change.
+        # Not cleared on re-render (the ordering must survive tree rebuilds).
+        self._ownership_block: dict[str, int] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.tree = _EnsTree()
@@ -1076,13 +1082,16 @@ class EnsPanel(QWidget):
         item.setExpanded(was_expanded)   # mutating children can't toggle the fold
 
     def apply_role(self, name: str, *, controller: str | None = None,
-                   registrant: str | None = None) -> None:
+                   registrant: str | None = None,
+                   block: int | None = None) -> None:
         """Optimistically set a name's manager (controller) / owner (registrant)
         row from a just-confirmed ownership write (set-manager, transfer),
-        without waiting on the verify pass. Unverified (no ✓) until the proof
-        lands and re-earns it."""
+        stamped with the tx's block so a lagging verify can't regress it.
+        Unverified (no ✓) until the proof lands and re-earns it."""
         import dataclasses
         nl = name.lower()
+        if not self._accept_block(nl, block):
+            return                                   # a newer read already won
         st = self._ownership.get(nl) or OwnershipCheck(owner_known=True)
         self._ownership[nl] = dataclasses.replace(
             st, owner_known=True,
@@ -1093,12 +1102,17 @@ class EnsPanel(QWidget):
         if item is not None:
             self._render_ownership_rows(item, nl)
 
-    def update_resolved(self, name: str, address: str | None) -> None:
+    def update_resolved(self, name: str, address: str | None, *,
+                        block: int | None = None) -> None:
         """Update a name row's 'Resolves to' column from a fresh head read of its
         ETH address record — so a setAddr change shows on the (possibly
         collapsed) name row, not just in the expanded records. ``None`` clears
-        it. Keeps the stored EnsName in sync for copy / sort / mismatch checks."""
-        item = self._items_by_name.get(name.lower())
+        it. Block-ordered: a read older than a just-confirmed setAddr is
+        rejected. Keeps the stored EnsName in sync for copy / sort / mismatch."""
+        nl = name.lower()
+        if not self._accept_block(nl, block):
+            return
+        item = self._items_by_name.get(nl)
         if item is None:
             return
         n = item.data(0, _NAME_ROLE)
@@ -1107,11 +1121,16 @@ class EnsPanel(QWidget):
         item.setText(2, address or "")
         item.setToolTip(2, _RESOLVED_TIP if address else "")
 
-    def update_expiry(self, name: str, expiry_ts: int | None) -> None:
+    def update_expiry(self, name: str, expiry_ts: int | None, *,
+                      block: int | None = None) -> None:
         """Set a name row's Expires column from the authoritative on-chain
-        nameExpires (verify pass) — re-styling the status chip (active /
-        expiring / grace / expired) like _build does."""
-        item = self._items_by_name.get(name.lower())
+        nameExpires (verify pass) or a just-confirmed renew — re-styling the
+        status chip (active / expiring / grace / expired) like _build does.
+        Block-ordered so a lagging read can't undo a fresh renewal."""
+        nl = name.lower()
+        if not self._accept_block(nl, block):
+            return
+        item = self._items_by_name.get(nl)
         if item is None or not expiry_ts:
             return
         n = item.data(0, _NAME_ROLE)
@@ -1124,8 +1143,34 @@ class EnsPanel(QWidget):
         item.setForeground(_EXPIRES_COL,
                            QBrush(colour) if colour is not None else QBrush())
 
+    def is_fresh_block(self, name_l: str, block: int | None) -> bool:
+        """Read-only twin of ``_accept_block``: is ``block`` ≥ the name's shown
+        block, WITHOUT recording it? Lets the plugin gate its role-set updates on
+        the same rule the panel uses, before ``mark_verified`` stamps."""
+        b = int(block) if block is not None else 0
+        return b >= self._ownership_block.get(name_l, 0)
+
+    def stamp_block(self, name: str, block: int | None) -> None:
+        """Record a name's known-as-of block from a confirmed write (its tx's
+        block), so a later async read at an older block is rejected. Only ever
+        raises the stamp (highest block wins)."""
+        self._accept_block(name.lower(), block)
+
+    def _accept_block(self, name_l: str, block: int | None) -> bool:
+        """The one ordering rule for a name row's on-chain state: accept an
+        update iff its block is ≥ the block already shown (highest block wins),
+        recording the new block. A write stamps its tx's block; each async read
+        carries its own — so a lagging or failed read (older/ unknown block → 0)
+        can never regress a just-confirmed change. Returns False to reject."""
+        b = int(block) if block is not None else 0
+        if b < self._ownership_block.get(name_l, 0):
+            return False
+        self._ownership_block[name_l] = b
+        return True
+
     def mark_verified(self, states: dict[str, OwnershipCheck],
-                      address: str, *, verified: bool = True) -> list[str]:
+                      address: str, *, verified: bool = True,
+                      block: int | None = None) -> list[str]:
         """Apply an ownership read to the rows and return the names DROPPED.
 
         Two callers: the fast UNVERIFIED read (``verified=False``) freshens the
@@ -1143,6 +1188,8 @@ class EnsPanel(QWidget):
             item = self._items_by_name.get(name_l)
             if item is None:
                 continue
+            if not self._accept_block(name_l, block):
+                continue          # a read older than a shown change — reject it
             n = item.data(0, _NAME_ROLE)
             src = n.source if isinstance(n, EnsName) else ""
             if st.disowned_by(address):
@@ -1165,9 +1212,10 @@ class EnsPanel(QWidget):
                     removed.append(name_l)
                     continue
             # Authoritative on-chain expiry (nameExpires) → correct the Expires
-            # column over BENS's grace-inclusive hint.
+            # column over BENS's grace-inclusive hint. (Same block as the row —
+            # already accepted above — so this re-check always passes.)
             if st.expiry:
-                self.update_expiry(name_l, st.expiry)
+                self.update_expiry(name_l, st.expiry, block=block)
             # Show the on-chain roles (manager / owner) for every kept name —
             # owned or merely watched — once the read definitively landed.
             if st.owner_known:
@@ -1393,6 +1441,22 @@ def _checksum(text: str) -> str | None:
 def _fmt_expiry(ts: int) -> str:
     from datetime import datetime
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def _receipt_block(receipt: object) -> int | None:
+    """The block a confirmed tx mined in, from its receipt — the authoritative
+    'as-of' block for the change it made. ``None`` when unavailable (then the
+    optimistic update stamps 0, still ahead of no prior stamp). Handles both an
+    int ``blockNumber`` (web3) and a ``0x`` hex string."""
+    if receipt is None or not hasattr(receipt, "get"):
+        return None
+    bn = receipt.get("blockNumber")
+    if bn is None:
+        return None
+    try:
+        return int(bn, 16) if isinstance(bn, str) else int(bn)
+    except (TypeError, ValueError):
+        return None
 
 
 def _qdate_from_ts(ts: int) -> QDate:
@@ -2215,7 +2279,8 @@ class EnsPlugin(Plugin):
         self._start(worker)
 
     def _on_verified(self, address: str, states: dict[str, OwnershipCheck],
-                     verified: bool, *, epoch: int | None = None) -> None:
+                     verified: bool, block: int | None = None,
+                     *, epoch: int | None = None) -> None:
         # Two passes land here: the fast unverified read (verified=False) for an
         # immediate owner/manager/role-gate update, then the Helios-proven read
         # (verified=True) that earns the ✓ and decides drops. Both carry fresh
@@ -2233,6 +2298,12 @@ class EnsPlugin(Plugin):
         if host is not None and host.selected_address != address:
             return                                  # view moved on
         for name_l, st in states.items():
+            # Highest-block-wins: a read older than a just-confirmed write for
+            # this name mustn't regress its role gates either (the panel applies
+            # the same rule to the row in mark_verified). Read-only here; the
+            # stamp is set by mark_verified below.
+            if not self._panel.is_fresh_block(name_l, block):
+                continue
             if st.resolver:
                 self._resolver_cache[name_l] = st.resolver
             if st.owned_by(address):
@@ -2264,7 +2335,8 @@ class EnsPlugin(Plugin):
             else:
                 self._controller.discard(name_l)
         self._denied.update(
-            self._panel.mark_verified(states, address, verified=verified))
+            self._panel.mark_verified(states, address, verified=verified,
+                                      block=block))
         self._refresh_writable(address)
 
     def _can_sign(self, address: str) -> bool:
@@ -2403,7 +2475,7 @@ class EnsPlugin(Plugin):
             # present one (an absent addr may just be served offchain).
             head_addr = rec.addresses.get("60")
             if head_addr or forced:
-                self._panel.update_resolved(name, head_addr)
+                self._panel.update_resolved(name, head_addr, block=b)
 
     # --- add custom -------------------------------------------------------
 
@@ -2468,7 +2540,7 @@ class EnsPlugin(Plugin):
             return
         self._open_composer(
             name, self._remove_record_op(name, res, label, value),
-            after_confirm=lambda: self._apply_record_removal(name, label))
+            after_confirm=lambda b: self._apply_record_removal(name, label, b))
 
     def _remove_subdomain(self, name: str) -> None:
         """Delete a subdomain. Three authorised paths, by how the name is held:
@@ -2495,7 +2567,7 @@ class EnsPlugin(Plugin):
         else:
             return
         self._open_composer(
-            name, op, after_confirm=lambda: self._mark_removed(name))
+            name, op, after_confirm=lambda b: self._mark_removed(name, b))
 
     # --- per-kind editors --------------------------------------------------
 
@@ -2504,25 +2576,28 @@ class EnsPlugin(Plugin):
         return c[0] if c is not None else None
 
     def _push_records(self, name: str, new_rec: EnsRecords, *,
+                      block: int | None = None,
                       set_resolved: bool = False,
                       resolved: str | None = None) -> None:
         """Show a record change NOW (unverified), off the value we just wrote —
-        no wait on the async re-read. Keeps the anchor's block so that re-read
-        (a newer block) still supersedes and earns the ✓; a lone async refresh
-        can be lost to timing or a concurrent tree rebuild, which is why the
-        change wasn't appearing on confirm."""
+        no wait on the async re-read. Stamps the ``_rec_cache`` anchor with the
+        tx's block, so the async re-read (at that block or newer) supersedes and
+        earns the ✓, while a lagging-node read at an older block is rejected."""
         nl = name.lower()
         prev = self._rec_cache.get(nl)
-        block = prev[1] if prev is not None else 0
-        self._rec_cache[nl] = (new_rec, block, False)
+        prev_block = prev[1] if prev is not None else 0
+        b = max(int(block) if block is not None else 0, prev_block)
+        self._rec_cache[nl] = (new_rec, b, False)
         if self._panel is not None:
             self._panel.add_records(name, new_rec, verified=False)
             if set_resolved:
-                self._panel.update_resolved(name, resolved)
+                self._panel.update_resolved(name, resolved, block=block)
 
-    def _apply_record_change(self, name: str, changed: dict[str, str]) -> None:
+    def _apply_record_change(self, name: str, changed: dict[str, str],
+                             block: int | None = None) -> None:
         """Merge a just-confirmed record write into the shown records + Resolves-
-        to column at once (``changed`` = the confirmed kind/key-or-coin/value)."""
+        to column at once (``changed`` = the confirmed kind/key-or-coin/value),
+        stamped with the tx's block."""
         if self._panel is None or not changed:
             return
         from .. import ens_write
@@ -2561,9 +2636,10 @@ class EnsPlugin(Plugin):
         self._push_records(
             name, EnsRecords(addresses=addresses, texts=texts,
                              contenthash=contenthash),
-            set_resolved=set_resolved, resolved=resolved)
+            block=block, set_resolved=set_resolved, resolved=resolved)
 
-    def _apply_record_removal(self, name: str, label: str) -> None:
+    def _apply_record_removal(self, name: str, label: str,
+                              block: int | None = None) -> None:
         """Drop a just-removed record from the shown records at once. ``label``
         is the tree row label (``address`` / ``address (COIN)`` / ``content`` /
         a text key), same forms ``_record_rows`` renders."""
@@ -2588,7 +2664,7 @@ class EnsPlugin(Plugin):
         self._push_records(
             name, EnsRecords(addresses=addresses, texts=texts,
                              contenthash=contenthash),
-            set_resolved=set_resolved, resolved=None)
+            block=block, set_resolved=set_resolved, resolved=None)
 
     def _open_record_composer(self, name: str, res: str, **op_kwargs) -> None:
         """Open a record-write composer that reflects its change in the tree the
@@ -2600,7 +2676,7 @@ class EnsPlugin(Plugin):
         op = self._record_op(name, res, changed=changed, **op_kwargs)
         self._open_composer(
             name, op,
-            after_confirm=lambda: self._apply_record_change(name, changed))
+            after_confirm=lambda b: self._apply_record_change(name, changed, b))
 
     def _write_addr(self, name: str, prefill: str = "") -> None:
         if self._panel is None:
@@ -2659,7 +2735,7 @@ class EnsPlugin(Plugin):
         created: dict[str, str] = {}
         op = self._subnode_op(name, _checksum(self_addr or "") or "", created)
         self._open_composer(
-            name, op, after_confirm=lambda: self._mark_added(created))
+            name, op, after_confirm=lambda b: self._mark_added(created, b))
 
     # --- renewal -----------------------------------------------------------
 
@@ -2677,12 +2753,13 @@ class EnsPlugin(Plugin):
         changed: dict[str, str] = {}
         op = self._renew_op(name, chain, changed)
         self._open_composer(
-            name, op, after_confirm=lambda: self._apply_renew(name, changed))
+            name, op, after_confirm=lambda b: self._apply_renew(name, changed, b))
 
-    def _apply_renew(self, name: str, changed: dict[str, str]) -> None:
+    def _apply_renew(self, name: str, changed: dict[str, str],
+                     block: int | None = None) -> None:
         ts = changed.get("expiry")
         if ts and self._panel is not None:
-            self._panel.update_expiry(name, int(ts))
+            self._panel.update_expiry(name, int(ts), block=block)
 
     # --- transfer ----------------------------------------------------------
 
@@ -2697,9 +2774,11 @@ class EnsPlugin(Plugin):
         changed: dict[str, str] = {}
         op = self._transfer_op(name, addr, changed)
         self._open_composer(
-            name, op, after_confirm=lambda: self._apply_transfer(name, changed))
+            name, op,
+            after_confirm=lambda b: self._apply_transfer(name, changed, b))
 
-    def _apply_transfer(self, name: str, changed: dict[str, str]) -> None:
+    def _apply_transfer(self, name: str, changed: dict[str, str],
+                        block: int | None = None) -> None:
         to = changed.get("to")
         if not to or self._panel is None:
             return
@@ -2707,7 +2786,8 @@ class EnsPlugin(Plugin):
         # the manager stays with you until the new owner reclaims it.
         wrapped = bool(changed.get("wrapped"))
         self._panel.apply_role(
-            name, registrant=to, controller=to if wrapped else None)
+            name, registrant=to, controller=to if wrapped else None,
+            block=block)
 
     # --- set manager (reclaim) --------------------------------------------
 
@@ -2726,17 +2806,20 @@ class EnsPlugin(Plugin):
             if nl in self._subnode_manageable:
                 self._open_composer(
                     name, self._set_subnode_manager_op(name, self_addr, changed),
-                    after_confirm=lambda: self._apply_set_manager(name, changed))
+                    after_confirm=lambda b:
+                        self._apply_set_manager(name, changed, b))
         elif _is_eth_2ld(name) and nl not in self._wrapped:
             # 2LD: the registrant reclaims via the BaseRegistrar.
             self._open_composer(
                 name, self._set_manager_op(name, self_addr, changed),
-                after_confirm=lambda: self._apply_set_manager(name, changed))
+                after_confirm=lambda b:
+                    self._apply_set_manager(name, changed, b))
 
-    def _apply_set_manager(self, name: str, changed: dict[str, str]) -> None:
+    def _apply_set_manager(self, name: str, changed: dict[str, str],
+                           block: int | None = None) -> None:
         mgr = changed.get("manager")
         if mgr and self._panel is not None:
-            self._panel.apply_role(name, controller=mgr)
+            self._panel.apply_role(name, controller=mgr, block=block)
 
     # --- op construction ---------------------------------------------------
 
@@ -3217,13 +3300,15 @@ class EnsPlugin(Plugin):
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(self._panel, "ENS", text)
 
-    def _open_composer(self, name: str, op: _EnsOp,
-                       *, after_confirm: Callable[[], None] | None = None) -> None:
+    def _open_composer(
+            self, name: str, op: _EnsOp, *,
+            after_confirm: Callable[[int | None], None] | None = None) -> None:
         """Open the rich ``_EnsWriteComposer`` for ``op`` via the host opener,
         wiring the post-confirm refresh (rediscover vs. force-reread records).
-        ``after_confirm`` runs first on confirmation (e.g. purge a deleted
-        subdomain from caches). Falls back to a no-op when the host can't host a
-        composer (mirrors the old ``request_transaction`` capability check)."""
+        ``after_confirm(block)`` runs first on confirmation with the tx's block —
+        the optimistic display update stamps that block, so a later async read at
+        an older block is rejected (the highest-block-wins rule). Falls back to a
+        no-op when the host can't host a composer."""
         host = self.host
         chain = self._mainnet()
         addr = host.selected_address if host is not None else None
@@ -3233,15 +3318,13 @@ class EnsPlugin(Plugin):
         from eth_utils import to_checksum_address
         nm = name
 
-        def _on_confirmed(_receipt: object) -> None:
-            # The write mined: refresh against CONFIRMED (chain-head) state right
-            # away. ``rediscover`` re-runs name discovery — a subdomain add (a
-            # new name) or a renewal (a new expiry) shows up there, not in the
-            # resolver records; a plain record write force-re-reads instead so
-            # the new value shows now, marked "confirmed" until finality earns
-            # it the ✓ (rather than waiting on finality to show it at all).
+        def _on_confirmed(receipt: object) -> None:
+            # The write mined: reflect it against the tx's block right away, then
+            # let the async read confirm/upgrade it. Stamping the tx block is what
+            # makes a lagging or failed async read unable to regress the change.
+            block = _receipt_block(receipt)
             if after_confirm is not None:
-                after_confirm()
+                after_confirm(block)
             if op.rediscover:
                 # catchup=True: a transfer/reclaim changed ownership, so wait
                 # for the verified head to reflect it before the proof overwrites
@@ -3253,7 +3336,7 @@ class EnsPlugin(Plugin):
         host.open_ens_composer(name, op, chain, to_checksum_address(addr),
                                on_confirmed=_on_confirmed)
 
-    def _mark_removed(self, name: str) -> None:
+    def _mark_removed(self, name: str, block: int | None = None) -> None:
         """A subdomain delete just CONFIRMED on-chain — remove it locally and
         keep it gone, rather than waiting on the verify pass to drop it. That
         pass can't: the fast read never drops (only the Helios-proven read does),
@@ -3262,32 +3345,41 @@ class EnsPlugin(Plugin):
         (the delete tx we built mined), so: deny the name (─→ filtered from every
         re-render + not re-cached), purge it from all account caches, and drop
         its row now. Self-heals if it's ever recreated (``_on_verified`` discards
-        a re-owned name from ``_denied``)."""
+        a re-owned name from ``_denied``). Stamps the tx block so a lagging read
+        can't re-show it."""
         nl = name.lower()
         self._denied.add(nl)
         self._pending_adds.pop(nl, None)         # a re-created-then-deleted name
         self._purge_name_from_caches(name)
         if self._panel is not None:
+            self._panel.stamp_block(name, block)
             self._panel.drop_name(nl)
 
-    def _mark_added(self, created: dict[str, str]) -> None:
+    def _mark_added(self, created: dict[str, str],
+                    block: int | None = None) -> None:
         """A subdomain ADD just confirmed. BENS lags on brand-new names, and the
         verify pass only re-checks names already in the tree — so a plain
         rediscover wouldn't surface it. We KNOW the name we created, so inject it
         now (source "owned"): un-deny it, add it to the pending-adds merged into
-        every render, and re-render immediately. The rediscover that follows
-        verifies it (earns the ✓); once discovery returns it, it self-drops from
-        pending. The additive counterpart of ``_mark_removed``."""
+        every render, re-render, AND show its manager row (we assigned the owner)
+        — all stamped with the tx block, so the follow-up verify at that block or
+        newer confirms it (earns the ✓) while a lagging read can't drop it. Once
+        discovery returns it, it self-drops from pending."""
         name = created.get("name")
         if not name or self._panel is None:
             return
         nl = name.lower()
+        owner = created.get("owner")
         self._denied.discard(nl)
-        self._pending_adds[nl] = EnsName(
-            name, owner=created.get("owner"), source="owned")
+        self._pending_adds[nl] = EnsName(name, owner=owner, source="owned")
         # Re-render from the account's cache (holds the parent, so build_tree
         # nests the new subnode under it) + the pending merge.
         self._render(self._cache.load(ENS_CHAIN_ID, self._loaded_for or "") or [])
+        # Show the manager row now (a subnode's controller is the owner we just
+        # set) + stamp the block, so it appears immediately and a lagging verify
+        # can't regress it.
+        if owner:
+            self._panel.apply_role(name, controller=owner, block=block)
 
     def _purge_name_from_caches(self, name: str) -> None:
         """Drop a just-deleted subdomain from EVERY account's disk cache, so the

@@ -1155,6 +1155,50 @@ class TestEnsPanel:
         assert root.text(2) == real                   # proven head value shown
         assert root.data(0, _NAME_ROLE).resolved_address == real
 
+    # --- block-ordering: highest block wins, stale reads rejected ---------
+
+    def test_stale_verify_rejected_by_block(self, qtbot):
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("alice.eth")]), NOW)
+        # a confirmed write stamped it owned-by-me at block 100 (+ manager row)
+        panel.apply_role("alice.eth", controller=me, block=100)
+        assert panel._ownership_block["alice.eth"] == 100
+        # a STALE verify (block 90) reading it disowned must be REJECTED
+        removed = panel.mark_verified(
+            {"alice.eth": OwnershipCheck(controller=None, owner_known=True)},
+            me, verified=True, block=90)
+        assert removed == []                          # not dropped
+        assert "alice.eth" in panel._items_by_name
+        item = panel._items_by_name["alice.eth"]
+        mgr = next((item.child(i) for i in range(item.childCount())
+                    if item.child(i).text(0) == "manager"), None)
+        assert mgr is not None                         # manager row survived
+
+    def test_fresh_verify_applies_over_stamp(self, qtbot):
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("alice.eth")]), NOW)
+        panel.apply_role("alice.eth", controller=me, block=100)
+        # a FRESH verify (block 110 ≥ 100) reading it disowned → applies (drops)
+        removed = panel.mark_verified(
+            {"alice.eth": OwnershipCheck(controller=None, owner_known=True)},
+            me, verified=True, block=110)
+        assert removed == ["alice.eth"]               # accepted, dropped
+
+    def test_block_ordering_is_backward_compatible_without_blocks(self, qtbot):
+        # No blocks anywhere (block=None→0) → everything applies as before.
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        me = "0x" + "11" * 20
+        panel.populate(build_tree([EnsName("alice.eth")]), NOW)
+        removed = panel.mark_verified(
+            {"alice.eth": OwnershipCheck(controller="0x" + "99" * 20,
+                                         owner_known=True)}, me)
+        assert removed == ["alice.eth"]               # unstamped → drops normally
+
 
 # --- EnsPlugin -------------------------------------------------------------
 
@@ -1640,6 +1684,37 @@ class TestEnsWriteActions:
         assert "blog.vitalik.eth" in panel._items_by_name          # shown now
         sub = panel._items_by_name["blog.vitalik.eth"]
         assert sub.parent() is panel._items_by_name["vitalik.eth"]  # nested
+        # ...and its manager row shows immediately (the owner we assigned)
+        from eth_utils import to_checksum_address
+        mgr = next((sub.child(i) for i in range(sub.childCount())
+                    if sub.child(i).text(0) == "manager"), None)
+        assert mgr is not None and mgr.text(2) == to_checksum_address(ADDR)
+
+    def test_receipt_block_parses_int_hex_and_missing(self):
+        from qeth.plugins.ens import _receipt_block
+        assert _receipt_block({"blockNumber": 100}) == 100
+        assert _receipt_block({"blockNumber": "0x64"}) == 100
+        assert _receipt_block({"status": "0x1"}) is None     # no blockNumber
+        assert _receipt_block(None) is None
+
+    def test_add_then_stale_verify_keeps_name_and_manager(self, qtbot, tmp_path):
+        # The reported cbbtc case: a just-added subnode must survive a LAGGING
+        # verify that reads it disowned (older block than the add tx).
+        from qeth.ens_app import EnsCache, OwnershipCheck
+        from qeth.plugins.ens import ENS_CHAIN_ID
+        plugin, host, store = self._plugin(qtbot, owned=("me.eth",))
+        plugin._cache = EnsCache(tmp_path)
+        plugin._loaded_for = ADDR
+        plugin._cache.save(ENS_CHAIN_ID, ADDR, [EnsName("me.eth")])
+        plugin._mark_added({"name": "sub.me.eth", "owner": ADDR}, 500)  # add @500
+        panel = plugin.widget()
+        assert panel._ownership_block["sub.me.eth"] == 500
+        # a lagging verify @ 450 reads it disowned → must NOT drop it
+        plugin._on_verified(
+            ADDR, {"sub.me.eth": OwnershipCheck(controller=None, owner_known=True)},
+            True, 450, epoch=plugin._epoch)
+        assert "sub.me.eth" in panel._items_by_name       # survived the stale read
+        assert "sub.me.eth" not in plugin._denied         # and not denied
 
     def test_pending_add_survives_lagging_rediscovery(self, qtbot):
         # A rediscover whose result LACKS the just-added name still shows it.
