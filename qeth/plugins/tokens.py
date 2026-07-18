@@ -47,7 +47,9 @@ from ..icons import (
     IconCache, bundled_native_icon, notification_icon, smooth_icon,
 )
 from ..plugin import Plugin
-from ..pricing import DefiLlamaPrices, Price, PriceSource
+from ..pricing import (
+    ChainedPriceSource, DefiLlamaPrices, OnChainVaultPrices, Price, PriceSource,
+)
 from ..risk import GoPlusRisk, RiskCache
 from ..token_metadata import TokenMetadataCache
 from ..token_discovery import (
@@ -331,7 +333,13 @@ class TokensPlugin(Plugin):
         # CoinGecko in the background. The indexer still covers the long tail.
         self._top_tokens = TopTokens()
         self._icon_cache = IconCache()
-        self._price_source: PriceSource = DefiLlamaPrices()
+        # DefiLlama first; for anything it can't price (vault shares, LP tokens
+        # the user got from their own txs) fall back to reading the value
+        # on-chain (ERC-4626 / Curve LP / UniV2). Both price paths (discovery
+        # `kick_prices` and the displayed-but-unpriced `_ensure_prices_for_
+        # unpriced`) go through this, so they gain the fallback for free.
+        self._price_source: PriceSource = ChainedPriceSource(
+            DefiLlamaPrices(), OnChainVaultPrices())
         self._wallet_cache = WalletCache()
         self._token_metadata = TokenMetadataCache()
         self._risk_source = GoPlusRisk()
