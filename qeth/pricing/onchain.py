@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -305,7 +305,33 @@ class OnChainVaultPrices:
             frontier = [d for d in need_base
                         if d not in resolved and _is_addr(d)]
 
-        return {a: resolved[a] for a in want if a in resolved}
+        out: dict[str, Price] = {}
+        for a in want:
+            p = resolved.get(a)
+            if p is None:
+                continue
+            if p.underlying:
+                # For the icon, report the TERMINAL recognizable asset: a vault
+                # over another vault (a 4626 wrapping yb-WETH wrapping WETH) has
+                # no icon for its immediate underlying, so walk down to the first
+                # non-vault asset (WETH), whose icon we can actually show.
+                term = self._terminal_underlying(cid, p.underlying)
+                if term != p.underlying:
+                    p = replace(p, underlying=term)
+            out[a] = p
+        return out
+
+    def _terminal_underlying(self, cid: int, underlying: str) -> str:
+        """Follow nested single-underlying vaults down to the first asset that
+        isn't itself such a vault — the recognizable base for the vault icon."""
+        cur = underlying.lower()
+        for _ in range(self.MAX_DEPTH):
+            st = self._memo.get((cid, cur))
+            if isinstance(st, VaultStructure):
+                cur = st.underlying
+            else:
+                break
+        return cur
 
     # -- registry + probing ----------------------------------------------
 

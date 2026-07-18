@@ -354,6 +354,26 @@ def test_univ2_no_priced_legs_gives_nothing():
 
 # --- 8. nested 4626-over-CurveLP, one base_lookup call per level ------------
 
+def test_nested_vault_reports_terminal_underlying_for_icon():
+    """A vault over a vault (a 4626 wrapping a YB vault wrapping WETH): the
+    price recurses, and Price.underlying is the TERMINAL asset (WETH) — not the
+    intermediate vault, which has no icon of its own."""
+    h: dict = {}
+    outer, inner, weth = A, B, C
+    _vault_4626(h, outer, vdec=18, underlying=inner, udec=18, assets_per_share="1.0")
+    # inner: a YB vault (pricePerShare + ASSET_TOKEN) over WETH
+    h[(inner, M._SEL_DECIMALS.hex())] = lambda cd: u256(18)
+    h[(inner, M._SEL_TOTAL_SUPPLY.hex())] = lambda cd: u256(10 ** 24)
+    h[(inner, M._SEL_PRICE_PER_SHARE.hex())] = lambda cd: u256(int(Decimal("1.05") * 10 ** 18))
+    h[(inner, M._SEL_ASSET_TOKEN.hex())] = lambda cd: addr32(weth)
+    h[(weth, M._SEL_DECIMALS.hex())] = lambda cd: u256(18)
+    pricer, _ = _mk(h)
+    out = pricer.price(Chain(), [outer], _BaseLookup({weth: ("3000", 1.0)}))
+    assert out[outer].price_usd == Decimal("3150")   # 1.0 × (1.05 × $3000)
+    assert out[outer].underlying == weth             # terminal WETH, not inner vault
+    assert out[outer].confidence == 0.9 * (0.9 * 1.0)
+
+
 def test_nested_vault_over_curve_lp():
     h: dict = {}
     vault, lp, coin0, coin1 = A, B, C, "0x" + "e5" * 20
