@@ -88,6 +88,36 @@ class TestIsLikelyScam:
             1, SCAM_ETH, "USDC", "fake usdc", risk=None,
         )
 
+    def test_trusted_lock_survives_goplus_honeypot(self, lists_with_usdc):
+        # vlSDT: a legit non-transferable vote-lock GoPlus reports as a
+        # honeypot. The allowlist short-circuits it to not-scam even though
+        # it's on no curated whitelist and has a high-risk report.
+        vlsdt = "0x94818a7baa7e9f5dc62ce4da1b52ef9a760b80b8"
+        risk = RiskReport(is_honeypot=True, fetched_at=1)
+        assert not lists_with_usdc.is_likely_scam(
+            1, vlsdt, "vlSDT", "Vote Locked SDT", risk=risk,
+        )
+        # Case-insensitive on the address (contract may arrive checksummed).
+        assert not lists_with_usdc.is_likely_scam(
+            1, vlsdt.upper().replace("0X", "0x"), "vlSDT", "Vote Locked SDT",
+            risk=risk,
+        )
+
+    def test_trusted_lock_is_per_chain(self, lists_with_usdc):
+        # eQi is allowlisted on Polygon (137), not on Ethereum. GoPlus flags it
+        # as a honeypot on both; only the Polygon entry is trusted.
+        eqi = "0x880decade22ad9c58a8a4202ef143c4f305100b3"
+        risk = RiskReport(is_honeypot=True, fetched_at=1)
+        assert not lists_with_usdc.is_likely_scam(137, eqi, "eQi", "escrowed Qi", risk=risk)
+        assert lists_with_usdc.is_likely_scam(1, eqi, "eQi", "escrowed Qi", risk=risk)
+
+    def test_unlisted_honeypot_still_flags(self, lists_with_usdc):
+        # The allowlist must not weaken the honeypot signal for anything else.
+        risk = RiskReport(is_honeypot=True, fetched_at=1)
+        assert lists_with_usdc.is_likely_scam(
+            1, SCAM_ETH, "SAFE", "Definitely Safe", risk=risk,
+        )
+
     def test_whitelist_beats_risk(self, lists_with_usdc):
         risk = RiskReport(is_honeypot=True, fetched_at=1)
         # USDC is on the whitelist; even a "honeypot" verdict from

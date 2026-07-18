@@ -50,6 +50,38 @@ _CANONICAL_SYMBOLS = {
     "bnb", "avax", "frax", "crv", "uni", "aave",
 }
 
+# Legitimate non-transferable governance locks (vote-escrow / vote-locked).
+# These are non-transferable BY DESIGN — you lock a token to get voting weight,
+# you can't sell/move the receipt. GoPlus's honeypot/blacklist simulation can't
+# tell "non-transferable by design" from a real trap, so it false-flags them —
+# and inconsistently: vlSDT reads is_honeypot, vlAURA is_blacklisted, vlCVX is
+# clean (all the same Convex-style lock), and batch vs single fetches disagree.
+# That unpredictability is why a deterministic address allowlist beats trying to
+# reinterpret GoPlus. Keyed (chain_id, lower-address). EVERY entry was
+# identity-verified on-chain (name()/symbol()) before landing here; extend the
+# same way — never add an unverified address to a scam bypass. Scoped to the
+# scam check only (not is_known), so it can't change visibility/pricing.
+_TRUSTED_LOCKS: frozenset[tuple[int, str]] = frozenset(
+    (cid, addr.lower()) for cid, addr in (
+        # --- Ethereum mainnet ---
+        (1, "0x72a19342e8F1838460eBFCCEf09F6585e32db86E"),  # vlCVX  — Convex
+        (1, "0x3Fa73f1E5d8A792C80F426fc8F84FBF7Ce9bBCAC"),  # vlAURA — Aura
+        (1, "0x94818A7baa7e9F5dC62ce4da1B52ef9a760b80B8"),  # vlSDT  — Stake DAO
+        (1, "0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2"),  # veCRV  — Curve
+        (1, "0xC128a9954e6c874eA3d62ce62B468bA073093F25"),  # veBAL  — Balancer
+        (1, "0xc8418aF6358FFddA74e09Ca9CC3Fe03Ca6aDC5b0"),  # veFXS  — Frax
+        (1, "0x90c1f9220d90d3966FbeE24045EDd73E1d588aD5"),  # veYFI  — Yearn
+        (1, "0x0C462Dbb9EC8cD1630f1728B2CFD2769d09f0dd5"),  # veANGLE — Angle
+        (1, "0x0c93675719ad43648a1ab5f735dcaaa08e130be4"),  # veMAV  — Maverick
+        (1, "0xbF82a3212e13b2d407D10f5107b5C8404dE7F403"),  # veSPA  — Sperax
+        (1, "0x0C30476f66034E11782938DF8e4384970B6c9e8a"),  # veSDT  — Stake DAO
+        # --- Arbitrum ---
+        (42161, "0x2e2071180682Ce6C247B1eF93d382D509F5F6A17"),  # veSPA — Sperax
+        # --- Polygon ---
+        (137, "0x880DeCADe22aD9c58A8A4202EF143c4F305100B3"),  # eQi  — QiDao
+    )
+)
+
 
 @dataclass(frozen=True)
 class TokenListEntry:
@@ -334,7 +366,9 @@ class TokenLists:
 
         Presence on any curated whitelist short-circuits to False — if
         a token's contract is in Uniswap/CoinGecko/Curve/1inch we trust
-        it regardless of how scammy the on-chain name reads.
+        it regardless of how scammy the on-chain name reads. A curated set
+        of non-transferable governance locks (``_TRUSTED_LOCKS``) short-
+        circuits the same way — GoPlus false-flags those as honeypots.
 
         Otherwise, in order of confidence:
         - ``risk.is_high_risk()`` returns True (GoPlus reported a
@@ -349,6 +383,10 @@ class TokenLists:
         catches the obvious URL/keyword/impersonation cases.
         """
         if self.is_known(chain_id, contract):
+            return False
+        if (chain_id, contract.lower()) in _TRUSTED_LOCKS:
+            # A known non-transferable governance lock — GoPlus false-flags
+            # these as honeypots/blacklisted. See _TRUSTED_LOCKS.
             return False
         if risk is not None and risk.is_high_risk():
             return True
