@@ -549,8 +549,10 @@ class MainWindow(QMainWindow):
         "Ctrl+C copies the selected address, token, or tx hash.",
         "Del removes the selected account.",
         "Double-click an account to connect it to the browser (set as default).",
-        "Drag accounts in the tree to reorder them.",
+        "Drag accounts — or whole device branches — in the tree to reorder them.",
         "Right-click an account for Copy, Remove, and Connect-to-Browser.",
+        "Ctrl+F filters accounts by label or address; ↑/↓ step through the matches.",
+        "Edit Label… renames an account — or a whole hardware-device subtree.",
         "Double-click a transaction to see its decoded details.",
         "Right-click a pending transaction to Speed up or Cancel it.",
         "Scroll to the bottom of the history to load older transactions.",
@@ -558,13 +560,23 @@ class MainWindow(QMainWindow):
         "used it.",
         "Double-click a token to open its transfers in the block explorer.",
         "In Send, Max fills your full balance; the USD value updates as you type.",
+        "Before you sign, qeth simulates the transaction and previews the token "
+        "and balance changes it will make.",
         "Switch networks with the chain selector in the toolbar.",
+        "Point any network at your own RPC — edit it beside the chain selector.",
         "Right-click an address or hash to copy it or open it in the explorer.",
         "Connect dapps — qeth serves a Frame-compatible wallet on 127.0.0.1:1248.",
         "Select a token to Hide it from this wallet, or pin ★ to keep it shown.",
         "Toggle 'Show all' to reveal hidden tokens and dust-value balances.",
-        "Sign an arbitrary message from a wallet's details panel (Sign Message…).",
+        "Sign an arbitrary message: pick an account, then Sign Message… "
+        "(action-row button or right-click).",
+        "The QR button shows an account's address as a scannable code.",
         "Track any address read-only: Add → Watch-only Address.",
+        "Add → Air-gapped signs with a QR hardware wallet (Keystone / Keycard).",
+        "In the ENS tab, set a name's ETH address, text and IPFS records, and "
+        "add or remove subdomains.",
+        "Renew or transfer your .eth names from the ENS tab — Extend one before "
+        "it expires.",
     )
 
     def _build_statusbar(self) -> None:
