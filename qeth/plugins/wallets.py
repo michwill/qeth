@@ -291,18 +291,29 @@ class _ReorderTree(QTreeWidget):
 
 
 class _SearchEdit(QLineEdit):
-    """The Accounts find-bar field. Emits ``escape_pressed`` on Escape so the
-    plugin can close the bar + clear the filter (browser-style), while the field
-    has focus. A subclass rather than a QShortcut: keyPressEvent delivery is
-    deterministic under headless QTest, and it matches the browser rule that
-    Escape only dismisses when the find field is focused (mirrors
-    ``_ReorderTree.keyPressEvent`` above)."""
+    """The Accounts find-bar field. Emits ``escape_pressed`` on Escape (close +
+    clear the filter, browser-style) and ``navigate`` on Up/Down so the plugin
+    can walk the selection through the visible matches while the field keeps
+    focus — the user filters, then arrows through results watching each
+    account's balances load. A subclass rather than a QShortcut: keyPressEvent
+    delivery is deterministic under headless QTest; Escape matches the browser
+    rule that it only dismisses when the field is focused; and a single-line
+    QLineEdit ignores Up/Down natively, so claiming them costs no editing
+    behaviour (mirrors ``_ReorderTree.keyPressEvent`` above)."""
 
     escape_pressed = Signal()
+    navigate = Signal(int)          # -1 = Up (previous match), +1 = Down (next)
 
     def keyPressEvent(self, event):  # noqa: N802 — Qt method name
-        if event.key() == Qt.Key.Key_Escape:
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
             self.escape_pressed.emit()
+            return
+        if key == Qt.Key.Key_Up:
+            self.navigate.emit(-1)
+            return
+        if key == Qt.Key.Key_Down:
+            self.navigate.emit(1)
             return
         super().keyPressEvent(event)
 
@@ -631,6 +642,7 @@ class WalletsPlugin(Plugin):
         self._search_edit.setVisible(False)
         self._search_edit.textChanged.connect(self._on_search_text)
         self._search_edit.escape_pressed.connect(self._hide_search)
+        self._search_edit.navigate.connect(self._search_navigate)
         v.addWidget(self._search_edit)
         # Scope Ctrl+F to the whole Accounts panel (tree OR find field), so it
         # fires wherever focus is in this slot and won't shadow a find in the
@@ -1225,6 +1237,63 @@ class WalletsPlugin(Plugin):
     def _on_search_text(self, text: str) -> None:
         self._filter_text = text
         self._apply_filter()
+
+    def _visible_leaves(self) -> list[QTreeWidgetItem]:
+        """Account leaves currently on screen, top-to-bottom: unhidden and with
+        every ancestor unhidden AND expanded. Under an active filter this is
+        exactly the matched rows (matched branches are force-expanded), so it's
+        the set the Up/Down keys walk."""
+        out: list[QTreeWidgetItem] = []
+        if self._tree is None:
+            return out
+
+        def walk(item: QTreeWidgetItem | None, shown: bool) -> None:
+            if item is None:
+                return
+            self_shown = shown and not item.isHidden()
+            addr = item.data(0, Qt.ItemDataRole.UserRole)
+            if self_shown and isinstance(addr, str) and addr:
+                out.append(item)
+            # Children are on screen only if this row is shown AND expanded.
+            children_shown = self_shown and item.isExpanded()
+            for i in range(item.childCount()):
+                walk(item.child(i), children_shown)
+
+        for i in range(self._tree.topLevelItemCount()):
+            walk(self._tree.topLevelItem(i), True)
+        return out
+
+    def _search_navigate(self, direction: int) -> None:
+        """Move the selection to the previous/next visible account row while the
+        find field keeps focus, so the user can arrow through the matches and
+        watch each account's balances load. Clamps at the ends; broadcasts once
+        (blocked clear+select) so the right-hand panels reload cleanly."""
+        if self._tree is None:
+            return
+        leaves = self._visible_leaves()
+        if not leaves:
+            return
+        cur = self._tree.currentItem()
+        idx = next((i for i, lf in enumerate(leaves) if lf is cur), -1)
+        if idx == -1:
+            # Current row isn't among the visible matches (e.g. it was filtered
+            # out): enter from the top going down, the bottom going up.
+            new_idx = 0 if direction > 0 else len(leaves) - 1
+        else:
+            new_idx = max(0, min(len(leaves) - 1, idx + direction))
+        target = leaves[new_idx]
+        if target is cur:
+            return
+        # clearSelection() then setSelected() would emit selected_address_changed
+        # twice (None, then addr) — the flash the rebuild path blocks too. Do the
+        # selection change silently and fire _on_tree_selection once.
+        self._tree.blockSignals(True)
+        self._tree.clearSelection()
+        self._tree.setCurrentItem(target)
+        target.setSelected(True)
+        self._tree.blockSignals(False)
+        self._tree.scrollToItem(target)
+        self._on_tree_selection()
 
     def _restore_expansion_snapshot(self, snapshot: dict) -> None:
         """Re-apply a captured expand/collapse state to the keyed group/root

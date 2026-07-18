@@ -2710,6 +2710,45 @@ class TestWalletsFindBar:
         plugin._search_edit.setText("")
         assert self._root_of(plugin, a1).isExpanded() is False
 
+    def test_arrow_keys_walk_matches_and_broadcast(self, qtbot, tmp_qeth):
+        # Up/Down in the find field move the selection through the visible
+        # matches (so the user watches each account's balances load) and
+        # broadcast the newly-selected account. a1 (Ledger) precedes a2 (Hot).
+        plugin, a1, a2 = self._plugin(qtbot)
+        plugin._search_edit.setText("0x")            # matches both addresses
+        assert plugin.selected_address == a1         # default selection
+        emits: list = []
+        plugin.selected_address_changed.connect(emits.append)
+        plugin._search_edit.navigate.emit(1)         # Down → a2
+        assert plugin.selected_address == a2
+        assert emits[-1] == a2
+        plugin._search_edit.navigate.emit(-1)        # Up → back to a1
+        assert plugin.selected_address == a1
+        assert emits[-1] == a1
+        plugin._search_edit.navigate.emit(-1)        # Up at top → clamps
+        assert plugin.selected_address == a1
+
+    def test_arrow_navigation_skips_filtered_out_rows(self, qtbot, tmp_qeth):
+        # The current row (a1, the default) is hidden by the filter; Down enters
+        # the visible set from the top — landing on the sole match, a2.
+        plugin, a1, a2 = self._plugin(qtbot)
+        plugin._search_edit.setText("2222")          # only a2 matches
+        assert plugin._find_item(a1).isHidden() is True
+        plugin._search_edit.navigate.emit(1)         # Down
+        assert plugin.selected_address == a2
+        plugin._search_edit.navigate.emit(1)         # Down again → clamps on a2
+        assert plugin.selected_address == a2
+
+    def test_down_arrow_key_moves_selection(self, qtbot, tmp_qeth):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        plugin, a1, a2 = self._plugin(qtbot)
+        plugin.widget().show()                       # for reliable key delivery
+        plugin.act_find.trigger()                    # Ctrl+F
+        plugin._search_edit.setText("0x")            # matches both
+        QTest.keyClick(plugin._search_edit, Qt.Key.Key_Down)
+        assert plugin.selected_address == a2
+
 
 class TestTokensStartupNonBlocking:
     """Pin the no-wait-for-token-lists startup behaviour: when the
