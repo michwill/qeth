@@ -140,8 +140,7 @@ files = [
     "qeth/fsatomic.py",
     "qeth/single_instance.py",
     "qeth/balance_ledger.py",
-    "qeth/tokens.py",
-    "qeth/tokenlists.py",
+    "qeth/token_discovery",
     "qeth/token_metadata.py",
     "qeth/pricing",
     "qeth/abi.py",
@@ -207,7 +206,6 @@ files = [
     "qeth/formatting.py",
     "qeth/ens.py",
     "qeth/chain_rpc_dialog.py",
-    "qeth/toptokens.py",
     # The Falkon browser-connector plugin (out-of-tree package; uses the
     # root Falkon.pyi stub). Same scoped-Qt-enum rules apply.
     "integrations/falkon/qeth_connector",

@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt
 from qeth.chains import DEFAULT_CHAINS
 from qeth.icons import IconCache
 from qeth.store import Store
-from qeth.tokens import TokenBalance
+from qeth.token_discovery import TokenBalance
 from qeth.plugins.tokens import TokenListPanel
 from qeth.transactions import Transaction
 from qeth.plugins.transactions import TransactionListPanel
@@ -170,7 +170,7 @@ class TestTokenListPanel:
         token with any non-zero balance shows even below the dust threshold; an
         ordinary dust token is hidden."""
         from decimal import Decimal
-        from qeth.tokens import TokenBalance
+        from qeth.token_discovery import TokenBalance
         from qeth.pricing import Price
         store = Store.load()
         pin0 = "0x" + "a0" * 20      # pinned, zero balance
@@ -208,7 +208,7 @@ class TestTokenListPanel:
         only for unrecognised spam. An unrecognised no-price token stays hidden.
         (The 'swapped LT→WETH but WETH didn't appear' bug.)"""
         from types import SimpleNamespace
-        from qeth.tokens import TokenBalance
+        from qeth.token_discovery import TokenBalance
         store = Store.load()
         weth = "0x" + "c0" * 20      # pretend-recognised
         spam = "0x" + "5e" * 20      # unrecognised, no price
@@ -241,7 +241,7 @@ class TestTokenListPanel:
         recognised-but-unpriced token once its window lapses (so it agrees with
         the discovery filter instead of lingering until the next discovery)."""
         from types import SimpleNamespace
-        from qeth.tokens import TokenBalance
+        from qeth.token_discovery import TokenBalance
         store = Store.load()
         addr = "0x" + "c0" * 20
         panel = TokenListPanel(IconCache(), store)

@@ -50,12 +50,11 @@ from ..plugin import Plugin
 from ..pricing import DefiLlamaPrices, Price, PriceSource
 from ..risk import GoPlusRisk, RiskCache
 from ..token_metadata import TokenMetadataCache
-from ..tokenlists import TokenListEntry, TokenLists
-from ..tokens import (
-    BlockscoutSource, EtherscanV2Source, RoutedTokenSource, TokenBalance,
-    TokenSource,
+from ..token_discovery import (
+    COINGECKO_PLATFORMS, BlockscoutSource, EtherscanV2Source,
+    RoutedTokenSource, TokenBalance, TokenListEntry, TokenLists, TokenSource,
+    TopTokens,
 )
-from ..toptokens import COINGECKO_PLATFORMS, TopTokens
 from ..balance_ledger import BalanceLedger
 from ..wallet_cache import CachedToken, CachedWallet, WalletCache
 

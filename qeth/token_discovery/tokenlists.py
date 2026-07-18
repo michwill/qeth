@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import ClassVar
 from collections.abc import Iterable
 
-from . import USER_AGENT
-from .fsatomic import atomic_write_bytes
+from .. import USER_AGENT
+from ..fsatomic import atomic_write_bytes
 
-log = logging.getLogger("qeth.tokenlists")
+log = logging.getLogger("qeth.token_discovery.tokenlists")
 
 CACHE_DIR = Path.home() / ".qeth" / "tokenlists"
 DEFAULT_TIMEOUT = 8.0

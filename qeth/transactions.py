@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 from . import USER_AGENT
 from .chains import Chain
-from .tokens import BLOCKSCOUT_INSTANCES, ETHERSCAN_V2_CHAINS, ETHERSCAN_V2_BASE
+from .token_discovery import BLOCKSCOUT_INSTANCES, ETHERSCAN_V2_CHAINS, ETHERSCAN_V2_BASE
 
 
 class TxDirection(enum.Enum):

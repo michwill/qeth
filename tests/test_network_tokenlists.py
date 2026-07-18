@@ -8,7 +8,7 @@ silently empty out the merged index — these tests guard against that.
 
 import pytest
 
-from qeth.tokenlists import CoinGeckoPerChain, Curve, OneInch, UniswapDefault
+from qeth.token_discovery import CoinGeckoPerChain, Curve, OneInch, UniswapDefault
 
 pytestmark = pytest.mark.network
 

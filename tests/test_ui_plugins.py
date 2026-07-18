@@ -1811,7 +1811,7 @@ class TestTokensPlugin:
         """A custom token with any non-zero balance shows even below the dust
         threshold; an ordinary dust token is filtered."""
         from decimal import Decimal
-        from qeth.tokens import TokenBalance
+        from qeth.token_discovery import TokenBalance
         from qeth.pricing import Price
         host = _StubHost()
         tokens_plugin.attach(host)
@@ -1839,7 +1839,7 @@ class TestTokensPlugin:
         inside its grace window so a just-received token isn't hidden while its
         price loads — then hides once the window lapses, unless pinned."""
         import time
-        from qeth.tokens import TokenBalance
+        from qeth.token_discovery import TokenBalance
         monkeypatch.setattr(tokens_plugin._token_lists, "is_known",
                             lambda cid, a: True)          # everything recognised
         known = "0x" + "ab" * 20
@@ -2025,7 +2025,7 @@ class TestCuratedListAsDiscoverySource:
     fetch + cache."""
 
     def test_addresses_for_chain_filters_by_chain(self):
-        from qeth.tokenlists import TokenListEntry, TokenLists
+        from qeth.token_discovery import TokenListEntry, TokenLists
         lists = TokenLists()
         lists._index = {
             (1, "0xa"): TokenListEntry(
@@ -2052,7 +2052,7 @@ class TestCuratedListAsDiscoverySource:
         # decimals on chain). The curated lists already carry that
         # data — prefilling means MetadataWorker can be skipped
         # entirely for curated contracts on first refresh.
-        from qeth.tokenlists import TokenListEntry
+        from qeth.token_discovery import TokenListEntry
         usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
         tokens_plugin._token_lists._index = {
             (1, usdc): TokenListEntry(
@@ -2196,7 +2196,7 @@ class TestReceiptTransferScan:
         # persist to the wallet cache even when the on-chain metadata prefill
         # hasn't run — using the token-list entry's symbol/name/decimals — so
         # it doesn't show for one forced refresh then drop out again.
-        from qeth.tokenlists import TokenListEntry
+        from qeth.token_discovery import TokenListEntry
         token = "0x4e3fbd56cd56c3e72c1403e103b45db9da5b9d2b"   # CVX
         entry = TokenListEntry(
             chain_id=ETH.chain_id, address=token, symbol="CVX",
@@ -2306,7 +2306,7 @@ class TestReceiptTransferScan:
         # confirms, the receiver's CACHE must hold USDT — even if
         # the receiver isn't the current view (so the next time
         # the user opens it, USDT is already there).
-        from qeth.tokenlists import TokenListEntry
+        from qeth.token_discovery import TokenListEntry
         USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
         tokens_plugin._store.add_account({
             "address": self.ME, "source": "hot", "label": "Me",

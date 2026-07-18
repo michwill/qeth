@@ -26,7 +26,7 @@ import urllib.request
 from typing import Any, cast
 
 from . import USER_AGENT
-from .tokens import (   # reuse the per-chain maps + Etherscan v2 endpoint
+from .token_discovery import (   # reuse the per-chain maps + Etherscan v2 endpoint
     BLOCKSCOUT_INSTANCES, ETHERSCAN_V2_BASE, ETHERSCAN_V2_CHAINS,
 )
 

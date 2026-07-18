@@ -3,7 +3,7 @@
 import pytest
 
 from qeth.chains import DEFAULT_CHAINS
-from qeth.tokens import BlockscoutSource
+from qeth.token_discovery import BlockscoutSource
 
 pytestmark = pytest.mark.network
 

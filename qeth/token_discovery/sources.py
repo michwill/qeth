@@ -19,10 +19,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
 
-from . import USER_AGENT
-from .chains import Chain
+from .. import USER_AGENT
+from ..chains import Chain
 
-log = logging.getLogger("qeth.tokens")
+log = logging.getLogger("qeth.token_discovery.sources")
 
 
 @dataclass(frozen=True)

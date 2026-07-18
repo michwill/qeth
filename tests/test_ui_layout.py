@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from qeth.chains import DEFAULT_CHAINS
-from qeth.tokens import TokenBalance
+from qeth.token_discovery import TokenBalance
 
 
 # --- Account actions row ----------------------------------------------------

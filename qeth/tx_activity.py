@@ -30,7 +30,7 @@ from . import USER_AGENT
 from .abi import AnyAbiSource, BlockscoutAbiSource, selector_names
 from .abi_cache import AbiCache
 from .chains import DEFAULT_CHAINS, Chain
-from .tokens import BLOCKSCOUT_INSTANCES
+from .token_discovery import BLOCKSCOUT_INSTANCES
 from .transactions import Transaction
 
 if TYPE_CHECKING:

@@ -1,11 +1,11 @@
 """Tests for the scam heuristic and source-failure resilience in
-qeth.tokenlists.
+qeth.token_discovery.tokenlists.
 """
 
 import pytest
 
 from qeth.risk import RiskReport
-from qeth.tokenlists import TokenLists
+from qeth.token_discovery import TokenLists
 
 
 REAL_USDC_ETH = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
@@ -101,7 +101,7 @@ class TestLoadFailureTolerant:
     """One bad source must never sink the whole index."""
 
     def test_one_failing_source_doesnt_block_others(self, tmp_qeth):
-        from qeth.tokenlists import TokenListSource, TokenListEntry
+        from qeth.token_discovery import TokenListSource, TokenListEntry
 
         class Good(TokenListSource):
             name = "good"
@@ -124,7 +124,7 @@ class TestLoadFailureTolerant:
         assert lists.is_known(1, "0xaaaa")
 
     def test_first_source_to_provide_a_pair_wins(self, tmp_qeth):
-        from qeth.tokenlists import TokenListSource, TokenListEntry
+        from qeth.token_discovery import TokenListSource, TokenListEntry
 
         class A(TokenListSource):
             name = "a"
@@ -156,8 +156,8 @@ def test_curve_logo_path_is_per_chain(monkeypatch, tmp_path):
     images/assets-<slug>/ for every other chain. The logo URL must follow
     that per-chain layout — the old single images/assets/ path 404'd for
     every non-mainnet token (e.g. Gnosis EURe showed a generic glyph)."""
-    import qeth.tokenlists as tl
-    from qeth.tokenlists import Curve
+    import qeth.token_discovery.tokenlists as tl
+    from qeth.token_discovery import Curve
 
     def fake_fetch_json(url, path, ttl, timeout):
         return {"data": {"tokens": [

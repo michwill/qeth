@@ -1,11 +1,11 @@
-"""Top-tokens-by-market-cap provider (qeth.toptokens)."""
+"""Top-tokens-by-market-cap provider (qeth.token_discovery.toptokens)."""
 
 from __future__ import annotations
 
 import json
 
-import qeth.toptokens as tt_mod
-from qeth.toptokens import TopToken, TopTokens, fetch_top_tokens
+import qeth.token_discovery.toptokens as tt_mod
+from qeth.token_discovery import TopToken, TopTokens, fetch_top_tokens
 
 USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"

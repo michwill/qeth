@@ -1,4 +1,4 @@
-"""Hermetic tests for qeth.tokens — the Etherscan v2 token source.
+"""Hermetic tests for qeth.token_discovery.sources — the Etherscan v2 token source.
 
 These never hit the network: ``urllib.request.urlopen`` is monkeypatched
 to return a canned Etherscan response. See ``test_network_tokens.py`` for
@@ -18,7 +18,7 @@ import logging
 import pytest
 
 from qeth.chains import DEFAULT_CHAINS
-from qeth.tokens import (
+from qeth.token_discovery import (
     ETHERSCAN_PAGE_CAP,
     EtherscanV2Source,
     UnsupportedChain,
@@ -81,7 +81,7 @@ class TestEtherscanOffsetCap:
         """A full page back is a truncation signal, not a clean result."""
         full_page = [_token_row(i) for i in range(ETHERSCAN_PAGE_CAP)]
         _install_fake(monkeypatch, result=full_page)
-        with caplog.at_level(logging.WARNING, logger="qeth.tokens"):
+        with caplog.at_level(logging.WARNING, logger="qeth.token_discovery.sources"):
             out = EtherscanV2Source(lambda: "KEY").list_balances(ETH, ADDR)
         # Everything fetched is still returned — we don't drop the page,
         # we just flag that there may be more beyond it.
@@ -94,7 +94,7 @@ class TestEtherscanOffsetCap:
     def test_no_warning_below_the_cap(self, monkeypatch, caplog):
         partial = [_token_row(i) for i in range(5)]
         _install_fake(monkeypatch, result=partial)
-        with caplog.at_level(logging.WARNING, logger="qeth.tokens"):
+        with caplog.at_level(logging.WARNING, logger="qeth.token_discovery.sources"):
             out = EtherscanV2Source(lambda: "KEY").list_balances(ETH, ADDR)
         assert len(out) == 5
         assert not any("page cap" in r.message for r in caplog.records)
@@ -153,7 +153,7 @@ class _Clock:
 
 class TestRoutedTokenSourceCooldown:
     def test_first_call_uses_primary(self):
-        from qeth.tokens import RoutedTokenSource
+        from qeth.token_discovery import RoutedTokenSource
         clk = _Clock()
         primary = _FakeSource({1}, tag="ether")
         secondary = _FakeSource({1}, tag="blockscout")
@@ -162,7 +162,7 @@ class TestRoutedTokenSourceCooldown:
         assert primary.calls == 1 and secondary.calls == 0
 
     def test_burst_within_cooldown_diverts_to_secondary(self):
-        from qeth.tokens import RoutedTokenSource
+        from qeth.token_discovery import RoutedTokenSource
         clk = _Clock()
         primary = _FakeSource({1}, tag="ether")
         secondary = _FakeSource({1}, tag="blockscout")
@@ -173,7 +173,7 @@ class TestRoutedTokenSourceCooldown:
         assert primary.calls == 1 and secondary.calls == 1
 
     def test_primary_resumes_after_cooldown(self):
-        from qeth.tokens import RoutedTokenSource
+        from qeth.token_discovery import RoutedTokenSource
         clk = _Clock()
         primary = _FakeSource({1}, tag="ether")
         secondary = _FakeSource({1}, tag="blockscout")
@@ -186,7 +186,7 @@ class TestRoutedTokenSourceCooldown:
     def test_cooldown_ignored_when_secondary_cant_serve_chain(self):
         # BNB-style: secondary doesn't support the chain, so even inside
         # the window we must keep using the primary (no alternative).
-        from qeth.tokens import RoutedTokenSource
+        from qeth.token_discovery import RoutedTokenSource
         BNB = next(c for c in DEFAULT_CHAINS if c.chain_id == 56)
         clk = _Clock()
         primary = _FakeSource({56}, tag="ether")
@@ -198,7 +198,7 @@ class TestRoutedTokenSourceCooldown:
         assert primary.calls == 2 and secondary.calls == 0
 
     def test_rate_limited_primary_falls_back_to_secondary(self):
-        from qeth.tokens import RoutedTokenSource, RateLimited
+        from qeth.token_discovery import RoutedTokenSource, RateLimited
         clk = _Clock()
         primary = _FakeSource({1}, raises=RateLimited("slow down"), tag="ether")
         secondary = _FakeSource({1}, tag="blockscout")

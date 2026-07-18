@@ -31,10 +31,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from . import USER_AGENT
-from .fsatomic import atomic_write_text
+from .. import USER_AGENT
+from ..fsatomic import atomic_write_text
 
-log = logging.getLogger("qeth.toptokens")
+log = logging.getLogger("qeth.token_discovery.toptokens")
 
 # chain_id -> CoinGecko platform slug (the keys in coins/list `platforms`).
 COINGECKO_PLATFORMS: dict[int, str] = {

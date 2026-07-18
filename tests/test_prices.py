@@ -31,7 +31,7 @@ def test_avalanche_in_curated_tokenlist_sources():
     """Discovery drops any token not in a curated list (is_known), so the
     per-chain tokenlist sources must include Avalanche or its tokens never
     surface — even priced ones."""
-    from qeth.tokenlists import CoinGeckoPerChain, Curve, OneInch
+    from qeth.token_discovery import CoinGeckoPerChain, Curve, OneInch
     assert 43114 in CoinGeckoPerChain.SLUGS
     assert 43114 in Curve.SLUGS
     assert 43114 in OneInch.CHAINS

@@ -553,7 +553,7 @@ def test_confirmed_receive_adds_and_prices_recognised_token(anvil, qtbot, tmp_qe
     DefiLlama source prices USDC."""
     from types import SimpleNamespace
     from qeth.store import Store
-    from qeth.tokenlists import TokenListEntry
+    from qeth.token_discovery import TokenListEntry
     amount = 25 * 10 ** USDC_DECIMALS
     _ensure_usdc(anvil, ACCT, 0)                # start with none
 
