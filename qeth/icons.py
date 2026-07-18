@@ -316,6 +316,7 @@ def notification_icon(
 # scaled at draw time.
 _VAULT_BADGE_COLOR = QColor(255, 209, 59)      # gold-yellow fill
 _VAULT_BADGE_OUTLINE = QColor(122, 74, 10)     # brown border (defines the star)
+_VAULT_BADGE_OPACITY = 0.7                      # let the underlying icon show through
 _SPARKLE_POINTS = (
     (0.0, -1.0), (0.24, -0.24), (1.0, 0.0), (0.24, 0.24),
     (0.0, 1.0), (-0.24, 0.24), (-1.0, 0.0), (-0.24, -0.24),
@@ -336,9 +337,12 @@ def _draw_sparkle_badge(
     path.closeSubpath()
     pen = QPen(_VAULT_BADGE_OUTLINE, max(1.0, r * 0.16))
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    prev = painter.opacity()
+    painter.setOpacity(_VAULT_BADGE_OPACITY)   # let the icon show through a little
     painter.setPen(pen)
     painter.setBrush(_VAULT_BADGE_COLOR)
     painter.drawPath(path)
+    painter.setOpacity(prev)
 
 
 def vault_icon(base: "QPixmap | None", size: int = 64) -> QPixmap:

@@ -93,22 +93,37 @@ class TestVaultIcon:
                     return True
         return False
 
-    def test_underlying_shows_with_yellow_sparkle_badge(self, qtbot):
-        from PySide6.QtGui import QPixmap
-        from qeth.icons import vault_icon, _VAULT_BADGE_COLOR
-        base = QPixmap(64, 64)
-        base.fill(Qt.GlobalColor.red)          # stand-in underlying icon
-        img = vault_icon(base, 64).toImage()
-        # Underlying (red) shows in the top-left; the gold-yellow sparkle is in
-        # the bottom-right.
-        assert self._has_color(img, Qt.GlobalColor.red, (4, 4, 24, 24))
-        assert self._has_color(img, _VAULT_BADGE_COLOR, (36, 36, 63, 63))
+    def _max_green(self, img, box):
+        x0, y0, x1, y1 = box
+        return max(img.pixelColor(x, y).green()
+                   for x in range(x0, x1, 2) for y in range(y0, y1, 2))
 
-    def test_no_base_still_draws_a_sparkle(self, qtbot):
-        from qeth.icons import vault_icon, _VAULT_BADGE_COLOR
+    def test_underlying_shows_with_sparkle_in_the_corner(self, qtbot):
+        from PySide6.QtGui import QPixmap
+        from qeth.icons import vault_icon
+        base = QPixmap(64, 64)
+        base.fill(Qt.GlobalColor.red)          # green channel 0 everywhere
+        img = vault_icon(base, 64).toImage()
+        # Underlying (red) shows in the top-left, un-badged.
+        assert self._has_color(img, Qt.GlobalColor.red, (6, 6, 22, 22))
+        # The gold sparkle sits in the bottom-right: the red underlying has no
+        # green, so a raised green channel there marks the sparkle (robust to
+        # its 70% opacity blending with the icon).
+        assert self._max_green(img, (40, 40, 63, 63)) > 90
+        assert self._max_green(img, (6, 6, 22, 22)) < 40    # top-left un-badged
+
+    def test_badge_is_semi_transparent(self, qtbot):
+        from qeth.icons import vault_icon, _VAULT_BADGE_OPACITY
+        # Centred sparkle over a transparent canvas. Sample pure-fill pixels near
+        # the centre (bright yellow, clear of the brown outline) — they keep the
+        # badge's ~70% alpha, so the underlying icon shows through.
         img = vault_icon(None, 64).toImage()
-        # Centred sparkle when the underlying icon isn't available yet.
-        assert self._has_color(img, _VAULT_BADGE_COLOR, (20, 20, 44, 44))
+        alphas = [img.pixelColor(x, y).alpha()
+                  for x in range(26, 39) for y in range(26, 39)
+                  if img.pixelColor(x, y).red() > 220
+                  and img.pixelColor(x, y).green() > 180]
+        assert alphas                                    # the sparkle drew
+        assert abs(max(alphas) - round(255 * _VAULT_BADGE_OPACITY)) <= 15
 
 
 class TestVaultRowIcon:
