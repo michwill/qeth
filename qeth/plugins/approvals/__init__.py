@@ -449,14 +449,17 @@ class ApprovalsPanel(QWidget):
         self._scan_bar.setVisible(False)
         v.addWidget(self._scan_bar)
 
-        self.btn_modify = QPushButton("&Modify Approval…")
-        self.btn_modify.setIcon(_icon(*_IC_MODIFY))
-        self.btn_modify.setToolTip("Set a new allowance for the selected spender")
-        self.btn_modify.clicked.connect(self._emit_modify)
-        self.btn_revoke = QPushButton("&Revoke")
-        self.btn_revoke.setIcon(_icon(*_IC_REVOKE))
-        self.btn_revoke.setToolTip("Set the selected allowance to zero")
-        self.btn_revoke.clicked.connect(self._emit_revoke)
+        # One morphing primary button, so the action row stays narrow enough
+        # that the pane (and the eliding identity column) can size down: it's
+        # "Modify" for a single selected row and turns into "Revoke (N)" the
+        # moment any boxes are checked. (The context menu still offers both
+        # per-row — parity is kept there.)
+        self._ic_modify = _icon(*_IC_MODIFY)
+        self._ic_revoke = _icon(*_IC_REVOKE)
+        self._action_mode = "modify"
+        self.btn_action = QPushButton("&Modify")
+        self.btn_action.setIcon(self._ic_modify)
+        self.btn_action.clicked.connect(self._on_action_clicked)
         self.btn_copy = QPushButton()
         self.btn_copy.setIcon(_icon(*_IC_COPY))
         self.btn_copy.setToolTip("Copy spender address")
@@ -479,8 +482,8 @@ class ApprovalsPanel(QWidget):
             self._host.icon_cache().icon_ready.connect(self._on_icon_ready)
 
     def action_widgets(self) -> list[QWidget]:
-        return [self.btn_modify, self.btn_revoke,
-                self.btn_copy, self.btn_explorer, self.btn_refresh]
+        return [self.btn_action, self.btn_copy, self.btn_explorer,
+                self.btn_refresh]
 
     # --- scan lifecycle ---------------------------------------------------
     def begin_scan(self) -> None:
@@ -763,24 +766,29 @@ class ApprovalsPanel(QWidget):
         n_checked = len(self.checked_leaves())
         self.btn_copy.setEnabled(has_leaf)
         self.btn_explorer.setEnabled(has_leaf and self._explorer_base() is not None)
-        self.btn_modify.setEnabled(has_leaf)          # modify is single-leaf only
-        self.btn_revoke.setText(f"&Revoke ({n_checked})" if n_checked else "&Revoke")
-        self.btn_revoke.setEnabled(has_leaf or n_checked > 0)
+        # Checked boxes → batch Revoke; else a selected row → Modify; else off.
+        if n_checked > 0:
+            self._action_mode = "revoke"
+            self.btn_action.setText(f"&Revoke ({n_checked})")
+            self.btn_action.setIcon(self._ic_revoke)
+            self.btn_action.setToolTip("Set the checked allowances to zero")
+            self.btn_action.setEnabled(True)
+        else:
+            self._action_mode = "modify"
+            self.btn_action.setText("&Modify")
+            self.btn_action.setIcon(self._ic_modify)
+            self.btn_action.setToolTip("Set a new allowance for the selected spender")
+            self.btn_action.setEnabled(has_leaf)
 
-    def _emit_modify(self) -> None:
-        r = self._selected_leaf()
-        if r is not None:
-            self.modify_requested.emit(r)
-
-    def _emit_revoke(self) -> None:
-        # Checked leaves win (a batch); otherwise fall back to the selected one.
-        rows = self.checked_leaves()
-        if not rows:
+    def _on_action_clicked(self) -> None:
+        if self._action_mode == "revoke":
+            rows = self.checked_leaves()
+            if rows:
+                self.revoke_requested.emit(rows)
+        else:
             r = self._selected_leaf()
-            if r is None:
-                return
-            rows = [r]
-        self.revoke_requested.emit(rows)
+            if r is not None:
+                self.modify_requested.emit(r)
 
     def _copy_spender(self) -> None:
         r = self._selected_leaf()

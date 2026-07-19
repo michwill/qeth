@@ -244,36 +244,24 @@ def test_copy_enabled_only_with_leaf_selected(qtbot):
 
 # --- commit 2: modify / revoke + optimistic updates -----------------------
 
-def test_modify_revoke_enabled_only_with_leaf(qtbot):
+def test_action_button_disabled_without_leaf(qtbot):
     p = _panel(qtbot)
     p.append_rows([_row()])
-    assert not p.btn_modify.isEnabled() and not p.btn_revoke.isEnabled()
-    p.tree.setCurrentItem(p.tree.topLevelItem(0).child(0))
-    assert p.btn_modify.isEnabled() and p.btn_revoke.isEnabled()
-    p.tree.setCurrentItem(p.tree.topLevelItem(0))      # token node
-    assert not p.btn_modify.isEnabled() and not p.btn_revoke.isEnabled()
+    assert not p.btn_action.isEnabled()                # nothing selected/checked
+    p.tree.setCurrentItem(p.tree.topLevelItem(0))      # token node, not a leaf
+    assert not p.btn_action.isEnabled()
 
 
-def test_modify_button_emits_selected_row(qtbot):
+def test_action_button_is_modify_for_selected_leaf(qtbot):
     p = _panel(qtbot)
     row = _row()
     p.append_rows([row])
     p.tree.setCurrentItem(p.tree.topLevelItem(0).child(0))
+    assert p.btn_action.isEnabled() and "Modify" in p.btn_action.text()
     got = []
     p.modify_requested.connect(got.append)
-    p.btn_modify.click()
+    p.btn_action.click()
     assert got == [row]
-
-
-def test_revoke_button_emits_selected_row_as_list(qtbot):
-    p = _panel(qtbot)
-    row = _row()
-    p.append_rows([row])
-    p.tree.setCurrentItem(p.tree.topLevelItem(0).child(0))
-    got = []
-    p.revoke_requested.connect(got.append)
-    p.btn_revoke.click()
-    assert got == [[row]]
 
 
 def test_mark_pending_disables_and_relabels(qtbot):
@@ -322,42 +310,44 @@ def test_check_token_selects_whole_subtree(qtbot):
     assert len(p.checked_leaves()) == 2
 
 
-def test_revoke_label_adapts_to_checked_count(qtbot):
+def test_action_button_morphs_to_revoke_on_check(qtbot):
     p = _panel(qtbot)
     p.append_rows([_row(spender=SP1), _row(spender=SP2)])
-    assert p.btn_revoke.text() == "&Revoke"
+    assert "Modify" in p.btn_action.text()                     # nothing checked
     p.tree.topLevelItem(0).child(0).setCheckState(0, Qt.CheckState.Checked)
-    assert p.btn_revoke.text() == "&Revoke (1)"
-    p.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
-    assert p.btn_revoke.text() == "&Revoke (2)"
+    assert p.btn_action.text() == "&Revoke (1)"
+    p.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)   # both
+    assert p.btn_action.text() == "&Revoke (2)"
 
 
-def test_revoke_button_emits_checked_batch(qtbot):
+def test_action_button_revoke_emits_checked_batch(qtbot):
     p = _panel(qtbot)
     p.append_rows([_row(spender=SP1), _row(spender=SP2)])
     p.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)   # both
     got = []
     p.revoke_requested.connect(got.append)
-    p.btn_revoke.click()
+    p.btn_action.click()
     assert len(got) == 1 and len(got[0]) == 2
 
 
-def test_revoke_button_falls_back_to_selection(qtbot):
+def test_checked_boxes_win_over_selection(qtbot):
+    # a checked box means "batch revoke" even if a different row is selected
     p = _panel(qtbot)
-    row = _row(spender=SP1)
-    p.append_rows([row, _row(spender=SP2)])           # nothing checked
-    p.tree.setCurrentItem(p.tree.topLevelItem(0).child(0))
+    p.append_rows([_row(spender=SP1), _row(spender=SP2)])
+    p.tree.topLevelItem(0).child(1).setCheckState(0, Qt.CheckState.Checked)  # check SP2
+    p.tree.setCurrentItem(p.tree.topLevelItem(0).child(0))                   # select SP1
+    assert p.btn_action.text() == "&Revoke (1)"
     got = []
     p.revoke_requested.connect(got.append)
-    p.btn_revoke.click()
-    assert got == [[row]]
+    p.btn_action.click()
+    assert [x.spender for x in got[0]] == [SP2]
 
 
 def test_append_does_not_leave_boxes_checked(qtbot):
     p = _panel(qtbot)
     p.append_rows([_row(spender=SP1), _row(spender=SP2)])
     assert p.checked_leaves() == []                   # populate starts unchecked
-    assert p.btn_revoke.text() == "&Revoke"
+    assert "Modify" in p.btn_action.text()
 
 
 # --- USD valuation + sorting + column sizing ------------------------------
