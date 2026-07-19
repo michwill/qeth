@@ -78,6 +78,20 @@ class TestFormatBalance:
         assert "×" not in out
         assert "⁰" not in out
 
+    @pytest.mark.parametrize("inp,expected", [
+        # float %g zero-pads single-digit exponents ("1e+06") — the pad must be
+        # stripped so it reads "10⁶", not "10⁰⁶".
+        (1e6,        "1 × 10⁶"),
+        (1.5e-9,     "1.5 × 10⁻⁹"),
+        (9.12e10,    "9.12 × 10¹⁰"),
+        # round values stay plain (a Decimal would go "1.5 × 10³" after
+        # normalize; float keeps it "1500").
+        (1500.0,     "1500"),
+        (5.0,        "5"),
+    ])
+    def test_float_input_clean_exponents(self, inp, expected):
+        assert format_balance(inp) == expected
+
 
 # --- format_usd ------------------------------------------------------------
 

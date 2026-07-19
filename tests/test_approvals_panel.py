@@ -47,9 +47,10 @@ def _panel(qtbot, host=None):
     return p
 
 
-def _row(token=TOKEN, spender=SP1, allowance=1, symbol="USDC", decimals=6):
+def _row(token=TOKEN, spender=SP1, allowance=1, symbol="USDC", decimals=6,
+         price_usd=None):
     return ApprovalRow(token=token, spender=spender, allowance=allowance,
-                       symbol=symbol, decimals=decimals)
+                       symbol=symbol, decimals=decimals, price_usd=price_usd)
 
 
 def test_spenders_group_under_one_token_node(qtbot):
@@ -57,7 +58,7 @@ def test_spenders_group_under_one_token_node(qtbot):
     p.append_rows([_row(spender=SP1), _row(spender=SP2)])
     assert p.tree.topLevelItemCount() == 1
     tok = p.tree.topLevelItem(0)
-    assert tok.text(0) == "USDC"
+    assert tok.text(0).startswith("USDC (0x") and tok.text(0).endswith(")")
     assert tok.childCount() == 2
 
 
@@ -349,3 +350,117 @@ def test_append_does_not_leave_boxes_checked(qtbot):
     p.append_rows([_row(spender=SP1), _row(spender=SP2)])
     assert p.checked_leaves() == []                   # populate starts unchecked
     assert p.btn_revoke.text() == "&Revoke"
+
+
+# --- USD valuation + sorting + column sizing ------------------------------
+
+from decimal import Decimal  # noqa: E402
+
+from qeth.formatting import short_addr  # noqa: E402
+from qeth.plugins.approvals import (  # noqa: E402
+    _allowance_cell, _row_sort_value, _row_usd,
+)
+
+
+def test_row_usd_finite_priced():
+    assert _row_usd(_row(allowance=5_000_000, decimals=6,
+                         price_usd=Decimal("1"))) == Decimal("5")
+
+
+def test_row_usd_none_when_unpriced():
+    assert _row_usd(_row(allowance=5_000_000, decimals=6, price_usd=None)) is None
+
+
+def test_row_usd_none_when_unlimited():
+    assert _row_usd(_row(allowance=_MAX, price_usd=Decimal("1"))) is None
+
+
+def test_row_sort_value_unlimited_is_inf():
+    assert _row_sort_value(_row(allowance=_MAX)) == float("inf")
+
+
+def test_row_sort_value_priced_is_usd():
+    assert _row_sort_value(_row(allowance=5_000_000, decimals=6,
+                                price_usd=Decimal("2"))) == 10.0
+
+
+def test_row_sort_value_unpriced_finite_is_zero():
+    assert _row_sort_value(_row(allowance=5_000_000, decimals=6,
+                                price_usd=None)) == 0.0
+
+
+def test_allowance_cell_appends_usd():
+    assert _allowance_cell(_row(allowance=5_000_000, decimals=6,
+                                price_usd=Decimal("1"))) == "5 · $5.00"
+
+
+def test_allowance_cell_unlimited_has_no_usd():
+    assert _allowance_cell(_row(allowance=_MAX, price_usd=Decimal("1"))) == "unlimited"
+
+
+def test_allowance_cell_unpriced_is_amount_only():
+    assert _allowance_cell(_row(allowance=5_000_000, decimals=6,
+                                price_usd=None)) == "5"
+
+
+def test_token_node_shows_symbol_and_short_address(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([_row(symbol="USDC")])
+    assert p.tree.topLevelItem(0).text(0) == f"USDC ({short_addr(TOKEN)})"
+
+
+def test_allowance_column_shows_usd(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([_row(allowance=5_000_000, decimals=6, price_usd=Decimal("1"))])
+    assert p.tree.topLevelItem(0).child(0).text(1) == "5 · $5.00"
+
+
+def test_stretch_last_section_is_off(qtbot):
+    p = _panel(qtbot)
+    assert p.tree.header().stretchLastSection() is False
+
+
+def test_sort_by_token_is_alphabetical_by_default(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([
+        _row(token=TOKEN2, symbol="ZRX", spender=SP1),
+        _row(token=TOKEN, symbol="AAVE", spender=SP1),
+    ])
+    assert p.tree.topLevelItem(0).text(0).startswith("AAVE")
+    assert p.tree.topLevelItem(1).text(0).startswith("ZRX")
+
+
+def test_sort_by_allowance_ranks_by_usd_exposure(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([
+        _row(token=TOKEN, symbol="LOW", spender=SP1,
+             allowance=1_000_000, decimals=6, price_usd=Decimal("1")),        # $1
+        _row(token=TOKEN2, symbol="HIGH", spender=SP1,
+             allowance=1_000_000_000, decimals=6, price_usd=Decimal("1")),    # $1000
+    ])
+    p._on_header_clicked(1)                    # sort by Allowance → highest first
+    assert p.tree.topLevelItem(0).text(0).startswith("HIGH")
+    assert p.tree.topLevelItem(1).text(0).startswith("LOW")
+
+
+def test_unlimited_sorts_to_top_by_allowance(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([
+        _row(token=TOKEN, symbol="FIN", spender=SP1,
+             allowance=1_000_000, decimals=6, price_usd=Decimal("1")),
+        _row(token=TOKEN2, symbol="INF", spender=SP1, allowance=_MAX),   # unlimited
+    ])
+    p._on_header_clicked(1)                    # by allowance, descending exposure
+    assert p.tree.topLevelItem(0).text(0).startswith("INF")   # ∞ exposure first
+
+
+def test_token_total_sums_spender_exposure(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([
+        _row(token=TOKEN, symbol="T", spender=SP1,
+             allowance=1_000_000, decimals=6, price_usd=Decimal("1")),   # $1
+        _row(token=TOKEN, symbol="T", spender=SP2,
+             allowance=3_000_000, decimals=6, price_usd=Decimal("1")),   # $3
+    ])
+    from qeth.plugins.approvals import _USD_SORT_ROLE
+    assert p.tree.topLevelItem(0).data(1, _USD_SORT_ROLE) == 4.0         # $1 + $3

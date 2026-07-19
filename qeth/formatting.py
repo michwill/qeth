@@ -14,23 +14,31 @@ from decimal import Decimal
 _SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
 
 
-def format_balance(value: Decimal) -> str:
+def format_balance(value: Decimal | float) -> str:
     """Format a token balance with up to 6 significant figures, replacing
     scientific notation's ``eNN`` suffix with typographic ``× 10ⁿ``.
+
+    Accepts a ``float`` as well as a ``Decimal``: a ``Decimal`` keeps its stored
+    trailing zeros through ``%g`` (``Decimal("1.5E+3")`` → ``"1.5e+3"``), so a
+    caller that wants the plain float rendering (``1500`` → ``"1500"``) can pass
+    ``float(value)`` — 6 sig figs is well within float precision.
 
     Examples::
 
         format_balance(Decimal("0.5"))                 -> "0.5"
         format_balance(Decimal("1234.5"))              -> "1234.5"
-        format_balance(Decimal("9.12e+10"))            -> "9.12 × 10¹⁰"
-        format_balance(Decimal("1.5e-9"))              -> "1.5 × 10⁻⁹"
+        format_balance(9.12e10)                        -> "9.12 × 10¹⁰"
+        format_balance(1.5e-9)                         -> "1.5 × 10⁻⁹"
     """
     s = f"{value:.6g}"
     if "e" not in s and "E" not in s:
         return s
     mantissa, _, exp = s.lower().partition("e")
-    exp = exp.lstrip("+")              # drop leading "+", keep "-"
-    return f"{mantissa} × 10{exp.translate(_SUPERSCRIPT)}"
+    # Normalise the exponent: drop the "+" and any zero-padding (float's %g emits
+    # "e+06", Decimal's "e+6"), keep a leading "-".
+    sign = "-" if exp.startswith("-") else ""
+    digits = exp.lstrip("+-").lstrip("0") or "0"
+    return f"{mantissa} × 10{(sign + digits).translate(_SUPERSCRIPT)}"
 
 
 def format_usd(value: Decimal) -> str:

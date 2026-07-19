@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 
 from ... import QULONGLONG
 from ...chain import EthClient
-from ...formatting import format_balance
+from ...formatting import format_balance, format_usd, short_addr
 from ...plugin import Plugin
 from ...token_metadata import TokenMetadataCache
 from ...transactions import (
@@ -39,12 +39,15 @@ from .discovery import ApprovalRow, approve_pairs_in, fetch_allowances
 from .revoke_queue import RevokeQueue
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from ...transactions import Transaction
 
 log = logging.getLogger(__name__)
 
 _ROW_ROLE = Qt.ItemDataRole.UserRole          # leaf: ApprovalRow
 _TOKEN_ROLE = Qt.ItemDataRole.UserRole + 1    # token node: token address (lower)
+_USD_SORT_ROLE = Qt.ItemDataRole.UserRole + 2  # float: USD exposure (∞ = unlimited)
 
 # At/above this an allowance reads as "unlimited" — the same threshold the
 # approve dialog's Unlimited toggle uses (2**255 is half the uint256 space,
@@ -63,9 +66,60 @@ def _format_allowance(raw: int, decimals: int) -> str:
         return "unlimited"
     from decimal import Decimal
     scaled = Decimal(raw) / (Decimal(10) ** decimals) if decimals > 0 else Decimal(raw)
-    # normalize() drops trailing zeros so format_balance's 6-sig-fig ``%g`` shows
-    # "9.12 × 10¹⁰", not "9.12000 × 10¹⁰" (a large int Decimal keeps its zeros).
-    return format_balance(scaled.normalize())
+    # Format via float so %g is clean in BOTH directions — a Decimal keeps its
+    # trailing zeros ("9.12000 × 10¹⁰") and turns round thousands scientific
+    # ("1.5 × 10³"); float gives "9.12 × 10¹⁰" and "1500". 6 sig figs fits float.
+    return format_balance(float(scaled))
+
+
+def _row_usd(r: ApprovalRow):
+    """USD value of the allowance cap (``amount × unit price``), or None for an
+    unlimited or unpriced allowance. Derived from ``allowance`` each call so it
+    stays correct after a reconcile edits the amount in place."""
+    if r.price_usd is None or r.allowance >= _UNLIMITED_MIN:
+        return None
+    from decimal import Decimal
+    scaled = (Decimal(r.allowance) / (Decimal(10) ** r.decimals)
+              if r.decimals > 0 else Decimal(r.allowance))
+    return scaled * r.price_usd
+
+
+def _row_sort_value(r: ApprovalRow) -> float:
+    """Numeric exposure key for sorting: unlimited outranks everything (∞), a
+    priced cap sorts by its USD value, an unpriced finite cap sorts as 0."""
+    if r.allowance >= _UNLIMITED_MIN:
+        return float("inf")
+    usd = _row_usd(r)
+    return float(usd) if usd is not None else 0.0
+
+
+def _allowance_cell(r: ApprovalRow) -> str:
+    """Allowance column text: the compact amount, plus the USD value when the
+    cap is finite and priced ("1,000,000 · $1,000,000.00")."""
+    amount = _format_allowance(r.allowance, r.decimals)
+    usd = _row_usd(r)
+    if usd is not None:
+        u = format_usd(usd)
+        if u:
+            return f"{amount} · {u}"
+    return amount
+
+
+class _ApprovalItem(QTreeWidgetItem):
+    """Tree item that sorts the Allowance column by a numeric USD role (stored in
+    ``_USD_SORT_ROLE``) instead of its display text, and the identity column by
+    casefolded text — the same trick the ENS tree uses for its expiry column."""
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, QTreeWidgetItem):
+            return NotImplemented
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+        if col == 1:
+            a = self.data(1, _USD_SORT_ROLE)
+            b = other.data(1, _USD_SORT_ROLE)
+            return (a if a is not None else 0.0) < (b if b is not None else 0.0)
+        return self.text(0).casefold() < other.text(0).casefold()
 
 
 # --- worker ---------------------------------------------------------------
@@ -84,7 +138,8 @@ class ScanWorker(QThread):
     MAX_ATTEMPTS = 3
 
     def __init__(self, chain, address: str, source, snapshot, metadata_cache,
-                 *, label_source=None, client_factory=None, parent=None):
+                 *, label_source=None, price_source=None, client_factory=None,
+                 parent=None):
         super().__init__(parent)
         self._chain = chain
         self._address = address
@@ -92,6 +147,8 @@ class ScanWorker(QThread):
         self._snapshot = list(snapshot)
         self._meta = metadata_cache
         self._label_source = label_source
+        self._price_source = price_source
+        self._priced: dict[str, Decimal | None] = {}   # token -> unit price (memo)
         self._client_factory = client_factory or EthClient
 
     def run(self) -> None:
@@ -188,6 +245,8 @@ class ScanWorker(QThread):
             except Exception:
                 log.debug("approvals metadata read failed", exc_info=True)
         labels = self._fetch_labels(cid, sorted({s for (_t, s) in found}))
+        finite = sorted({t for (t, _s), v in found.items() if v < _UNLIMITED_MIN})
+        prices = self._fetch_prices(finite)
         rows = []
         for (token, spender), value in found.items():
             m = self._meta.get(cid, token) or {}
@@ -195,8 +254,26 @@ class ScanWorker(QThread):
                 token=token, spender=to_checksum_address(spender), allowance=value,
                 symbol=m.get("symbol") or "", name=m.get("name") or "",
                 decimals=int(m.get("decimals") or 18),
-                spender_label=labels.get(spender, "")))
+                spender_label=labels.get(spender, ""),
+                price_usd=prices.get(token)))
         self.rows_ready.emit(cid, addr_l, rows)
+
+    def _fetch_prices(self, tokens: list[str]) -> dict[str, Decimal | None]:
+        """USD unit prices for ``tokens`` (memoized, so streaming batches don't
+        re-quote). Best-effort — an outage just leaves the caps unpriced."""
+        if self._price_source is None or not tokens:
+            return {}
+        need = [t for t in tokens if t not in self._priced]
+        if need:
+            quotes: dict = {}
+            try:
+                quotes = self._price_source.fetch(self._chain, need)
+            except Exception:
+                log.debug("approvals price fetch failed", exc_info=True)
+            for t in need:
+                q = quotes.get(t)
+                self._priced[t] = q.price_usd if q is not None else None
+        return {t: self._priced.get(t) for t in tokens}
 
     def _fetch_labels(self, cid: int, spenders: list[str]) -> dict[str, str]:
         """Keyless public name-tags for the spender contracts ("Uniswap:
@@ -263,6 +340,8 @@ class ApprovalsPanel(QWidget):
         self._host = host
         self._token_items: dict[str, QTreeWidgetItem] = {}
         self._hovered: QTreeWidgetItem | None = None
+        self._sort_col = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder    # token A→Z by default
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
 
@@ -285,8 +364,17 @@ class ApprovalsPanel(QWidget):
         self.tree.viewport().installEventFilter(self)
         self.tree.itemDoubleClicked.connect(self._on_double_clicked)
         hh = self.tree.header()
+        # QTreeView defaults stretchLastSection=True, which force-stretched the
+        # last (Allowance) column — stranding the amount with dead space no drag
+        # could reclaim. Off: Token/Spender stretches to fill (and absorbs the
+        # squeeze), Allowance fits its content but stays user-resizable.
+        hh.setStretchLastSection(False)
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionsClickable(True)
+        hh.setSortIndicatorShown(True)
+        hh.setSortIndicator(self._sort_col, self._sort_order)
+        hh.sectionClicked.connect(self._on_header_clicked)
         v.addWidget(self.tree, 1)
 
         self.status_lbl = QLabel("")
@@ -370,8 +458,9 @@ class ApprovalsPanel(QWidget):
         self.tree.blockSignals(True)                 # populate without churning buttons
         for r in rows:
             self._add_row(r)
-        self.tree.expandAll()
         self.tree.blockSignals(False)
+        self._apply_sort()                           # recompute sums, sort, expandAll
+        self.tree.resizeColumnToContents(1)          # allowance fits; identity absorbs
         self._update_buttons()
         self._refresh_reveal()
 
@@ -395,8 +484,9 @@ class ApprovalsPanel(QWidget):
         node = self._token_items.get(r.token)
         if node is not None:
             return node
-        node = QTreeWidgetItem(self.tree)
-        node.setText(0, r.symbol or (r.token[:10] + "…"))
+        node = _ApprovalItem(self.tree)
+        node.setText(0, f"{r.symbol} ({short_addr(r.token)})" if r.symbol
+                     else short_addr(r.token))
         node.setData(0, _TOKEN_ROLE, r.token)
         node.setToolTip(0, f"{r.name or r.symbol}\n{r.token}")
         node.setFlags(node.flags() | Qt.ItemFlag.ItemIsUserCheckable
@@ -417,14 +507,49 @@ class ApprovalsPanel(QWidget):
 
     def _add_row(self, r: ApprovalRow) -> None:
         parent = self._token_node(r)
-        leaf = QTreeWidgetItem(parent)
+        leaf = _ApprovalItem(parent)
         leaf.setText(0, self._leaf_text(r, reveal=False))
-        leaf.setText(1, _format_allowance(r.allowance, r.decimals))
+        leaf.setText(1, _allowance_cell(r))
+        leaf.setData(1, _USD_SORT_ROLE, _row_sort_value(r))
         leaf.setToolTip(0, f"{r.spender_label}\n{r.spender}"
                         if r.spender_label else r.spender)
         leaf.setData(0, _ROW_ROLE, r)
         leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         leaf.setCheckState(0, Qt.CheckState.Unchecked)
+
+    # --- sorting (manual: live setSortingEnabled would re-sort on hover) ---
+    def _on_header_clicked(self, col: int) -> None:
+        if col == self._sort_col:
+            self._sort_order = (
+                Qt.SortOrder.DescendingOrder
+                if self._sort_order == Qt.SortOrder.AscendingOrder
+                else Qt.SortOrder.AscendingOrder)
+        else:
+            self._sort_col = col
+            # Allowance defaults to highest-exposure-first; identity to A→Z.
+            self._sort_order = (Qt.SortOrder.DescendingOrder if col == 1
+                                else Qt.SortOrder.AscendingOrder)
+        self._apply_sort()
+
+    def _apply_sort(self) -> None:
+        self._recompute_token_totals()
+        self.tree.header().setSortIndicator(self._sort_col, self._sort_order)
+        self.tree.sortItems(self._sort_col, self._sort_order)
+        self.tree.expandAll()
+
+    def _recompute_token_totals(self) -> None:
+        """Each token node's Allowance-sort key = the summed USD exposure of its
+        spenders (∞ if any is unlimited), so sorting by allowance ranks tokens by
+        total exposure."""
+        for ti in range(self.tree.topLevelItemCount()):
+            node = self.tree.topLevelItem(ti)
+            if node is None:
+                continue
+            total = 0.0
+            for ci in range(node.childCount()):
+                v = node.child(ci).data(1, _USD_SORT_ROLE)
+                total += float(v) if v is not None else 0.0
+            node.setData(1, _USD_SORT_ROLE, total)
 
     # --- hover / selection address reveal ---------------------------------
     def _on_item_entered(self, item: QTreeWidgetItem, column: int) -> None:
@@ -515,7 +640,8 @@ class ApprovalsPanel(QWidget):
         r = leaf.data(0, _ROW_ROLE)
         if isinstance(r, ApprovalRow):
             r.allowance = value
-            leaf.setText(1, _format_allowance(value, r.decimals))
+            leaf.setText(1, _allowance_cell(r))
+            leaf.setData(1, _USD_SORT_ROLE, _row_sort_value(r))
         leaf.setDisabled(False)
 
     def remove_leaf(self, token: str, spender: str) -> None:
@@ -652,6 +778,12 @@ class ApprovalsPlugin(Plugin):
         # Keyless: spender name-tags come from the free Blockscout metadata
         # service (fetch_labels needs no Etherscan key).
         self._label_source = ContractIdentitySource(lambda: None)
+        from ...pricing import (
+            ChainedPriceSource, DefiLlamaPrices, OnChainVaultPrices,
+        )
+        # USD valuation of finite allowances — DefiLlama (keyless) first, then
+        # on-chain for vault/LP shares it can't quote (mirrors the Tokens tab).
+        self._price_source = ChainedPriceSource(DefiLlamaPrices(), OnChainVaultPrices())
         self._workers: set[QThread] = set()
         self._scan: ScanWorker | None = None
         self._queue: RevokeQueue | None = None
@@ -841,7 +973,8 @@ class ApprovalsPlugin(Plugin):
         self._panel.begin_scan()
         snapshot = self._disk_cache.load(chain.chain_id, addr) or []
         worker = ScanWorker(chain, addr, self._source, snapshot, self._metadata,
-                            label_source=self._label_source)
+                            label_source=self._label_source,
+                            price_source=self._price_source)
         worker.batch_fetched.connect(self._on_batch)
         worker.rows_ready.connect(
             lambda c, a, rows, e=epoch: self._on_rows(c, a, rows, e))

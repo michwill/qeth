@@ -175,3 +175,55 @@ def test_discovered_approve_pair_becomes_a_row(monkeypatch):
     assert (TOKEN.lower(), SPENDER.lower()) in seen["pairs"]
     rows = [r for batch in got["rows"] for r in batch]
     assert any(r.token == TOKEN.lower() and r.allowance == 42 for r in rows)
+
+
+class _FakePrices:
+    def __init__(self, unit):
+        from decimal import Decimal
+        self._unit = Decimal(unit)
+        self.calls = []
+
+    def fetch(self, chain, contracts, include_native=False):
+        from qeth.pricing import Price
+        self.calls.append(list(contracts))
+        return {t: Price(self._unit, 0, "fake") for t in contracts}
+
+
+def test_price_source_sets_unit_price_on_finite_rows(monkeypatch):
+    from decimal import Decimal
+    monkeypatch.setattr(ap, "fetch_allowances",
+                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, 5_000_000))
+    monkeypatch.setattr(ap, "_is_full_history", lambda txs: True)
+    prices = _FakePrices("2")
+    w = ScanWorker(CHAIN, A, _FakeSource([]), [_tx(0, 100, _approve(SPENDER))],
+                   _FakeMeta(), price_source=prices, client_factory=_FakeClient)
+    got = _run(w)
+    assert got["rows"][0][0].price_usd == Decimal("2")
+    assert prices.calls == [[TOKEN.lower()]]        # priced the finite token
+
+
+def test_unlimited_allowance_is_not_priced(monkeypatch):
+    monkeypatch.setattr(ap, "fetch_allowances",
+                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, (1 << 256) - 1))
+    monkeypatch.setattr(ap, "_is_full_history", lambda txs: True)
+    prices = _FakePrices("2")
+    w = ScanWorker(CHAIN, A, _FakeSource([]), [_tx(0, 100, _approve(SPENDER))],
+                   _FakeMeta(), price_source=prices, client_factory=_FakeClient)
+    got = _run(w)
+    assert got["rows"][0][0].price_usd is None
+    assert prices.calls == []                        # no quote for an all-unlimited token
+
+
+def test_price_source_failure_leaves_rows_unpriced(monkeypatch):
+    class _Boom:
+        def fetch(self, chain, contracts, include_native=False):
+            raise RuntimeError("defillama down")
+
+    monkeypatch.setattr(ap, "fetch_allowances",
+                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, 5_000_000))
+    monkeypatch.setattr(ap, "_is_full_history", lambda txs: True)
+    w = ScanWorker(CHAIN, A, _FakeSource([]), [_tx(0, 100, _approve(SPENDER))],
+                   _FakeMeta(), price_source=_Boom(), client_factory=_FakeClient)
+    got = _run(w)
+    assert got["rows"][0][0].price_usd is None
+    assert got["done"] == [True]

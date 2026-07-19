@@ -21,6 +21,7 @@ from ...chain import _decode_uint256
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from decimal import Decimal
 
     from ...chain import EthClient
     from ...transactions import Transaction
@@ -40,6 +41,9 @@ class ApprovalRow:
     name: str = ""
     decimals: int = 18
     spender_label: str = ""   # "Uniswap: Router" etc., "" when unknown
+    price_usd: Decimal | None = None   # USD per whole token; None = unpriced
+    # (the USD *value* of the cap is derived: allowance/10**decimals * price_usd,
+    # so it stays correct after a reconcile changes `allowance` in place)
 
 
 def _pad_address(addr: str) -> bytes:
