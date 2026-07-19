@@ -2397,8 +2397,38 @@ class EnsPlugin(Plugin):
             if nl not in have and nl not in self._denied:
                 names.append(pending)
         names = self._with_cross_account_subdomains(names)
+        names = self._fill_intermediate_ancestors(names)
         self._names_by_l = {n.name.lower(): n for n in names}
         self._panel.populate(build_tree(names), int(time.time()))
+
+    @staticmethod
+    def _fill_intermediate_ancestors(names: list[EnsName]) -> list[EnsName]:
+        """Synthesise any MISSING intermediate ancestor of a surfaced name — up
+        to its nearest ancestor that IS present — so build_tree can nest a deep
+        subname instead of orphaning it at the top level.
+
+        On a fresh run a deep name you own (``wbtc.oracles-ll.yieldbasis.eth``)
+        can surface before its cross-account parent (``oracles-ll.yieldbasis.eth``,
+        held by another account whose cache isn't loaded yet). build_tree only
+        nests a name whose immediate parent is in the set, so the grandchild
+        would sit detached from ``yieldbasis.eth`` until that account is visited.
+        Bridge the gap with placeholder ``subnode`` rows (verified + given their
+        manager row like any other surfaced subnode). Only bridges when a present
+        ancestor exists above the gap — a name with no present ancestor stays a
+        root (there's nothing to attach it to)."""
+        have = {n.name.lower() for n in names}
+        extra: dict[str, EnsName] = {}
+        for n in names:
+            cur = n.parent
+            chain: list[str] = []
+            while (cur is not None and cur.lower() not in have
+                   and cur.lower() not in extra):
+                chain.append(cur)
+                cur = EnsName(cur).parent
+            if cur is not None:            # reached a present ancestor → bridge
+                for nm in chain:
+                    extra.setdefault(nm.lower(), EnsName(nm, source="subnode"))
+        return names + list(extra.values())
 
     # --- verification (batched, Helios) -----------------------------------
 

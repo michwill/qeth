@@ -1477,6 +1477,34 @@ class TestEnsWriteActions:
             start_worker=start_worker or (lambda w: None),
             identity_source=None, identity_cache=None, tx_cache=None)
 
+    def test_deep_subname_nests_via_synthesized_intermediate(self, qtbot):
+        # A deep name you own can surface before its cross-account intermediate
+        # parent (held by another account whose cache isn't loaded yet). Render
+        # must synthesize the missing middle so the grandchild nests under the
+        # owned 2LD, not orphan at the top level.
+        plugin, host, store = self._plugin(qtbot, owned=("yieldbasis.eth",))
+        plugin._render([
+            EnsName("yieldbasis.eth"),
+            EnsName("wbtc.oracles-ll.yieldbasis.eth", source="owned"),
+        ])
+        idx = plugin.widget()._items_by_name
+        assert "oracles-ll.yieldbasis.eth" in plugin._names_by_l   # synthesized
+        assert "oracles-ll.yieldbasis.eth" in idx
+        # nested: yieldbasis.eth > oracles-ll… > wbtc…
+        assert idx["wbtc.oracles-ll.yieldbasis.eth"].parent() \
+            is idx["oracles-ll.yieldbasis.eth"]
+        assert idx["oracles-ll.yieldbasis.eth"].parent() is idx["yieldbasis.eth"]
+        assert idx["yieldbasis.eth"].parent() is None              # 2LD at top
+
+    def test_deep_name_with_no_present_ancestor_stays_root(self, qtbot):
+        # No owned/present ancestor to attach to → don't synthesize a floating
+        # chain; the name stays a root.
+        plugin, host, store = self._plugin(qtbot, owned=("yieldbasis.eth",))
+        plugin._render([EnsName("yieldbasis.eth"),
+                        EnsName("x.y.stranger.eth", source="owned")])
+        assert "y.stranger.eth" not in plugin._names_by_l
+        assert "stranger.eth" not in plugin._names_by_l
+
     def test_cross_account_subdomain_surfaced_from_cache(self, qtbot, tmp_path):
         from qeth.ens_app import EnsCache
         from qeth.plugins.ens import ENS_CHAIN_ID
