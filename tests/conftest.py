@@ -115,6 +115,43 @@ def tmp_qeth(tmp_path, monkeypatch) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _dispose_transactions_plugins(monkeypatch):
+    """Shut down every ``TransactionsPlugin`` a test builds.
+
+    ``attach()`` starts two plugin-owned QTimers — the 10s pending-tx sweep
+    and the 30s external-nonce poll — but ``qtbot.addWidget`` disposes only the
+    plugin's *widget*, never the plugin QObject or its timers. Left ticking on
+    the process-wide QApplication they fire on a LATER test's event loop and
+    call back into the plugin's host — which some tests reassign
+    ``start_worker`` on to run a worker's ``run()`` inline — so a network
+    worker executes on an unrelated test's main thread. That cross-test
+    contamination is what intermittently crashed the suite (the flaky
+    ``test_scroll_loads_older_via_block_cursor`` teardown).
+
+    Wrapping ``__init__`` catches all construction sites (no per-test opt-in)
+    and ``shutdown()`` is idempotent, so a test / MainWindow that already tore
+    the plugin down is harmless to shut down again. The test module is already
+    imported at collection, so the wrap is a plain attribute swap — no extra
+    Qt import cost for non-UI tests."""
+    from qeth.plugins.transactions import TransactionsPlugin
+
+    built: list[TransactionsPlugin] = []
+    orig_init = TransactionsPlugin.__init__
+
+    def _tracking_init(self, *a, **k):
+        orig_init(self, *a, **k)
+        built.append(self)
+
+    monkeypatch.setattr(TransactionsPlugin, "__init__", _tracking_init)
+    yield
+    for plugin in built:
+        try:
+            plugin.shutdown()
+        except RuntimeError:
+            pass          # C++ side already gone
+
+
 class _FakeRpc:
     """Stand-in for qeth.rpc.RpcServer in UI tests. Doesn't bind a
     socket — MainWindow only reads ``host``/``port``/``error`` and

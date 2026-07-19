@@ -660,6 +660,14 @@ class MainWindow(QMainWindow):
         still running when Qt destroys its QThread — that aborts (SIGABRT). They
         self-evict via ``finished``, but at quit there's no event loop left to
         run that, so we join explicitly here."""
+        # Silence the plugins' long-lived poll timers / ws watchers first, so
+        # nothing kicks a fresh worker while we're draining the in-flight ones.
+        for plugin in (self.wallets_plugin, self.tokens_plugin,
+                       self.transactions_plugin):
+            try:
+                plugin.shutdown()
+            except RuntimeError:
+                pass          # C++ side already gone
         import time as _t
         deadline = _t.monotonic() + self._SHUTDOWN_JOIN_S
         for w in list(self._active_workers):

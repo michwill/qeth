@@ -1156,6 +1156,23 @@ class TransactionsPlugin(Plugin):
                 self._abi_source, "set_storage_reader"):
             self._abi_source.set_storage_reader(self._abi_read_storage)
 
+    def shutdown(self) -> None:
+        """Stop the long-lived background machinery ``attach`` started: the
+        pending-tx sweep (a QObject wrapping a 10s QTimer), the 30s
+        external-nonce poll timer, and the ws live watcher (which joins its
+        asyncio thread). Idempotent and safe before ``attach``. In-flight
+        worker QThreads are joined by the host's aboutToQuit handler; here we
+        just silence the timers so they can't kick fresh ones. Load-bearing for
+        tests too — a plugin built in a test but never shut down leaves these
+        timers ticking on the shared QApplication, where they later fire on an
+        unrelated test's event loop."""
+        if self._pending_watcher is not None:
+            self._pending_watcher.stop()
+        if self._nonce_timer is not None:
+            self._nonce_timer.stop()
+        if self._live_watcher is not None:
+            self._live_watcher.stop()
+
     # --- ws live watcher wiring -------------------------------------------
 
     def _live_chains_provider(self) -> list[Any]:

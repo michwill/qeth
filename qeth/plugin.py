@@ -127,6 +127,13 @@ class Plugin(QObject):
         """Fires when this plugin becomes the active tab.
         Useful for lazy data loading."""
 
+    def shutdown(self) -> None:
+        """Teardown counterpart to ``attach``: stop any long-lived background
+        machinery the plugin started (poll timers, ws watchers, …). Called by
+        the host at app close. Default no-op — a plugin with nothing running
+        needn't override it. Must be idempotent and safe to call before
+        ``attach`` (or when ``attach`` was never reached)."""
+
 
 class Slot(QWidget):
     """A column that hosts one or more plugins.

@@ -267,10 +267,12 @@ class EnsTreeMachine(RuleBasedStateMachine):
 
 
 TestEnsTree = EnsTreeMachine.TestCase
-# Kept deliberately modest: each example builds+destroys a real ENS-plugin widget
-# tree, and heavy Qt churn here shifts timing enough to tip a pre-existing flaky
-# QThread-teardown test elsewhere into a crash under the full suite. 40×20 still
-# explores a lot of event orderings while staying a light citizen.
+# 80×25 explores a broad spread of event orderings. Each example builds and
+# destroys a real ENS-plugin widget tree, so this used to have to stay tiny: the
+# Qt churn tipped a pre-existing flaky TransactionsPlugin teardown into a crash
+# under the full suite. That leak is fixed at its source now (the plugin's poll
+# timers are shut down in teardown — see conftest._dispose_transactions_plugins),
+# so the fuzzer is free to be thorough; the ceiling here is just suite wall-clock.
 TestEnsTree.settings = settings(
-    max_examples=40, stateful_step_count=20, deadline=None,
+    max_examples=80, stateful_step_count=25, deadline=None,
     suppress_health_check=[HealthCheck.too_slow])
