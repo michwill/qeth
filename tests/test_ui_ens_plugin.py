@@ -2736,6 +2736,30 @@ class TestEnsWriteActions:
             ["bytes32", "string", "address", "uint32", "uint64"],
             [namehash("vitalik.eth"), "blog", self.OTHER, 0, 0]).hex()
 
+    def test_reassigned_subnode_stays_visible_via_pending(self, qtbot):
+        # Handing a subnode you own the PARENT of to another address must keep it
+        # in the tree — you can still manage it — but the rediscover right after
+        # would drop it (no longer owned by you; the new owner's cache isn't
+        # refreshed yet). So it's held in the pending merge.
+        plugin, host, store = self._plugin(qtbot, owned=("vitalik.eth",))
+        plugin._names_by_l["blog.vitalik.eth"] = EnsName(
+            "blog.vitalik.eth", source="subnode")
+        plugin._controller.add("vitalik.eth")            # we control the parent
+        other = "0x" + "a3" * 20
+        plugin._apply_set_manager("blog.vitalik.eth", {"manager": other})
+        pend = plugin._pending_adds.get("blog.vitalik.eth")
+        assert pend is not None and pend.is_subdomain and pend.source == "subnode"
+        # a rediscover whose result omits the subnode still keeps it visible
+        plugin._render([EnsName("vitalik.eth")])
+        assert "blog.vitalik.eth" in plugin._names_by_l
+
+    def test_reassigned_2ld_is_not_held_pending(self, qtbot):
+        # Guard: only a subnode-under-an-owned-parent is held; a 2LD isn't.
+        plugin, host, store = self._plugin(qtbot, owned=("vitalik.eth",))
+        plugin._names_by_l["vitalik.eth"] = EnsName("vitalik.eth")
+        plugin._apply_set_manager("vitalik.eth", {"manager": "0x" + "a3" * 20})
+        assert "vitalik.eth" not in plugin._pending_adds
+
 
 # --- EnsPlugin: name-row resolution follows the head address read ----------
 

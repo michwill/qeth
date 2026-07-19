@@ -2989,8 +2989,20 @@ class EnsPlugin(Plugin):
     def _apply_set_manager(self, name: str, changed: dict[str, str],
                            block: int | None = None) -> None:
         mgr = changed.get("manager")
-        if mgr and self._panel is not None:
-            self._panel.apply_role(name, controller=mgr, block=block)
+        if not mgr or self._panel is None:
+            return
+        self._panel.apply_role(name, controller=mgr, block=block)
+        # A subnode whose PARENT you control stays visible even after you hand it
+        # to another address (you own the parent, so you can still manage it).
+        # Keep it in the pending merge so the rediscover kicked right after this
+        # write doesn't drop it: it's no longer owned by this account, and the
+        # new owner's cache isn't refreshed yet, so _with_cross_account_subdomains
+        # can't float it either. Self-drops once discovery returns it.
+        cur = self._names_by_l.get(name.lower())
+        parent = (cur.parent or "").lower() if cur is not None else ""
+        if cur is not None and cur.is_subdomain and parent in self._controller:
+            self._pending_adds[name.lower()] = EnsName(
+                name, owner=mgr, source="subnode")
 
     # --- op construction ---------------------------------------------------
 
