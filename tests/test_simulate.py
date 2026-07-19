@@ -288,6 +288,15 @@ def test_rpc_reader_prefetch_failure_is_silent(monkeypatch):
             return "0x6001" if method == "eth_getCode" else "0x1"
 
     monkeypatch.setattr("qeth.chain.EthClient", _NoAccessList)
+    # prefetch's batch seeding POSTs to chain.rpc_url via urllib directly
+    # (bypassing EthClient) — inject the failure rather than relying on
+    # rpc.example's DNS to NXDOMAIN for real.
+    import urllib.request
+
+    def _down(*a, **k):
+        raise OSError("unreachable (test)")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _down)
     reader = RpcStateReader(
         SimpleNamespace(chain_id=1, rpc_url="https://rpc.example"), "0x10")
     reader.prefetch(from_addr=FROM, to_addr=USDC, data="0xdead", value=0)

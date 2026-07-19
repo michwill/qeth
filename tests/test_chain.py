@@ -236,7 +236,11 @@ class TestMulticallContextManager:
     def test_value_unreadable_before_exit(self, eth_client, monkeypatch):
         token = "0x" + "a" * 40
         holder = "0x" + "b" * 40
-        # Don't patch — won't be flushed mid-context anyway
+        # The exit DOES flush (one real call), so patch it like the siblings —
+        # the pre-exit assertions are what this test is about.
+        response = _aggregate3_response([(True, (1).to_bytes(32, "big"))])
+        monkeypatch.setattr(eth_client, "call",
+                            lambda tx, block="latest": response)
         with eth_client.multicall() as mc:
             p = mc.balance_of(token, holder)
             assert p.success is None    # not yet flushed

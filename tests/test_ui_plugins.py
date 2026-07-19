@@ -1024,11 +1024,21 @@ class TestTransactionsPlugin:
         plugin.on_activated()
         assert plugin.widget().table.rowCount() == first_count
 
-    def test_scroll_loads_older_via_block_cursor(self, qtbot, tmp_qeth):
+    def test_scroll_loads_older_via_block_cursor(self, qtbot, tmp_qeth,
+                                                 monkeypatch):
         """Older history loads on scroll via the endblock cursor (page
         stays 1, no page × offset cap). The cursor walks down from the
         oldest loaded block until it reaches the start of history."""
+        from qeth.plugins.transactions import (
+            NonceCheckWorker, ReceiptScanWorker, TxActivityWorker)
         from qeth.transactions_cache import TransactionCache
+
+        # The _start wrapper below runs EVERY spawned worker inline — and the
+        # refresh path kicks network followers beyond the paging under test:
+        # an immediate external-nonce check plus per-page activity/receipt
+        # scans, each a real RPC/explorer roundtrip on the main thread.
+        for cls in (NonceCheckWorker, TxActivityWorker, ReceiptScanWorker):
+            monkeypatch.setattr(cls, "run", lambda self: None)
 
         def _mk(n: int) -> Transaction:
             return Transaction(

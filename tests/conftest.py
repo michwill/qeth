@@ -17,6 +17,7 @@ enough.
 import atexit
 import os
 import shutil
+import socket
 import tempfile
 from pathlib import Path
 
@@ -83,6 +84,87 @@ if _dotenv.exists():
             os.environ.setdefault(_key.strip(), _val.strip())
 
 
+# --- hermeticity guard: no remote network from non-`network` tests ---------
+#
+# The suite's hermeticity used to rest on an allowlist (hermetic_mainwindow's
+# per-worker-class run() noops) — and allowlists drift: EnsTextKeysWorker was
+# added without a noop, so every MainWindow test spawned a real Blockscout
+# txlist scan for a real high-activity address. Those threads outlived their
+# tests by whole FILES, and a GC pass inside one of them segfaulted the suite.
+# This guard turns that class of leak into a deterministic same-test failure:
+# any non-loopback connect from a test not marked `network` is refused and
+# reported at that test's teardown. Loopback stays open (the RPC-server tests
+# bind 127.0.0.1), as do AF_UNIX sockets (Qt/dbus internals).
+#
+# Enforcement is at socket level so it covers urllib, aiohttp, websockets and
+# anything else in the Python stack; create_connection is wrapped too because
+# it still sees the *hostname* (connect only sees the resolved IP).
+
+_net_allowed = False
+_net_blocked: list[str] = []
+
+_real_sock_connect = socket.socket.connect
+_real_sock_connect_ex = socket.socket.connect_ex
+_real_create_connection = socket.create_connection
+
+
+def _is_local(address) -> bool:
+    if isinstance(address, (str, bytes)):        # AF_UNIX path
+        return True
+    host = address[0] if isinstance(address, tuple) and address else ""
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    return (host in ("localhost", "::1", "")
+            or host.startswith("127.") or host.startswith("::ffff:127."))
+
+
+def _refuse(address) -> None:
+    _net_blocked.append(repr(address))
+    raise OSError(
+        f"hermetic-test network guard: remote connect to {address!r} refused "
+        f"(mark the test with @pytest.mark.network, or stub the worker)")
+
+
+def _guarded_connect(self, address):
+    if not _net_allowed and not _is_local(address):
+        _refuse(address)
+    return _real_sock_connect(self, address)
+
+
+def _guarded_connect_ex(self, address):
+    if not _net_allowed and not _is_local(address):
+        _refuse(address)
+    return _real_sock_connect_ex(self, address)
+
+
+def _guarded_create_connection(address, *args, **kwargs):
+    if not _net_allowed and not _is_local(address):
+        _refuse(address)
+    return _real_create_connection(address, *args, **kwargs)
+
+
+socket.socket.connect = _guarded_connect          # type: ignore[method-assign, assignment]
+socket.socket.connect_ex = _guarded_connect_ex    # type: ignore[method-assign, assignment]
+socket.create_connection = _guarded_create_connection
+
+
+@pytest.fixture(autouse=True)
+def _network_guard(request):
+    """Per-test switch for the socket guard above + loud teardown report."""
+    global _net_allowed
+    _net_allowed = request.node.get_closest_marker("network") is not None
+    _net_blocked.clear()
+    yield
+    _net_allowed = False
+    if _net_blocked:
+        attempts = list(dict.fromkeys(_net_blocked))
+        _net_blocked.clear()
+        pytest.fail(
+            "remote network attempted from a non-`network` test (spawned by "
+            "this test, or leaked from an earlier one's background thread): "
+            + ", ".join(attempts[:8]))
+
+
 @pytest.fixture
 def tmp_qeth(tmp_path, monkeypatch) -> Path:
     """Redirect all qeth on-disk locations under ``tmp_path``."""
@@ -93,6 +175,7 @@ def tmp_qeth(tmp_path, monkeypatch) -> Path:
     import qeth.store
     import qeth.token_metadata
     import qeth.token_discovery.tokenlists
+    import qeth.token_discovery.toptokens
     import qeth.transactions_cache
     import qeth.wallet_cache
     import qeth.risk
@@ -103,6 +186,8 @@ def tmp_qeth(tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr(qeth.token_metadata, "CACHE_DIR", tmp_path / "token_metadata")
     monkeypatch.setattr(qeth.token_discovery.tokenlists, "CACHE_DIR",
                         tmp_path / "tokenlists")
+    monkeypatch.setattr(qeth.token_discovery.toptokens, "CACHE_DIR",
+                        tmp_path / "toptokens")
     monkeypatch.setattr(qeth.risk, "CACHE_DIR", tmp_path / "risk")
     monkeypatch.setattr(qeth.transactions_cache, "CACHE_DIR",
                         tmp_path / "transactions")
@@ -198,12 +283,13 @@ def hermetic_mainwindow(monkeypatch):
 
     for mod, cls_names in (
         (tokens_plugin, [
-            "TokenListsLoader", "TokenListWorker", "BalanceWorker",
-            "PricesWorker", "RiskWorker", "MetadataWorker",
+            "TokenListsLoader", "TopTokensLoader", "TokenListWorker",
+            "BalanceWorker", "PricesWorker", "RiskWorker", "MetadataWorker",
             "OwnTokenDiscoveryWorker",
         ]),
         (transactions_plugin, ["TransactionsWorker"]),
-        (ens_plugin, ["EnsNamesWorker", "EnsRecordsWorker", "EnsVerifyWorker"]),
+        (ens_plugin, ["EnsNamesWorker", "EnsRecordsWorker", "EnsVerifyWorker",
+                      "EnsTextKeysWorker"]),
     ):
         for cls_name in cls_names:
             cls = getattr(mod, cls_name, None)

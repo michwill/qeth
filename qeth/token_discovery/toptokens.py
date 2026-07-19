@@ -50,6 +50,8 @@ COINGECKO_PLATFORMS: dict[int, str] = {
 _MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 _LIST_URL = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
 _DEFAULT_TTL_S = 7 * 86400.0  # weekly; the top of the mcap table barely churns
+# Module-level so tests can redirect it (tmp_qeth), same as tokenlists.CACHE_DIR.
+CACHE_DIR = Path.home() / ".qeth" / "toptokens"
 
 FetchFn = Callable[[list[int], int, float], "dict[int, list[TopToken]]"]
 
@@ -169,7 +171,7 @@ class TopTokens:
         clock: Callable[[], float] = time.time,
         fetch: FetchFn = fetch_top_tokens,
     ):
-        self._cache_dir = cache_dir or (Path.home() / ".qeth" / "toptokens")
+        self._cache_dir = cache_dir if cache_dir is not None else CACHE_DIR
         self._seed_path = seed_path or (
             Path(__file__).resolve().parent / "data" / "top_tokens.json")
         self._ttl = ttl_seconds

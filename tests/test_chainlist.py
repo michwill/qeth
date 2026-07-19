@@ -129,16 +129,20 @@ class TestPickerIndication:
         assert a.index("https://x") == b.index("https://x")
 
     def test_simv1_endpoints_sort_first(self, qtbot, tmp_qeth, monkeypatch):
-        from qeth.chain_rpc_dialog import ChainRpcDialog, _ChainlistLoader
+        from qeth.chain_rpc_dialog import (
+            ChainRpcDialog, _ChainlistLoader, _UrlProbeWorker)
         from qeth.chains import DEFAULT_CHAINS
         from PySide6.QtCore import Qt
-        # Stop the dialog's constructor from spawning the live-probe thread:
+        # Stop the dialog's constructor from spawning the live-probe threads:
         # this test drives the sort/render path directly via _results +
         # _on_probing_done. The loader is DETACHED (parented to the
         # QApplication so the dialog can close instantly), so a real probe
         # run would hit the network for all 16 RPCs and — still in flight at
         # interpreter shutdown — hang the process joining it. No-op start().
+        # The constructor also kicks a _UrlProbeWorker at the pre-filled
+        # current RPC — same treatment.
         monkeypatch.setattr(_ChainlistLoader, "start", lambda self: None)
+        monkeypatch.setattr(_UrlProbeWorker, "start", lambda self: None)
         dlg = ChainRpcDialog(DEFAULT_CHAINS[0])
         qtbot.addWidget(dlg)
         # A fast endpoint without simV1 and a slower one with it: the
