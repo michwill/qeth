@@ -11,8 +11,9 @@ The base ``Plugin``, ``Slot``, and ``Host`` types live in
 outside this package.
 """
 
+from .ens import EnsPlugin
 from .tokens import TokensPlugin
 from .transactions import TransactionsPlugin
 from .wallets import WalletsPlugin
 
-__all__ = ["TokensPlugin", "TransactionsPlugin", "WalletsPlugin"]
+__all__ = ["EnsPlugin", "TokensPlugin", "TransactionsPlugin", "WalletsPlugin"]

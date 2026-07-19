@@ -144,9 +144,11 @@ def test_floor_includes_the_sent_tokens_balance_block():
     from types import SimpleNamespace
     token = "0x" + "ab" * 20
     plug = _plugin_with_cache([_tx(100)])          # our last sent tx at 100
-    plug.host = SimpleNamespace(tokens_plugin=SimpleNamespace(
+    _tokens = SimpleNamespace(
         last_balance_block=lambda cid, addr, tok:
-        150 if tok.lower() == token.lower() else None))
+        150 if tok.lower() == token.lower() else None)
+    plug.host = SimpleNamespace(
+        plugin=lambda pid: _tokens if pid == "tokens" else None)
     # sim_target is the token contract (an ERC-20 transfer's `to`).
     assert plug.fork_floor_block(1, ADDR, token) == 150
     # A target we hold no stamp for → floor unaffected (stays our tx block).
@@ -161,8 +163,9 @@ def test_pending_sentinel_beats_the_token_block():
     from types import SimpleNamespace
     token = "0x" + "ab" * 20
     plug = _plugin_with_cache([_tx(0, pending=True)])
-    plug.host = SimpleNamespace(tokens_plugin=SimpleNamespace(
-        last_balance_block=lambda cid, addr, tok: 150))
+    _tokens = SimpleNamespace(last_balance_block=lambda cid, addr, tok: 150)
+    plug.host = SimpleNamespace(
+        plugin=lambda pid: _tokens if pid == "tokens" else None)
     assert plug.fork_floor_block(1, ADDR, token) == _FORK_FLOOR_HEAD
 
 

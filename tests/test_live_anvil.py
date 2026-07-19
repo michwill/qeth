@@ -237,7 +237,7 @@ def _make_tokens_plugin(anvil, tmp_qeth):
         selected_address=ACCT.lower(),
         current_chain=lambda: anvil.chain,
         start_worker=start_worker,
-        tokens_plugin=None,
+        plugin=lambda pid: None,
     )
     return tp, panel, workers
 

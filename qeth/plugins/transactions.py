@@ -1257,7 +1257,7 @@ class TransactionsPlugin(Plugin):
         and the floor is unaffected."""
         if not sim_target:
             return None
-        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        tokens = self.host.plugin("tokens") if self.host else None
         getter = getattr(tokens, "last_balance_block", None)
         return getter(chain_id, address, sim_target) if callable(getter) else None
 
@@ -1276,7 +1276,7 @@ class TransactionsPlugin(Plugin):
 
     def _on_ws_link_state(self, chain, connected: bool) -> None:
         log.debug("ws %s: %s", chain.name, "up" if connected else "down")
-        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        tokens = self.host.plugin("tokens") if self.host else None
         if tokens is not None and hasattr(tokens, "on_ws_link_state"):
             try:
                 tokens.on_ws_link_state(chain, connected)
@@ -1307,7 +1307,7 @@ class TransactionsPlugin(Plugin):
         """A ws Transfer touched the account (LiveWatcher.balance_dirty).
         Relay it to TokensPlugin. ``native``/``balance`` are the ws-read values
         at the log's ``block`` (None if the ws read failed → http fallback)."""
-        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        tokens = self.host.plugin("tokens") if self.host else None
         if tokens is not None and hasattr(tokens, "on_balance_dirty"):
             try:
                 tokens.on_balance_dirty(chain, account, token, block,
@@ -1322,7 +1322,7 @@ class TransactionsPlugin(Plugin):
         _on_balance_dirty (a plain ETH send fires no Transfer log). ``block`` is
         the height the read ran at, so the tokens plugin can order it. Relay to
         TokensPlugin for a lightweight native-only apply."""
-        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        tokens = self.host.plugin("tokens") if self.host else None
         if tokens is not None and hasattr(tokens, "on_native_balance"):
             try:
                 tokens.on_native_balance(chain, account, native_wei, block)
@@ -1337,7 +1337,7 @@ class TransactionsPlugin(Plugin):
         TokensPlugin, which formats the amount with the token's symbol/decimals
         and raises the sent/received desktop notification. tx_hash+log_index let
         it dedup against the tx-confirmation receipt scan."""
-        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        tokens = self.host.plugin("tokens") if self.host else None
         if tokens is not None and hasattr(tokens, "on_transfer_seen"):
             try:
                 tokens.on_transfer_seen(
@@ -1505,8 +1505,9 @@ class TransactionsPlugin(Plugin):
         # have a matching pending entry — the tokens scan only
         # cares about the logs, not the local cache state.
         if self.host is not None:
-            tokens_plugin = getattr(self.host, "tokens_plugin", None)
-            if tokens_plugin is not None:
+            tokens_plugin = self.host.plugin("tokens")
+            if tokens_plugin is not None and hasattr(
+                    tokens_plugin, "note_receipt_logs"):
                 try:
                     tokens_plugin.note_receipt_logs(chain, receipt)
                 except Exception:
@@ -1552,7 +1553,7 @@ class TransactionsPlugin(Plugin):
         arrival (e.g. a swap's incoming token) still notifies when the ws
         Transfer-log subscription missed it. Dedup in ``on_transfer_seen`` keeps
         it to one notification per arrival — whichever source is faster wins."""
-        tokens = getattr(self.host, "tokens_plugin", None) if self.host else None
+        tokens = self.host.plugin("tokens") if self.host else None
         if tokens is None or not hasattr(tokens, "on_transfer_seen") or not logs:
             return
         for row in transfers_touching(logs, viewer):

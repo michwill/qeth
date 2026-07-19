@@ -95,7 +95,7 @@ def test_update_live_account_and_balance_dirty_relay(qtbot, monkeypatch):
     host = Mock()
     host.current_chain = lambda: gnosis
     host.selected_address = "0xABC"
-    host.tokens_plugin = tokens
+    host.plugin = lambda pid: tokens if pid == "tokens" else None
     plugin.attach(host)
     plugin._live_watcher = Mock()        # pretend it's on, but never connects
 

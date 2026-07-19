@@ -633,6 +633,18 @@ class MainWindow(QMainWindow):
         an address is held by two signers (Ledger + Air-gapped)."""
         return self.wallets_plugin.selected_key
 
+    def plugin(self, plugin_id: str):
+        """The mounted plugin with this id, or None if it isn't mounted.
+        The sanctioned way for one plugin to reach an optional sibling — e.g.
+        TransactionsPlugin relaying live-balance events into TokensPlugin —
+        without depending on a concrete MainWindow attribute."""
+        return {
+            "wallets": self.wallets_plugin,
+            "tokens": self.tokens_plugin,
+            "transactions": self.transactions_plugin,
+            "ens": self.ens_plugin,
+        }.get(plugin_id)
+
     def current_chain(self):
         return self.store.current_chain()
 
@@ -663,7 +675,7 @@ class MainWindow(QMainWindow):
         # Silence the plugins' long-lived poll timers / ws watchers first, so
         # nothing kicks a fresh worker while we're draining the in-flight ones.
         for plugin in (self.wallets_plugin, self.tokens_plugin,
-                       self.transactions_plugin):
+                       self.transactions_plugin, self.ens_plugin):
             try:
                 plugin.shutdown()
             except RuntimeError:

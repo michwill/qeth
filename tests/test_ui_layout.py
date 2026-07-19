@@ -97,6 +97,23 @@ def test_tab_bar_starts_on_tokens(mainwindow):
     assert mainwindow.right_slot.active() is mainwindow.tokens_plugin
 
 
+def test_join_workers_shuts_down_every_plugin(mainwindow):
+    # Regression: ens_plugin used to be omitted from the shutdown loop, so its
+    # timers/workers leaked past quit. Every mounted plugin must be shut down.
+    shut: list = []
+    for pid in ("wallets", "tokens", "transactions", "ens"):
+        p = mainwindow.plugin(pid)
+        p.shutdown = lambda pid=pid: shut.append(pid)
+    mainwindow._join_workers()
+    assert set(shut) == {"wallets", "tokens", "transactions", "ens"}
+
+
+def test_host_plugin_accessor_resolves_all_and_unknown(mainwindow):
+    assert mainwindow.plugin("tokens") is mainwindow.tokens_plugin
+    assert mainwindow.plugin("ens") is mainwindow.ens_plugin
+    assert mainwindow.plugin("nope") is None
+
+
 def test_switching_tab_swaps_visible_panel(qtbot, mainwindow):
     tab_bar = mainwindow.findChild(QTabBar)
     tab_bar.setCurrentIndex(1)

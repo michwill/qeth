@@ -89,6 +89,7 @@ class TxTreeMachine(RuleBasedStateMachine):
             selected_address=A, current_chain=lambda: ETH,
             start_worker=lambda w: None, token_info=lambda cid, addr: None,
             status_message=lambda *a, **k: None,
+            plugin=lambda pid: None,           # no sibling tokens plugin here
             chain_by_id=lambda cid: ETH if cid == CID else None)
         self.plugin.host = self.host
         self.current = A

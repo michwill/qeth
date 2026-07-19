@@ -167,7 +167,8 @@ def test_confirmation_feeds_incoming_token_to_notifier(qtbot, tmp_qeth):
     from qeth.tx_activity import TRANSFER_TOPIC0
     plugin = TransactionsPlugin()
     tokens = Mock()
-    plugin.host = SimpleNamespace(tokens_plugin=tokens)
+    plugin.host = SimpleNamespace(
+        plugin=lambda pid: tokens if pid == "tokens" else None)
     viewer = "0x7a16ff8270133f063aab6c9977183d9e72835428"
     other = "0x" + "11" * 20
     usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
@@ -1411,9 +1412,10 @@ class TestOnReceiptConfirmed:
         plugin.tx_confirmed.connect(lambda c, hh, r: fired.append(hh))
         credits: list = []
         plugin.host = type("H", (), {})()
-        plugin.host.tokens_plugin = type(
+        _tokens = type(
             "T", (), {"note_receipt_logs":
                       lambda self, c, r: credits.append(r)})()
+        plugin.host.plugin = lambda pid: _tokens if pid == "tokens" else None
 
         for _ in range(5):   # five duplicate deliveries
             plugin._on_receipt_confirmed(ETH, h, self._confirmed_receipt())

@@ -36,6 +36,17 @@ class Host(Protocol):
     def selected_address(self) -> str | None:
         ...
 
+    @property
+    def selected_key(self) -> tuple[str, str] | None:
+        """(address, path) of the single selected account row — routes a
+        send/sign to the exact signer record when one address is held by two
+        signers (e.g. Ledger + air-gapped)."""
+
+    def plugin(self, plugin_id: str) -> Plugin | None:
+        """The mounted plugin with this id, or None when it is disabled or
+        unknown. THE way for one plugin to reach an optional sibling — every
+        caller must handle None, because a disabled plugin simply isn't there."""
+
     def current_chain(self):
         """Return the qeth.chains.Chain currently selected by the user."""
 
@@ -81,6 +92,33 @@ class Host(Protocol):
         ``on_broadcast(tx_hash)`` fires after a successful broadcast;
         ``on_confirmed(receipt)`` fires once when the tx mines. Used by
         the ENS plugin's record / subdomain writes."""
+
+    def notify(self, title: str, body: str, icon=None) -> None:
+        """Raise a sent/received desktop notification."""
+
+    def account_addresses(self) -> list[str]:
+        """Every wallet address the app knows, lowercased."""
+
+    def account_book(self) -> list[tuple[str, str]]:
+        """(address, label) pairs for the send-dialog address completer."""
+
+    def chain_icon(self, chain_id: int):
+        """The (cached) QIcon for a chain, or a null icon."""
+
+    def open_send_dialog(self, asset: dict, chain, from_addr: str) -> None:
+        """Open the Send flow for a token/native asset (Tokens → here)."""
+
+    def open_replace_tx(self, tx, cancel: bool) -> None:
+        """Speed-up (cancel=False) or cancel (cancel=True) a pending tx."""
+
+    def open_ens_composer(self, name: str, op, chain, from_addr,
+                          *, on_confirmed=None) -> None:
+        """Open the ENS write composer (ENS → here); ``on_confirmed`` fires
+        once the write mines (routed via the transactions plugin)."""
+
+    def open_sign_message_dialog(self, address: str,
+                                 path: str | None = None) -> None:
+        """Open the personal_sign / typed-data message signer."""
 
 
 class Plugin(QObject):
