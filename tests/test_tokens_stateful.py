@@ -56,6 +56,9 @@ XX = "0x" + "55" * 20     # promotable via custom/discovered
 TOKENS = [KP, KU, UP, UU, XX]
 KNOWN = {KP.lower(), KU.lower()}
 PRICED = {KP.lower(), UP.lower()}
+# Recognised but never priced by discovery → subject to the unpriced-grace
+# window (shown for KNOWN_UNPRICED_GRACE_S, then hidden as spam).
+KNOWN_UNPRICED = {KU.lower()}
 UNIT = 10 ** 18                       # 1.0 of an 18-decimal token
 PRICE_USD = Decimal("2000")           # $2000 → 1.0 token = $2000 ≫ dust
 PRICE = Price(PRICE_USD, CID, "x")
@@ -96,6 +99,13 @@ class TokensTreeMachine(RuleBasedStateMachine):
         self._icons.request = lambda *a, **k: None   # type: ignore[method-assign]
         self.panel = TokenListPanel(self._icons, self.store)
         self.plugin._panel = self.panel
+        # Wire the panel the way the plugin's real panel setup does (we inject
+        # _panel directly, bypassing it): the display-time gate needs the token
+        # lists to know a token is *recognised*, and the shared grace clock so
+        # its unpriced-hiding agrees with the discovery filter. Without these the
+        # panel treats every unpriced token as unknown spam / shows it forever.
+        self.panel._token_lists = self.plugin._token_lists
+        self.panel._unpriced_grace = self.plugin._within_unpriced_grace
         self.host = SimpleNamespace(
             selected_address=A, current_chain=lambda: ETH,
             start_worker=lambda w: None, token_info=lambda cid, addr: None,
@@ -270,6 +280,29 @@ class TokensTreeMachine(RuleBasedStateMachine):
     @rule()
     def activate(self):
         self.plugin.on_activated()
+
+    @rule()
+    def elapse_unpriced_grace(self):
+        """Advance the wall clock past the unpriced-grace window (the analog of
+        advancing a chain's timestamp): a recognised-but-still-unpriced token
+        that has been coasting on grace must now hide as spam. Back-date every
+        known-unpriced token's grace stamp, rerender, and assert it's gone
+        (unless a custom/pin/discovered/show-all override keeps it)."""
+        import time as _t
+        expired = _t.monotonic() - (self.plugin.KNOWN_UNPRICED_GRACE_S + 10.0)
+        for addr in KNOWN_UNPRICED:
+            self.plugin._unpriced_since[(CID, addr)] = expired
+        self.plugin._invalidate_view_and_refresh()
+        if self.plugin._show_all:
+            return
+        held = self._held()
+        for addr in KNOWN_UNPRICED:
+            if (held.get(addr, 0) > 0
+                    and not self.store.is_custom_token(CID, addr)
+                    and not self.store.is_force_shown(CID, addr)
+                    and not self.store.is_discovered_token(CID, addr)):
+                assert addr not in self._rendered(), \
+                    f"known-unpriced {addr} still shown after grace elapsed"
 
     # --- invariants -------------------------------------------------------
     @invariant()
