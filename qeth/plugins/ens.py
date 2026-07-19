@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem, QTableWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+from shiboken6 import isValid as _qt_alive   # is a Qt C++ object still alive?
 
 from ..ens_app import (
     ENS_APP_URL, TEXT_KEYS, VERIFY_WAIT_S, EnsCache, EnsName, EnsNode,
@@ -948,9 +949,11 @@ class EnsPanel(QWidget):
         if sig == self._populate_sig and self._items_by_name:
             return   # identical tree — don't rebuild (would lose fold/selection)
         # Capture the user's fold + selection so a genuine rebuild restores them
-        # (a rebuilt tree starts collapsed with nothing selected).
+        # (a rebuilt tree starts collapsed with nothing selected). Skip any
+        # stranded-deleted item defensively — a stale C++ object must never block
+        # the rebuild (that's what borked the tree until restart; see _remove_item).
         expanded = {nl for nl, it in self._items_by_name.items()
-                    if it.isExpanded()}
+                    if _qt_alive(it) and it.isExpanded()}
         cur = self.tree.currentItem()
         cur_name = cur.data(0, _NAME_ROLE) if cur is not None else None
         selected = (cur_name.name.lower()
@@ -1287,7 +1290,24 @@ class EnsPanel(QWidget):
         item.setToolTip(self._STATUS_COL, tooltip)
 
     def _remove_item(self, item: QTreeWidgetItem, name_l: str) -> None:
-        """Drop a row (top-level or subdomain) from the tree + the index."""
+        """Drop a row (top-level or subdomain) from the tree + the index.
+
+        Removing an item deletes its whole C++ subtree, so every INDEXED
+        descendant (a subdomain row under it) must leave ``_items_by_name`` too —
+        otherwise the dict strands a deleted C++ object, and the next
+        ``populate``'s ``it.isExpanded()`` scan raises "already deleted" and
+        borks the tree until restart. Collect the doomed names BEFORE removal
+        (the items are gone after)."""
+        doomed = {name_l}
+        stack = [item]
+        while stack:
+            it = stack.pop()
+            for i in range(it.childCount()):
+                ch = it.child(i)
+                stack.append(ch)
+                n = ch.data(0, _NAME_ROLE)
+                if isinstance(n, EnsName):
+                    doomed.add(n.name.lower())
         parent = item.parent()
         if parent is not None:
             parent.removeChild(item)
@@ -1295,13 +1315,14 @@ class EnsPanel(QWidget):
             idx = self.tree.indexOfTopLevelItem(item)
             if idx >= 0:
                 self.tree.takeTopLevelItem(idx)
-        self._items_by_name.pop(name_l, None)
+        for nl in doomed:
+            self._items_by_name.pop(nl, None)
 
     def expanded_loaded_names(self) -> list[str]:
         """Names whose records are currently on screen (expanded + loaded) — the
         set to re-read when newly-discovered custom text keys arrive."""
         return [nl for nl, it in self._items_by_name.items()
-                if it.isExpanded() and it.data(0, _LOADED_ROLE)]
+                if _qt_alive(it) and it.isExpanded() and it.data(0, _LOADED_ROLE)]
 
     def drop_name(self, name: str) -> None:
         """Remove a name's row now (a delete confirmed on-chain) — no wait on the

@@ -124,6 +124,38 @@ class TestEnsPanel:
         assert sub.text(0) == "blog.vitalik.eth"
         assert sub.data(0, _NAME_ROLE).name == "blog.vitalik.eth"
 
+    def test_drop_name_removes_indexed_subdomains(self, qtbot):
+        # Regression: dropping a parent deletes its whole C++ subtree, so its
+        # indexed subdomain children must leave _items_by_name too — else a later
+        # populate's isExpanded() scan hits a deleted object and borks the tree.
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        names = [EnsName("vitalik.eth"), EnsName("blog.vitalik.eth")]
+        panel.populate(build_tree(names), NOW)
+        assert {"vitalik.eth", "blog.vitalik.eth"} <= set(panel._items_by_name)
+        panel._items_by_name["vitalik.eth"].setExpanded(True)
+        panel.drop_name("vitalik.eth")            # parent gone → child gone too
+        assert "vitalik.eth" not in panel._items_by_name
+        assert "blog.vitalik.eth" not in panel._items_by_name
+        # A subsequent populate must not raise (no stranded deleted item).
+        panel.populate(build_tree([EnsName("other.eth")]), NOW)
+        assert panel.tree.topLevelItemCount() == 1
+
+    def test_populate_survives_a_stranded_deleted_item(self, qtbot):
+        # Defense-in-depth: even if some path strands a deleted C++ item in the
+        # index, populate must skip it and rebuild — never crash (which froze the
+        # ENS tree on one account's names until restart).
+        from shiboken6 import delete, isValid
+        panel = EnsPanel()
+        qtbot.addWidget(panel)
+        panel.populate(build_tree([EnsName("a.eth"), EnsName("sub.a.eth")]), NOW)
+        stranded = panel._items_by_name["sub.a.eth"]
+        delete(stranded)                          # kill the C++ object under it
+        assert not isValid(stranded)
+        panel.populate(build_tree([EnsName("b.eth")]), NOW)   # must not raise
+        assert panel.tree.topLevelItemCount() == 1
+        assert "b.eth" in panel._items_by_name
+
     def test_populate_skips_identical_and_preserves_fold_selection(self, qtbot):
         # An identical discovery landing (the common refresh, and the one that
         # fires right after the user's own write) must not clear+rebuild the
