@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING
 from .wallet_cache import CachedToken, CachedWallet, WalletCache
 
 if TYPE_CHECKING:
-    from .token_metadata import TokenMetadataCache
-    from .token_discovery import TokenLists
+    from ...token_metadata import TokenMetadataCache
+    from ...token_discovery import TokenLists
 
 
 class BalanceLedger:

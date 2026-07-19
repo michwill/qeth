@@ -5,7 +5,7 @@ data. That lets us cache aggressively across runs — the plugin loads
 the cached page immediately on selection so the user never sees an
 empty → populated flicker while the background fetch runs.
 
-Layout mirrors qeth.wallet_cache:
+Layout mirrors qeth.plugins.tokens.wallet_cache:
     CACHE_DIR / <chain_id> / <address_lower>.json
 each file holds a JSON list of Transaction dicts (newest-first).
 """

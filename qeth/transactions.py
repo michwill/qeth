@@ -7,7 +7,7 @@ later (Etherscan v2, Otterscan ``ots_*`` against a user-supplied RPC,
 Blockscout's Etherscan-compatible ``/api?module=account&action=txlist``.
 
 The parsing logic is split out as a free function so it's unit-testable
-without HTTP, mirroring the ``qeth.risk._parse_report`` pattern.
+without HTTP, mirroring the ``qeth.plugins.tokens.risk._parse_report`` pattern.
 """
 
 import enum

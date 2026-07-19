@@ -1,10 +1,10 @@
-"""Tests for qeth.risk — RiskReport thresholds, parsing, cache TTL."""
+"""Tests for qeth.plugins.tokens.risk — RiskReport thresholds, parsing, cache TTL."""
 
 import time
 
 import pytest
 
-from qeth.risk import (
+from qeth.plugins.tokens.risk import (
     HIGH_SELL_TAX,
     GoPlusRisk,
     RiskCache,
@@ -165,7 +165,7 @@ class TestGoPlusFetch:
                 def __exit__(self, *a): return False
             return R()
 
-        monkeypatch.setattr("qeth.risk.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("qeth.plugins.tokens.risk.urllib.request.urlopen", fake_urlopen)
         out = GoPlusRisk().fetch(1, [addr])
         assert addr in out
         assert out[addr].is_honeypot is True
@@ -174,7 +174,7 @@ class TestGoPlusFetch:
     def test_network_failure_returns_empty(self, monkeypatch):
         def boom(req, timeout=None):
             raise OSError("no network")
-        monkeypatch.setattr("qeth.risk.urllib.request.urlopen", boom)
+        monkeypatch.setattr("qeth.plugins.tokens.risk.urllib.request.urlopen", boom)
         # Should not raise; just return empty dict.
         assert GoPlusRisk().fetch(1, ["0x" + "a" * 40]) == {}
 
@@ -185,6 +185,6 @@ class TestGoPlusFetch:
         def watch(req, timeout=None):
             called.append(req)
             raise RuntimeError("shouldn't reach here")
-        monkeypatch.setattr("qeth.risk.urllib.request.urlopen", watch)
+        monkeypatch.setattr("qeth.plugins.tokens.risk.urllib.request.urlopen", watch)
         assert GoPlusRisk().fetch(1, ["0xAA", "not-an-address"]) == {}
         assert not called

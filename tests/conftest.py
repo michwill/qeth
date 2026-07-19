@@ -177,18 +177,18 @@ def tmp_qeth(tmp_path, monkeypatch) -> Path:
     import qeth.token_discovery.tokenlists
     import qeth.token_discovery.toptokens
     import qeth.transactions_cache
-    import qeth.wallet_cache
-    import qeth.risk
+    import qeth.plugins.tokens.wallet_cache
+    import qeth.plugins.tokens.risk
 
     monkeypatch.setattr(qeth.store, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(qeth.store, "CONFIG_FILE", tmp_path / "config.json")
-    monkeypatch.setattr(qeth.wallet_cache, "CACHE_DIR", tmp_path / "wallets")
+    monkeypatch.setattr(qeth.plugins.tokens.wallet_cache, "CACHE_DIR", tmp_path / "wallets")
     monkeypatch.setattr(qeth.token_metadata, "CACHE_DIR", tmp_path / "token_metadata")
     monkeypatch.setattr(qeth.token_discovery.tokenlists, "CACHE_DIR",
                         tmp_path / "tokenlists")
     monkeypatch.setattr(qeth.token_discovery.toptokens, "CACHE_DIR",
                         tmp_path / "toptokens")
-    monkeypatch.setattr(qeth.risk, "CACHE_DIR", tmp_path / "risk")
+    monkeypatch.setattr(qeth.plugins.tokens.risk, "CACHE_DIR", tmp_path / "risk")
     monkeypatch.setattr(qeth.transactions_cache, "CACHE_DIR",
                         tmp_path / "transactions")
     monkeypatch.setattr(qeth.activity_cache, "ACTIVITIES_DIR",

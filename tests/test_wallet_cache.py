@@ -1,6 +1,6 @@
-"""Tests for qeth.wallet_cache — per-wallet display state on disk."""
+"""Tests for qeth.plugins.tokens.wallet_cache — per-wallet display state on disk."""
 
-from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
 
 
 def test_save_load_round_trip(tmp_qeth):

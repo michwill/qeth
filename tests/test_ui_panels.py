@@ -174,7 +174,7 @@ class TestLpRowIcon:
     C1 = "0x" + "c1" * 20
 
     def _cached(self, source="onchain-curve-lp"):
-        from qeth.wallet_cache import CachedToken, CachedWallet
+        from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet
         return CachedWallet(
             chain_id=1, address="0x" + "aa" * 20,
             tokens=[CachedToken(
@@ -245,7 +245,7 @@ class TestVaultRowIcon:
     UNDER = "0x" + "c0" * 20
 
     def _cached(self, source="onchain-yb"):
-        from qeth.wallet_cache import CachedToken, CachedWallet
+        from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet
         return CachedWallet(
             chain_id=1, address="0x" + "aa" * 20, native_price_usd="3000",
             tokens=[CachedToken(

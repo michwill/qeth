@@ -378,7 +378,7 @@ class TokenLists:
         - Symbol matches a canonical major (ETH/USDC/…) but the
           contract isn't whitelisted (= impersonation).
 
-        ``risk`` is a ``qeth.risk.RiskReport`` or None; passing None is
+        ``risk`` is a ``qeth.plugins.tokens.risk.RiskReport`` or None; passing None is
         the same as having no GoPlus data yet — the heuristic still
         catches the obvious URL/keyword/impersonation cases.
         """

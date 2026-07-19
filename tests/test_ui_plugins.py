@@ -60,7 +60,7 @@ class TestCarryForwardAbsent:
     also prefers last-known over the explorer's stale value."""
 
     def _plugin_with_prev(self, tmp_qeth, prev_balance=1000):
-        from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+        from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
         p = TokensPlugin.__new__(TokensPlugin)   # skip heavy __init__
         p._wallet_cache = WalletCache()
         p._wallet_cache.save(CachedWallet(
@@ -100,7 +100,7 @@ class TestCarryForwardAbsent:
         assert raw == {}                      # nothing to carry forward
 
     def test_no_prior_cache_is_noop(self, tmp_qeth):
-        from qeth.wallet_cache import WalletCache
+        from qeth.plugins.tokens.wallet_cache import WalletCache
         p = TokensPlugin.__new__(TokensPlugin)
         p._wallet_cache = WalletCache()       # nothing saved
         raw: dict = {}
@@ -1973,7 +1973,7 @@ class TestSiblingHeldContracts:
 
     def _populate(self, plugin, *, sibling_addr, contracts_with_balance,
                   contracts_zero=()):
-        from qeth.wallet_cache import CachedToken, CachedWallet
+        from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet
         # Register the sibling as one of "our" accounts.
         plugin._store.add_account({
             "address": sibling_addr, "source": "watch_only",
@@ -2387,7 +2387,7 @@ class TestReceiptTransferScan:
     def test_credit_bumps_existing_token_balance(self, tokens_plugin):
         # If the recipient already had some of this token cached,
         # apply the delta in place rather than appending a dup.
-        from qeth.wallet_cache import CachedToken, CachedWallet
+        from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet
         USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
         tokens_plugin._store.add_account({
             "address": self.ME, "source": "hot", "label": "Me",
@@ -2946,7 +2946,7 @@ class TestTokensStartupNonBlocking:
 
     def test_cached_wallet_renders_before_lists_load(self, qtbot, tmp_qeth):
         from qeth.plugins.tokens import TokensPlugin
-        from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+        from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
 
         # Pre-populate the wallet cache for a real ledger account.
         wallet_addr = "0x7a16ff8270133f063aab6c9977183d9e72835428"

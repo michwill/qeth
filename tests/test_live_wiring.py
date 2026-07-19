@@ -347,7 +347,7 @@ def test_on_activated_rerenders_flag_and_reconciles_balances(qtbot, monkeypatch,
     ws event for (the real bug: a fully-sent token lingered on tab switch)."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import BalanceWorker, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
     tp._wallet_cache = WalletCache(cache_dir=tmp_qeth)
     tp._wallet_cache.save(CachedWallet(
@@ -388,7 +388,7 @@ def test_rerender_view_from_cache_handles_hidden_and_usd(qtbot, tmp_qeth):
     from types import SimpleNamespace
     from PySide6.QtCore import Qt
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
     eth = SimpleNamespace(chain_id=1, name="Ethereum", symbol="ETH")
@@ -442,7 +442,7 @@ def test_on_live_refresh_reconciles_displayed_balances(qtbot, monkeypatch, tmp_q
     listed until the slow sweep, while 'switch tabs after' worked."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import BalanceWorker, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
     tp._wallet_cache = WalletCache(cache_dir=tmp_qeth)
     tp._wallet_cache.save(CachedWallet(
@@ -473,7 +473,7 @@ def test_targeted_drop_repaints_via_host_view_not_stale_displayed_view(qtbot, tm
     from types import SimpleNamespace
     from PySide6.QtCore import Qt
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
     eth = SimpleNamespace(chain_id=1, name="Ethereum", symbol="ETH")
@@ -521,7 +521,7 @@ def test_targeted_read_drops_spent_token_despite_a_lagging_chunk(qtbot, tmp_qeth
     heights."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
     eth = SimpleNamespace(chain_id=42161, name="Arbitrum", symbol="ETH")
@@ -580,7 +580,7 @@ def test_discovery_keeps_hidden_held_tokens_in_cache(qtbot, tmp_qeth):
     from types import SimpleNamespace
     from decimal import Decimal
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.pricing import Price
     from qeth.store import Store
@@ -627,7 +627,7 @@ def test_discovery_merges_and_is_block_ordered(qtbot, tmp_qeth):
     from types import SimpleNamespace
     from decimal import Decimal
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.pricing import Price
     from qeth.store import Store
@@ -688,7 +688,7 @@ def test_stale_discovery_native_does_not_regress(qtbot, tmp_qeth):
     from types import SimpleNamespace
     from decimal import Decimal
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.pricing import Price
     from qeth.store import Store
@@ -771,7 +771,7 @@ def test_stale_confirm_read_does_not_regress_the_panel(qtbot, tmp_qeth):
     from types import SimpleNamespace
     from PySide6.QtCore import Qt
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
     eth = SimpleNamespace(chain_id=1, name="Ethereum", symbol="ETH")
@@ -818,7 +818,7 @@ def test_balance_ordering_is_per_token_not_per_account(qtbot, tmp_qeth):
     stale read for the SAME token (older than its own last block) is ignored."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
     eth = SimpleNamespace(chain_id=1, name="Ethereum", symbol="ETH")
@@ -863,7 +863,7 @@ def test_stale_read_cannot_overwrite_a_fresher_drop(qtbot, tmp_qeth):
     (The 'cbBTC dropped then reappeared a moment later' bug.)"""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
     eth = SimpleNamespace(chain_id=1, name="Ethereum", symbol="ETH")
@@ -918,7 +918,7 @@ def test_stale_discovery_cannot_resurrect_a_sent_token(qtbot, tmp_qeth):
     from types import SimpleNamespace
     from PySide6.QtCore import Qt
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.pricing import Price
     from qeth.store import Store
@@ -984,7 +984,7 @@ def test_carried_forward_token_is_not_block_stamped(qtbot, tmp_qeth):
     from decimal import Decimal
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     from qeth.icons import IconCache
     from qeth.pricing import Price
     from qeth.store import Store
@@ -1053,7 +1053,7 @@ def test_persist_targeted_balances_writes_absolute(qtbot, tmp_qeth):
     with no metadata is left for discovery, not invented."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
     tp._wallet_cache = WalletCache(cache_dir=tmp_qeth)
     tp._wallet_cache.save(CachedWallet(
@@ -1081,7 +1081,7 @@ def test_apply_native_updates_only_native_and_is_ordered(qtbot, tmp_qeth):
     and a stale (older-block) poll can't regress it."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
     tp._wallet_cache = WalletCache(cache_dir=tmp_qeth)
     tp._wallet_cache.save(CachedWallet(
@@ -1112,7 +1112,7 @@ def test_stale_native_poll_does_not_regress_or_renotify(qtbot, monkeypatch,
     """2d: an out-of-order ws native poll (LB jumped back) must not regress the
     shown balance nor re-fire a 'received' notification for ETH seen earlier."""
     from qeth.plugins.tokens import TokensPlugin
-    from qeth.wallet_cache import CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
     tp.host = Mock()
     tp._wallet_cache = WalletCache(cache_dir=tmp_qeth)
@@ -1208,7 +1208,7 @@ def test_reconcile_tick_reads_displayed_balances_only_while_ws_live(
     re-reads balances, so the reconcile stays idle rather than doubling up."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import BalanceWorker, TokensPlugin
-    from qeth.wallet_cache import CachedToken, CachedWallet, WalletCache
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet, WalletCache
     tp = TokensPlugin(Mock())
     tp._wallet_cache = WalletCache(cache_dir=tmp_qeth)
     tp._wallet_cache.save(CachedWallet(

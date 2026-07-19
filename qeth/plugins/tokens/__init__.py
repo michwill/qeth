@@ -36,30 +36,30 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .. import QULONGLONG
-from ..dialog import prompt_text
-from ..alerts import warn
-from ..chain import EthClient, wei_to_ether
-from ..formatting import format_balance as _format_balance
-from ..formatting import format_usd as _format_usd
-from ..formatting import transfer_notice
-from ..icons import (
+from ... import QULONGLONG
+from ...dialog import prompt_text
+from ...alerts import warn
+from ...chain import EthClient, wei_to_ether
+from ...formatting import format_balance as _format_balance
+from ...formatting import format_usd as _format_usd
+from ...formatting import transfer_notice
+from ...icons import (
     IconCache, bundled_native_icon, notification_icon, smooth_icon,
     stacked_icon, vault_icon,
 )
-from ..plugin import Plugin
-from ..pricing import (
+from ...plugin import Plugin
+from ...pricing import (
     ChainedPriceSource, DefiLlamaPrices, OnChainVaultPrices, Price, PriceSource,
 )
-from ..risk import GoPlusRisk, RiskCache
-from ..token_metadata import TokenMetadataCache
-from ..token_discovery import (
+from .risk import GoPlusRisk, RiskCache
+from ...token_metadata import TokenMetadataCache
+from ...token_discovery import (
     COINGECKO_PLATFORMS, BlockscoutSource, EtherscanV2Source,
     RoutedTokenSource, TokenBalance, TokenListEntry, TokenLists, TokenSource,
     TopTokens,
 )
-from ..balance_ledger import BalanceLedger
-from ..wallet_cache import CachedToken, CachedWallet, WalletCache
+from .balance_ledger import BalanceLedger
+from .wallet_cache import CachedToken, CachedWallet, WalletCache
 
 
 log = logging.getLogger("qeth.plugin.tokens")
@@ -194,7 +194,7 @@ class OwnTokenDiscoveryWorker(QThread):
         self.addresses = list(addresses)
 
     def run(self) -> None:
-        from ..token_discovery import discover_own_tokens
+        from ...token_discovery import discover_own_tokens
         # (selected-wallet-first, then the rest). The origin check spans ALL
         # addresses in both passes, so cross-account sends aren't missed.
         for viewers in (self.addresses[:1], self.addresses[1:]):
@@ -2166,7 +2166,7 @@ class TokensPlugin(Plugin):
         MetadataWorker has nothing to fetch for them later. Idempotent
         — TokenMetadataCache.put_many overwrites existing keys but
         the value is identical."""
-        from ..chains import DEFAULT_CHAINS
+        from ...chains import DEFAULT_CHAINS
         for chain in DEFAULT_CHAINS:
             meta: dict[str, dict] = {}
             for addr in self._token_lists.addresses_for_chain(chain.chain_id):

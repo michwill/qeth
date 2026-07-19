@@ -217,7 +217,7 @@ def _make_tokens_plugin(anvil, tmp_qeth):
     """A real TokensPlugin + panel wired to the fork, holding USDC in cache."""
     from types import SimpleNamespace
     from qeth.plugins.tokens import TokenListPanel, TokensPlugin
-    from qeth.wallet_cache import WalletCache
+    from qeth.plugins.tokens.wallet_cache import WalletCache
     from qeth.icons import IconCache
     from qeth.store import Store
 
@@ -244,7 +244,7 @@ def _make_tokens_plugin(anvil, tmp_qeth):
 
 def _seed_usdc(tp, panel, anvil, held_raw):
     """Cache + render ACCT holding ``held_raw`` USDC, so it's on the list."""
-    from qeth.wallet_cache import CachedToken, CachedWallet
+    from qeth.plugins.tokens.wallet_cache import CachedToken, CachedWallet
     cached = CachedWallet(
         chain_id=1, address=ACCT.lower(),
         native_balance_wei=10 ** 18, native_price_updated=1,
@@ -573,7 +573,7 @@ def test_confirmed_receive_adds_and_prices_recognised_token(anvil, qtbot, tmp_qe
     tp._token_lists = lists
     panel._token_lists = lists
     # render an (empty) view for ACCT
-    from qeth.wallet_cache import CachedWallet
+    from qeth.plugins.tokens.wallet_cache import CachedWallet
     tp._wallet_cache.save(CachedWallet(
         chain_id=1, address=ACCT.lower(), native_balance_wei=10**18, tokens=[]))
     panel.show_cached(anvil.chain, tp._wallet_cache.load(1, ACCT.lower()))

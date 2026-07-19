@@ -20,8 +20,8 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import USER_AGENT
-from .fsatomic import atomic_write_text
+from ... import USER_AGENT
+from ...fsatomic import atomic_write_text
 
 log = logging.getLogger("qeth.risk")
 

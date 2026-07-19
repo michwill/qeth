@@ -6,7 +6,7 @@ batch a small set and run sparingly.
 
 import pytest
 
-from qeth.risk import GoPlusRisk, RiskReport
+from qeth.plugins.tokens.risk import GoPlusRisk, RiskReport
 
 pytestmark = pytest.mark.network
 

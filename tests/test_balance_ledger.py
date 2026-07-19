@@ -5,8 +5,8 @@ These pin the invariant directly (the plugin exercises the same code through
 _persist_targeted_balances / _record_nonzero_block delegates)."""
 from types import SimpleNamespace
 
-from qeth.balance_ledger import BalanceLedger
-from qeth.wallet_cache import WalletCache
+from qeth.plugins.tokens.balance_ledger import BalanceLedger
+from qeth.plugins.tokens.wallet_cache import WalletCache
 
 CHAIN = SimpleNamespace(chain_id=1)
 ACC = "0x" + "ab" * 20

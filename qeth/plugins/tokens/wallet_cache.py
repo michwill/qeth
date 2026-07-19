@@ -16,7 +16,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .fsatomic import atomic_write_text
+from ...fsatomic import atomic_write_text
 
 log = logging.getLogger("qeth.wallet_cache")
 

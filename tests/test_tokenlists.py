@@ -4,7 +4,7 @@ qeth.token_discovery.tokenlists.
 
 import pytest
 
-from qeth.risk import RiskReport
+from qeth.plugins.tokens.risk import RiskReport
 from qeth.token_discovery import TokenLists
 
 
