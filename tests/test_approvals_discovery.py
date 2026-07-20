@@ -214,12 +214,69 @@ def test_source_uses_etherscan_when_key_and_supported():
 
     def fake_transport(url, timeout):
         captured["url"] = url
-        return json.dumps({"status": "1", "result": []}).encode()
+        # A non-empty Etherscan response is used directly (no fallback).
+        return json.dumps({"status": "1", "result": [
+            _log_row(TOKEN, A, SPENDER, 100)]}).encode()
 
     src = ApprovalLogSource(lambda: "APIKEY", transport=fake_transport)
-    src.fetch(ETH, A)
-    assert "apikey=APIKEY" in captured["url"]
+    rows = src.fetch(ETH, A)
+    assert len(rows) == 1
+    assert "apikey=APIKEY" in captured["url"]     # served by Etherscan, keyed
     assert "chainid=1" in captured["url"]
+
+
+def test_source_fails_over_from_etherscan_to_blockscout():
+    # A keyed chain: Etherscan errors → fall back to the keyless Blockscout
+    # instance (the proven logs path) rather than getting stuck.
+    calls = []
+
+    def fake_transport(url, timeout):
+        calls.append(url)
+        if "etherscan" in url:                    # Etherscan errors
+            return json.dumps({"status": "0", "message": "NOTOK",
+                               "result": "Query Timeout"}).encode()
+        return json.dumps({"status": "1", "result": [   # Blockscout serves it
+            _log_row(TOKEN, A, SPENDER, 100)]}).encode()
+
+    src = ApprovalLogSource(lambda: "APIKEY", transport=fake_transport)
+    rows = src.fetch(ETH, A)
+    assert len(rows) == 1                          # got Blockscout's row
+    assert any("etherscan" in u for u in calls)    # tried Etherscan first
+    assert any("blockscout" in u for u in calls)   # then fell back
+
+
+def test_source_cold_scan_empty_primary_tries_fallback():
+    # Etherscan returns a VALID empty (no error) on a cold scan — a known
+    # silent-failure mode for topic-only queries. A cold scan must still try
+    # Blockscout rather than trust the empty.
+    calls = []
+
+    def fake_transport(url, timeout):
+        calls.append(url)
+        if "etherscan" in url:
+            return json.dumps({"status": "0", "message": "No records found",
+                               "result": []}).encode()      # valid-empty
+        return json.dumps({"status": "1", "result": [
+            _log_row(TOKEN, A, SPENDER, 100)]}).encode()
+
+    src = ApprovalLogSource(lambda: "APIKEY", transport=fake_transport)
+    assert len(src.fetch(ETH, A, from_block=0)) == 1         # fell back on empty
+    assert any("blockscout" in u for u in calls)
+
+
+def test_source_incremental_empty_is_respected_not_failed_over():
+    # An incremental window (from_block > 0) that empties is genuinely "no new
+    # logs" — do NOT waste a fallback call on it.
+    calls = []
+
+    def fake_transport(url, timeout):
+        calls.append(url)
+        return json.dumps({"status": "0", "message": "No records found",
+                           "result": []}).encode()
+
+    src = ApprovalLogSource(lambda: "APIKEY", transport=fake_transport)
+    assert src.fetch(ETH, A, from_block=1_000_000) == []
+    assert not any("blockscout" in u for u in calls)         # no fallback
 
 
 # --- fetch_allowances: found / read-zero / failed (the prune-safety split) ---

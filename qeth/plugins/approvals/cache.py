@@ -1,13 +1,19 @@
 """Persisted per-(chain, account) approvals state.
 
-Stores the discovered allowances plus the newest tx block accounted for, so
-re-opening the tab renders the last-known caps instantly and the scan only has
-to fetch the new tail (the tx cache's hash boundary does the actual incremental
-paging; ``last_block`` records how far we'd checked).
+Stores the discovered allowances plus ``last_block`` = the highest Approval-log
+block the scan has indexed, so re-opening the tab renders the last-known caps
+instantly and the incremental scan windows the Approval logs from there.
 
 JSON at ``~/.qeth/approvals/<chain_id>/<address_lower>.json``. ``allowance`` and
 ``price_usd`` are stored as strings — a uint256 allowance outgrows JSON's safe
 integer range and Decimal has no native JSON type.
+
+``last_block`` semantics changed with event-log discovery: it used to be the tx
+cache head (a recent block), it is now the Approval-log cursor. A v1 (pre-event
+-log) cache carries the OLD meaning, so ``_SCHEMA_VERSION`` gates it out — an
+unversioned/stale cache reads as a MISS, forcing a cold full scan from block 0
+that re-discovers the complete approval set (the tx-walk under-counted). Bump
+this whenever the persisted shape or a field's meaning changes.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from .discovery import ApprovalRow
 log = logging.getLogger(__name__)
 
 CACHE_DIR = Path.home() / ".qeth" / "approvals"
+_SCHEMA_VERSION = 2      # v1 = tx-history discovery (last_block = tx head)
 
 
 class ApprovalsCache:
@@ -37,6 +44,11 @@ class ApprovalsCache:
         try:
             data = json.loads(self._path(chain_id, address).read_text())
         except (OSError, ValueError):
+            return None
+        # Reject a pre-event-log (or otherwise stale-schema) cache: its
+        # last_block is the old tx-head meaning, which would poison the
+        # incremental log cursor. Treat as a miss → cold full scan.
+        if data.get("v") != _SCHEMA_VERSION:
             return None
         rows: list[ApprovalRow] = []
         for d in data.get("rows", []):
@@ -59,6 +71,7 @@ class ApprovalsCache:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({
+                "v": _SCHEMA_VERSION,
                 "last_block": int(last_block),
                 "rows": [{
                     "token": r.token, "spender": r.spender,

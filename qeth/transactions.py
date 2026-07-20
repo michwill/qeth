@@ -414,6 +414,42 @@ class ApprovalLogSource:
         return "0x" + "0" * 24 + h.lower()
 
     def fetch(self, chain: Chain, owner: str, from_block: int = 0) -> list[dict]:
+        # Etherscan (keyed) is tried first when it covers the chain, but its
+        # topic-only logs query has behaved inconsistently across tiers, so we
+        # fall back to the chain's keyless Blockscout instance on failure — the
+        # proven path. At least one endpoint must exist (supports() gates it).
+        key = self._get_api_key()
+        endpoints: list[tuple[str, str | None]] = []
+        if chain.chain_id in self._etherscan_chains and key:
+            endpoints.append((ETHERSCAN_V2_BASE, key))
+        base = self.instances.get(chain.chain_id)
+        if base:
+            endpoints.append((base.rstrip("/") + "/api", None))
+        if not endpoints:
+            raise UnsupportedChain(
+                f"No Approval-log source supports chain {chain.chain_id}"
+            )
+        last_err: Exception | None = None
+        for i, (endpoint, ep_key) in enumerate(endpoints):
+            is_last = i == len(endpoints) - 1
+            try:
+                rows = self._fetch_one(chain, owner, from_block, endpoint, ep_key)
+            except Exception as e:      # noqa: BLE001 — try the next endpoint
+                last_err = e
+                if is_last:
+                    raise
+                continue
+            # A COLD scan (from_block 0) that comes back empty from a non-final
+            # endpoint is suspicious — Etherscan's topic-only logs query has
+            # silently returned nothing on some tiers — so try the next endpoint
+            # too. An incremental window (from_block > 0) legitimately empties,
+            # so respect that immediately.
+            if rows or from_block > 0 or is_last:
+                return rows
+        raise last_err or TransactionSourceError("getLogs error")
+
+    def _fetch_one(self, chain: Chain, owner: str, from_block: int,
+                   endpoint: str, key: str | None) -> list[dict]:
         params = [
             ("module", "logs"),
             ("action", "getLogs"),
@@ -423,17 +459,9 @@ class ApprovalLogSource:
             ("topic1", self._owner_topic(owner)),
             ("topic0_1_opr", "and"),
         ]
-        key = self._get_api_key()
-        if chain.chain_id in self._etherscan_chains and key:
-            all_params = [("chainid", str(chain.chain_id)), *params, ("apikey", key)]
-            url = f"{ETHERSCAN_V2_BASE}?" + urllib.parse.urlencode(all_params)
-        else:
-            base = self.instances.get(chain.chain_id)
-            if not base:
-                raise UnsupportedChain(
-                    f"No Approval-log source supports chain {chain.chain_id}"
-                )
-            url = f"{base.rstrip('/')}/api?" + urllib.parse.urlencode(params)
+        if key:
+            params = [("chainid", str(chain.chain_id)), *params, ("apikey", key)]
+        url = f"{endpoint}?" + urllib.parse.urlencode(params)
 
         raw = self._transport(url, self.timeout)
         data = json.loads(raw)
