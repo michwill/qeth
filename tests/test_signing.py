@@ -1851,8 +1851,9 @@ class TestRpcEventBroadcast:
         sub_id = asyncio.run(go())
         assert isinstance(sub_id, str)
         assert sub_id.startswith("0x")
-        # Mapped under (ws, sub_type).
-        assert server._ws_subscriptions[ws]["accountsChanged"] == sub_id
+        # Mapped under (ws, sub_id) → (sub_type, origin). No origin was
+        # supplied on this dispatch, so it's None.
+        assert server._ws_subscriptions[ws][sub_id] == ("accountsChanged", None)
 
     def test_eth_subscribe_without_ws_context_raises(self):
         # HTTP-only callers can't be pushed to; refuse the subscribe.
@@ -1873,7 +1874,7 @@ class TestRpcEventBroadcast:
         ws_a = MagicMock(closed=False, send_str=AsyncMock())
         ws_b = MagicMock(closed=False, send_str=AsyncMock())
         server._ws_clients = {ws_a, ws_b}
-        sub_id = server._register_subscription(ws_a, "accountsChanged")
+        sub_id = server._register_subscription(ws_a, "accountsChanged", None)
 
         asyncio.run(server._broadcast_event(
             "accountsChanged", ["0x7a16ff"],
@@ -1898,8 +1899,8 @@ class TestRpcEventBroadcast:
         ))
         gone = MagicMock(closed=True, send_str=AsyncMock())
         server._ws_clients = {flaky, gone}
-        server._register_subscription(flaky, "chainChanged")
-        server._register_subscription(gone, "chainChanged")
+        server._register_subscription(flaky, "chainChanged", None)
+        server._register_subscription(gone, "chainChanged", None)
 
         asyncio.run(server._broadcast_event("chainChanged", "0x1"))
         # Both removed from clients + subscriptions.
@@ -1919,7 +1920,7 @@ class TestRpcEventBroadcast:
         from unittest.mock import MagicMock
         server = self._make_server()
         ws = MagicMock(closed=False)
-        sub_id = server._register_subscription(ws, "chainChanged")
+        sub_id = server._register_subscription(ws, "chainChanged", None)
 
         async def go():
             return await server._dispatch(
@@ -1927,7 +1928,7 @@ class TestRpcEventBroadcast:
             )
         result = asyncio.run(go())
         assert result is True
-        assert "chainChanged" not in server._ws_subscriptions.get(ws, {})
+        assert sub_id not in server._ws_subscriptions.get(ws, {})
 
     def test_dispatch_switch_chain_emits_chainChanged(self):
         from unittest.mock import AsyncMock, MagicMock
@@ -1940,10 +1941,10 @@ class TestRpcEventBroadcast:
         server = RpcServer(store)
         ws = MagicMock(closed=False, send_str=AsyncMock())
         server._ws_clients = {ws}
-        # Treat this ws as the calling dapp's socket so the
-        # scoped chainChanged broadcast actually reaches it.
-        server._ws_origin[ws] = "https://app.example"
-        chain_sub = server._register_subscription(ws, "chainChanged")
+        # Subscribe as the calling dapp's origin so the scoped
+        # chainChanged broadcast (only_origin) actually reaches it.
+        chain_sub = server._register_subscription(
+            ws, "chainChanged", "https://app.example")
 
         async def go():
             return await server._dispatch(
@@ -1982,8 +1983,8 @@ class TestRpcEventBroadcast:
         server = RpcServer(store)
         ws = MagicMock(closed=False, send_str=AsyncMock())
         server._ws_clients = {ws}
-        server._register_subscription(ws, "chainChanged")
-        server._register_subscription(ws, "networkChanged")
+        server._register_subscription(ws, "chainChanged", None)
+        server._register_subscription(ws, "networkChanged", None)
 
         # _schedule_event needs a running loop to actually push;
         # capture the calls (with kwargs) instead.
@@ -2056,7 +2057,7 @@ class TestRpcEventBroadcast:
         server = RpcServer(store)
         ws = MagicMock(closed=False, send_str=AsyncMock())
         server._ws_clients = {ws}
-        server._register_subscription(ws, "chainChanged")
+        server._register_subscription(ws, "chainChanged", None)
 
         async def go():
             await server._dispatch(

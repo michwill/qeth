@@ -140,14 +140,23 @@ class RpcServer:
         # asyncio loop; broadcast_* methods marshal Qt-thread
         # calls through asyncio.run_coroutine_threadsafe.
         self._ws_clients: set[web.WebSocketResponse] = set()
-        # Per-WS subscription map: ws → {sub_type: sub_id}.
+        # Per-WS subscription map: ws → {sub_id: (sub_type, origin)}.
         # Populated when a dapp calls eth_subscribe('accountsChanged')
         # or eth_subscribe('chainChanged'); used by _broadcast_event
         # to address the matching eth_subscription notifications.
         # Frame's protocol — without an active subscription the
         # extension simply ignores the push.
+        #
+        # Keyed by SUB ID (not sub_type) and carrying the per-sub
+        # EFFECTIVE origin so a single multiplexed socket — a browser
+        # extension relaying every tab/frame over one WS — can hold
+        # many same-type subscriptions, each scoped to its own dapp
+        # origin. Keying by sub_type would let a second tab's
+        # chainChanged subscription overwrite the first, and scoping
+        # on the socket's handshake origin (the extension's) would
+        # mis-route every per-origin push. See _broadcast_event.
         self._ws_subscriptions: dict[
-            web.WebSocketResponse, dict[str, str]
+            web.WebSocketResponse, dict[str, tuple[str, str | None]]
         ] = {}
         # Per-origin chain override. Each dapp (identified by its
         # Origin header / Frame's ``__frameOrigin``) can call
@@ -160,12 +169,6 @@ class RpcServer:
         # read time, so a UI toolbar flip automatically reaches
         # unscoped dapps.
         self._rpc_chain_id_by_origin: dict[str, int] = {}
-        # WS connection → origin captured at handshake. Lets
-        # _broadcast_event scope chainChanged pushes correctly:
-        # an override-driven chainChanged goes only to that
-        # origin's sockets, while a UI-driven one goes only to
-        # sockets whose origin doesn't carry an override.
-        self._ws_origin: dict[web.WebSocketResponse, str | None] = {}
         # In-flight ws request handlers — one task per message, dispatched
         # concurrently (5a) so a long-running handler (an unbounded signing
         # prompt) can't head-of-line-block other requests on the same socket
@@ -260,7 +263,6 @@ class RpcServer:
                 pass
         self._ws_clients.clear()
         self._ws_subscriptions.clear()
-        self._ws_origin.clear()
         # Cancel any in-flight request handlers (e.g. an open signing prompt) —
         # the app is going away, so abandon them rather than wait.
         for task in list(self._ws_tasks):
@@ -362,7 +364,6 @@ class RpcServer:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         self._ws_clients.add(ws)
-        self._ws_origin[ws] = origin
 
         async def handle_and_reply(req: Any) -> None:
             # _handle_one never raises (it maps every error to a JSON-RPC error
@@ -396,7 +397,6 @@ class RpcServer:
         finally:
             self._ws_clients.discard(ws)
             self._ws_subscriptions.pop(ws, None)
-            self._ws_origin.pop(ws, None)
             self._ws_send_locks.pop(ws, None)
         return ws
 
@@ -494,22 +494,25 @@ class RpcServer:
             loop,
         )
 
-    def _register_subscription(self, ws, sub_type: str) -> str:
+    def _register_subscription(
+        self, ws, sub_type: str, origin: str | None,
+    ) -> str:
         """Allocate a subscription id and remember it under
-        ``ws → sub_type``. Returns the id the dapp will see in
+        ``ws → {sub_id: (sub_type, origin)}``. ``origin`` is the
+        per-message effective origin (the real dapp, even over a
+        shared extension socket), so pushes scope to the right dapp.
+        Returns the id the dapp will see in
         ``eth_subscription.params.subscription``."""
         import uuid
         sub_id = "0x" + uuid.uuid4().hex
-        self._ws_subscriptions.setdefault(ws, {})[sub_type] = sub_id
+        self._ws_subscriptions.setdefault(ws, {})[sub_id] = (sub_type, origin)
         return sub_id
 
     def _unregister_subscription(self, ws, sub_id: str) -> None:
         subs = self._ws_subscriptions.get(ws)
         if subs is None:
             return
-        for sub_type, existing in list(subs.items()):
-            if existing == sub_id:
-                del subs[sub_type]
+        subs.pop(sub_id, None)
 
     async def _broadcast_event(
         self, sub_type: str, result,
@@ -517,41 +520,48 @@ class RpcServer:
         only_unscoped: bool = False,
     ) -> None:
         """Send an ``eth_subscription`` notification to subscribed
-        WS clients. Filters:
+        WS clients. Scoping is per SUBSCRIPTION (its own origin),
+        not per socket — one multiplexed extension socket can hold
+        several same-type subscriptions for different dapp origins,
+        each addressed by its own sub id. Filters:
 
-        - ``only_origin``: deliver only to sockets whose handshake
-          origin matched. Used for origin-scoped events like the
+        - ``only_origin``: deliver only to subscriptions whose origin
+          matched. Used for origin-scoped events like the
           chainChanged that follows a ``wallet_switchEthereumChain``
           — other dapps must not be yanked onto the new chain.
-        - ``only_unscoped``: deliver only to sockets whose origin
-          has NOT set a per-origin chain override. Used for the
-          UI-driven chainChanged that fires when the user flips
+        - ``only_unscoped``: deliver only to subscriptions whose
+          origin has NOT set a per-origin chain override. Used for
+          the UI-driven chainChanged that fires when the user flips
           the toolbar combo — dapps that have explicitly switched
           their chain stay on the chain they picked.
+
+        A single socket may therefore receive several notifications
+        from one event (one per matching subscription); the client
+        demultiplexes by subscription id.
         """
         if not self._ws_subscriptions:
             return
         dead: list[web.WebSocketResponse] = []
         for ws, subs in list(self._ws_subscriptions.items()):
-            sub_id = subs.get(sub_type)
-            if sub_id is None:
-                continue
             if ws.closed:
                 dead.append(ws)
                 continue
-            ws_origin = self._ws_origin.get(ws)
-            if only_origin is not None and ws_origin != only_origin:
-                continue
-            if (only_unscoped
-                    and (ws_origin or "") in self._rpc_chain_id_by_origin):
-                continue
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "eth_subscription",
-                "params": {"subscription": sub_id, "result": result},
-            }
-            if not await self._ws_send(ws, json.dumps(payload)):
-                dead.append(ws)   # send failed → socket gone, prune it
+            for sub_id, (stype, sub_origin) in list(subs.items()):
+                if stype != sub_type:
+                    continue
+                if only_origin is not None and sub_origin != only_origin:
+                    continue
+                if (only_unscoped
+                        and (sub_origin or "") in self._rpc_chain_id_by_origin):
+                    continue
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "eth_subscription",
+                    "params": {"subscription": sub_id, "result": result},
+                }
+                if not await self._ws_send(ws, json.dumps(payload)):
+                    dead.append(ws)   # send failed → socket gone, prune it
+                    break
         for ws in dead:
             self._ws_subscriptions.pop(ws, None)
             self._ws_clients.discard(ws)
@@ -637,7 +647,7 @@ class RpcServer:
                         -32600,
                         "eth_subscribe for wallet events requires WebSocket",
                     )
-                return self._register_subscription(ws, sub_type)
+                return self._register_subscription(ws, sub_type, origin)
             # newHeads / logs / newPendingTransactions / syncing fall
             # through to the upstream RPC — they need their own
             # subscription bookkeeping (forwarding upstream

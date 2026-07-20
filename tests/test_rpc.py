@@ -7,6 +7,7 @@ the response grants it. These tests lock the granting headers in.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from aiohttp import web
@@ -92,8 +93,9 @@ def test_shutdown_closes_ws_clients_so_cleanup_does_not_block():
     server = RpcServer(MagicMock())
     ws = MagicMock(close=AsyncMock())
     server._ws_clients = {ws}
-    server._ws_subscriptions = {ws: {"chainChanged": "0x1"}}
-    server._ws_origin = {ws: "https://app.example"}
+    server._ws_subscriptions = {
+        ws: {"0x1": ("chainChanged", "https://app.example")}
+    }
     server._client = None
     server._runner = None
 
@@ -102,7 +104,6 @@ def test_shutdown_closes_ws_clients_so_cleanup_does_not_block():
     ws.close.assert_awaited_once()
     assert server._ws_clients == set()
     assert server._ws_subscriptions == {}
-    assert server._ws_origin == {}
 
 
 def test_ws_slow_request_does_not_head_of_line_block(monkeypatch):
@@ -164,3 +165,81 @@ def test_ws_slow_request_does_not_head_of_line_block(monkeypatch):
         assert "slow" in [s.get("id") for s in sent]
 
     asyncio.run(scenario())
+
+
+class _CaptureWS:
+    """Minimal WS stand-in that records the JSON payloads sent to it."""
+
+    closed = False
+
+    def __init__(self):
+        self.sent: list = []
+
+    async def send_str(self, s):
+        import json
+        self.sent.append(json.loads(s))
+
+
+def _pushes(ws):
+    """The (subscription id, result) pairs pushed to a capture ws."""
+    return [
+        (m["params"]["subscription"], m["params"]["result"])
+        for m in ws.sent
+        if m.get("method") == "eth_subscription"
+    ]
+
+
+class TestPerSubscriptionScoping:
+    """One multiplexed socket (a browser extension relaying every tab over a
+    single WS) must hold many same-type subscriptions, each scoped to its own
+    dapp origin. Keying by sub_type — or scoping on the socket's handshake
+    origin — collapsed them / mis-routed every push."""
+
+    def _server(self):
+        store = MagicMock()
+        store.current_chain.return_value = SimpleNamespace(chain_id=1)
+        return RpcServer(store, port=0)
+
+    def test_same_type_subscriptions_coexist_on_one_socket(self):
+        server = self._server()
+        ws = _CaptureWS()
+        a = server._register_subscription(ws, "chainChanged", "https://a.example")
+        b = server._register_subscription(ws, "chainChanged", "https://b.example")
+        assert a != b
+        # Both survive — a sub_type-keyed map would have dropped the first.
+        assert set(server._ws_subscriptions[ws]) == {a, b}
+
+    def test_only_origin_reaches_just_that_subscription(self):
+        server = self._server()
+        ws = _CaptureWS()
+        a = server._register_subscription(ws, "chainChanged", "https://a.example")
+        server._register_subscription(ws, "chainChanged", "https://b.example")
+        _run(server._broadcast_event(
+            "chainChanged", "0xa", only_origin="https://a.example"))
+        # Only origin A's subscription id is pushed; B is untouched.
+        assert _pushes(ws) == [(a, "0xa")]
+
+    def test_only_unscoped_skips_a_pinned_origin(self):
+        server = self._server()
+        ws = _CaptureWS()
+        pinned = server._register_subscription(
+            ws, "chainChanged", "https://pinned.example")
+        free = server._register_subscription(
+            ws, "chainChanged", "https://free.example")
+        # pinned.example switched its own chain → has an override.
+        server._rpc_chain_id_by_origin["https://pinned.example"] = 10
+        _run(server._broadcast_event(
+            "chainChanged", "0x1", only_unscoped=True))
+        # The UI-driven push reaches only the un-pinned subscription.
+        assert _pushes(ws) == [(free, "0x1")]
+        assert pinned not in [sid for sid, _ in _pushes(ws)]
+
+    def test_unregister_removes_only_that_sub(self):
+        server = self._server()
+        ws = _CaptureWS()
+        a = server._register_subscription(ws, "chainChanged", "https://a.example")
+        b = server._register_subscription(ws, "accountsChanged", "https://a.example")
+        server._unregister_subscription(ws, a)
+        assert set(server._ws_subscriptions[ws]) == {b}
+        _run(server._broadcast_event("chainChanged", "0x5"))
+        assert _pushes(ws) == []      # the removed sub gets nothing
