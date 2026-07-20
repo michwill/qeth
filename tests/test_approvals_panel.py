@@ -412,19 +412,10 @@ def test_stretch_last_section_is_off(qtbot):
     assert p.tree.header().stretchLastSection() is False
 
 
-def test_sort_by_token_is_alphabetical_by_default(qtbot):
-    p = _panel(qtbot)
-    p.append_rows([
-        _row(token=TOKEN2, symbol="ZRX", spender=SP1),
-        _row(token=TOKEN, symbol="AAVE", spender=SP1),
-    ])
-    assert p.tree.topLevelItem(0).text(0).startswith("AAVE")
-    assert p.tree.topLevelItem(1).text(0).startswith("ZRX")
-
-
-def test_sort_by_allowance_ranks_by_value_at_risk(qtbot):
-    # Both unlimited (so the OLD summed-cap sort tied them at ∞) — the sort now
-    # ranks by the value actually HELD, so BIG ($5000) beats SMALL ($5).
+def test_default_sort_ranks_by_value_at_risk(qtbot):
+    # No header click: the most-exposed token bubbles to the top out of the box.
+    # Both unlimited (so the OLD summed-cap sort tied them at ∞) — the sort ranks
+    # by the value actually HELD, so BIG ($5000) beats SMALL ($5).
     p = _panel(qtbot)
     p.append_rows([
         _row(token=TOKEN, symbol="SMALL", spender=SP1, allowance=_MAX,
@@ -432,14 +423,25 @@ def test_sort_by_allowance_ranks_by_value_at_risk(qtbot):
         _row(token=TOKEN2, symbol="BIG", spender=SP1, allowance=_MAX,
              decimals=6, price_usd=Decimal("1"), token_balance=5_000_000_000),    # $5000
     ])
-    p._on_header_clicked(1)                    # sort by Allowance → highest at-risk first
     assert p.tree.topLevelItem(0).text(0).startswith("BIG")
     assert p.tree.topLevelItem(1).text(0).startswith("SMALL")
 
 
+def test_header_click_switches_to_token_alphabetical(qtbot):
+    # Clicking the identity header switches away from the value-at-risk default.
+    p = _panel(qtbot)
+    p.append_rows([
+        _row(token=TOKEN2, symbol="ZRX", spender=SP1),
+        _row(token=TOKEN, symbol="AAVE", spender=SP1),
+    ])
+    p._on_header_clicked(0)
+    assert p.tree.topLevelItem(0).text(0).startswith("AAVE")
+    assert p.tree.topLevelItem(1).text(0).startswith("ZRX")
+
+
 def test_held_token_outranks_a_bigger_unheld_allowance(qtbot):
     # A huge unlimited cap on a token you DON'T hold is $0 at risk → sorts below
-    # a modest holding of a token you do hold.
+    # a modest holding of a token you do hold (the default value-at-risk order).
     p = _panel(qtbot)
     p.append_rows([
         _row(token=TOKEN2, symbol="UNHELD", spender=SP1, allowance=_MAX,
@@ -447,7 +449,6 @@ def test_held_token_outranks_a_bigger_unheld_allowance(qtbot):
         _row(token=TOKEN, symbol="HELD", spender=SP1, allowance=1_000_000,
              decimals=6, price_usd=Decimal("1"), token_balance=10_000_000),   # $10
     ])
-    p._on_header_clicked(1)
     assert p.tree.topLevelItem(0).text(0).startswith("HELD")     # real risk first
     assert p.tree.topLevelItem(1).text(0).startswith("UNHELD")   # $0 at risk → bottom
 
@@ -471,7 +472,6 @@ def test_leaves_still_sort_by_their_own_cap(qtbot):
              decimals=6, price_usd=Decimal("1")),                    # $1 finite
         _row(token=TOKEN, symbol="T", spender=SP2, allowance=_MAX),  # unlimited
     ])
-    p._on_header_clicked(1)
     node = p.tree.topLevelItem(0)
     assert node.child(0).text(0) == SP2       # unlimited spender first
     assert node.child(1).text(0) == SP1

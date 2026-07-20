@@ -604,8 +604,12 @@ class ApprovalsPanel(QWidget):
         self._host = host
         self._token_items: dict[str, QTreeWidgetItem] = {}
         self._hovered: QTreeWidgetItem | None = None
-        self._sort_col = 0
-        self._sort_order = Qt.SortOrder.AscendingOrder    # token A→Z by default
+        # Value-at-risk first by default: the tokens whose approvals could drain
+        # the most real money bubble to the top (Allowance column, descending) —
+        # the most useful thing to review first. (Header click still switches to
+        # token A→Z; see _on_header_clicked.)
+        self._sort_col = 1
+        self._sort_order = Qt.SortOrder.DescendingOrder
         self._col0_frac: float | None = None              # user's split ratio
         self._syncing = False                             # re-entrancy guard
         v = QVBoxLayout(self)
