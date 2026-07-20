@@ -220,3 +220,57 @@ def test_source_uses_etherscan_when_key_and_supported():
     src.fetch(ETH, A)
     assert "apikey=APIKEY" in captured["url"]
     assert "chainid=1" in captured["url"]
+
+
+# --- fetch_allowances: found / read-zero / failed (the prune-safety split) ---
+
+from qeth.plugins.approvals.discovery import fetch_allowances  # noqa: E402
+
+
+class _MCPending:
+    def __init__(self, success, value):
+        self.success = success
+        self.value = value
+
+
+class _FakeMulticall:
+    def __init__(self, outcomes):
+        self._outcomes = outcomes          # {spender_lower: (success, value)}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def add(self, token, calldata, decoder=None):
+        spender = "0x" + calldata[-20:].hex()
+        success, value = self._outcomes.get(spender.lower(), (True, 0))
+        return _MCPending(success, value)
+
+
+class _FakeMCClient:
+    def __init__(self, outcomes):
+        self._outcomes = outcomes
+
+    def multicall(self, batch_size=100):
+        return _FakeMulticall(self._outcomes)
+
+
+def test_fetch_allowances_splits_found_readzero_and_failed():
+    s_pos = "0x" + "11" * 20
+    s_zero = "0x" + "22" * 20
+    s_fail = "0x" + "33" * 20
+    client = _FakeMCClient({
+        s_pos.lower(): (True, 500),        # positive → found + read
+        s_zero.lower(): (True, 0),         # read as zero → read only (prunable)
+        s_fail.lower(): (False, None),     # call reverted → NEITHER (never prune)
+    })
+    pairs = [(TOKEN.lower(), s_pos.lower()),
+             (TOKEN.lower(), s_zero.lower()),
+             (TOKEN.lower(), s_fail.lower())]
+    found, read = fetch_allowances(client, A, pairs)
+    assert found == {(TOKEN.lower(), s_pos.lower()): 500}       # only >0 displayed
+    assert (TOKEN.lower(), s_pos.lower()) in read
+    assert (TOKEN.lower(), s_zero.lower()) in read              # definitively zero
+    assert (TOKEN.lower(), s_fail.lower()) not in read         # failed → not prunable

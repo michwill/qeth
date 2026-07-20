@@ -558,18 +558,26 @@ def test_all_rows_returns_displayed(qtbot):
     assert {r.spender for r in p.all_rows()} == {SP1, SP2}
 
 
-def test_prune_to_drops_unconfirmed_leaves(qtbot):
+def test_prune_zeroed_drops_only_the_zeroed_leaves(qtbot):
     p = _panel(qtbot)
     p.append_rows([_row(spender=SP1), _row(spender=SP2)])
-    p.prune_to({(TOKEN.lower(), SP1.lower())})
+    p.prune_zeroed({(TOKEN.lower(), SP2.lower())})     # only SP2 read as zero
     assert p.tree.topLevelItem(0).childCount() == 1
-    assert p.all_rows()[0].spender == SP1
+    assert p.all_rows()[0].spender == SP1              # SP1 (not zeroed) survives
 
 
-def test_prune_to_empty_removes_token_node(qtbot):
+def test_prune_zeroed_empty_keeps_everything(qtbot):
+    # A scan that read nothing as zero prunes nothing — the transient-read fix.
     p = _panel(qtbot)
     p.append_rows([_row(spender=SP1)])
-    p.prune_to(set())
+    p.prune_zeroed(set())
+    assert p.tree.topLevelItemCount() == 1
+
+
+def test_prune_zeroed_removes_emptied_token_node(qtbot):
+    p = _panel(qtbot)
+    p.append_rows([_row(spender=SP1)])
+    p.prune_zeroed({(TOKEN.lower(), SP1.lower())})
     assert p.tree.topLevelItemCount() == 0
 
 

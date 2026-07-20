@@ -168,6 +168,7 @@ class ScanWorker(QThread):
 
     batch_fetched = Signal(QULONGLONG, str, object)      # cid, addr_l, [Transaction] (NEW rows)
     rows_ready = Signal(QULONGLONG, str, object)         # cid, addr_l, [ApprovalRow]
+    pairs_zeroed = Signal(QULONGLONG, str, object)       # cid, addr_l, {(token, spender)} read==0
     progress = Signal(QULONGLONG, str, object, object)   # cid, addr_l, pairs_seen, total(0=busy)
     scan_done = Signal(QULONGLONG, str, bool, object)    # cid, addr_l, complete, logs_head
 
@@ -305,8 +306,15 @@ class ScanWorker(QThread):
         todo = all_pairs - checked
         if not todo:
             return
-        checked.update(todo)
-        found = fetch_allowances(client, self._address, todo)
+        found, read = fetch_allowances(client, self._address, todo)
+        # Mark only DEFINITIVELY-read pairs as checked, so a pair whose call
+        # failed this pass is retried in a later batch rather than silently
+        # dropped. Pairs read as exactly zero are reported as zeroed so the
+        # plugin can prune them — but a failed read never prunes a real cap.
+        checked.update(read)
+        zeroed = read - set(found)
+        if zeroed:
+            self.pairs_zeroed.emit(cid, addr_l, zeroed)
         if not found:
             return
         tokens = sorted({t for (t, _s) in found})
@@ -363,9 +371,10 @@ class ScanWorker(QThread):
 class ReconcileWorker(QThread):
     """Re-reads ``allowance(owner, spender)`` for a specific set of pairs after
     a modify/revoke mines, so the tree reflects the on-chain truth (a reverted
-    revoke keeps its old value; a successful one reads 0). Emits every requested
-    pair — 0 for any that dropped out of ``fetch_allowances`` (which keeps >0
-    only) so the plugin knows to remove the leaf."""
+    revoke keeps its old value; a successful one reads 0). Reports a pair's value
+    only when its call SUCCEEDED — a pair whose read reverted/failed is OMITTED,
+    so ``_on_reconciled`` leaves that leaf as-is rather than falsely removing a
+    real cap on a transient glitch."""
 
     reconciled = Signal(QULONGLONG, str, object)   # cid, addr_l, {(token, spender): value}
 
@@ -379,14 +388,17 @@ class ReconcileWorker(QThread):
     def run(self) -> None:
         cid = self._chain.chain_id
         addr_l = self._owner.lower()
-        values: dict[tuple[str, str], int] = dict.fromkeys(self._pairs, 0)
         try:
             client = self._client_factory(self._chain)
-            found = fetch_allowances(client, self._owner, self._pairs)
-            values.update(found)
+            found, read = fetch_allowances(client, self._owner, self._pairs)
         except Exception:
             log.debug("approvals reconcile failed", exc_info=True)
             return                              # leave leaves as-is; no false removals
+        # Only pairs actually read carry a value: found>0 as read, the rest of
+        # `read` as 0 (definitively revoked). Pairs whose call failed are absent
+        # → the plugin leaves them untouched.
+        values: dict[tuple[str, str], int] = {p: 0 for p in read}
+        values.update(found)
         self.reconciled.emit(cid, addr_l, values)
 
 
@@ -687,9 +699,13 @@ class ApprovalsPanel(QWidget):
                     out.append(r)
         return out
 
-    def prune_to(self, pairs: set[tuple[str, str]]) -> None:
-        """Drop leaves whose (token, spender) a fresh scan didn't re-confirm —
-        i.e. caps revoked outside qeth that now read zero."""
+    def prune_zeroed(self, pairs: set[tuple[str, str]]) -> None:
+        """Drop leaves whose (token, spender) a fresh scan read as DEFINITIVELY
+        zero (revoked). Only these are removed — a cached cap the scan couldn't
+        re-read (a transient failure) is left displayed, never dropped on a
+        hiccup."""
+        if not pairs:
+            return
         self.tree.blockSignals(True)
         for ti in range(self.tree.topLevelItemCount() - 1, -1, -1):
             node = self.tree.topLevelItem(ti)
@@ -699,7 +715,7 @@ class ApprovalsPanel(QWidget):
                 leaf = node.child(ci)
                 r = leaf.data(0, _ROW_ROLE)
                 if (isinstance(r, ApprovalRow)
-                        and (r.token.lower(), r.spender.lower()) not in pairs):
+                        and (r.token.lower(), r.spender.lower()) in pairs):
                     if leaf is self._hovered:
                         self._hovered = None
                     node.removeChild(leaf)
@@ -1046,6 +1062,7 @@ class ApprovalsPlugin(Plugin):
         self._cache = ApprovalsCache()               # persisted allowances + last block
         self._last_block = 0
         self._scan_pairs: set[tuple[str, str]] = set()   # pairs a live scan re-confirmed
+        self._scan_zeroed: set[tuple[str, str]] = set()  # pairs a live scan read as zero
 
     def widget(self) -> QWidget:
         if self._panel is None:
@@ -1280,6 +1297,7 @@ class ApprovalsPlugin(Plugin):
         epoch = self._epoch
         chain = self.host.current_chain()
         self._scan_pairs = set()
+        self._scan_zeroed = set()
         # Instant paint from the cache; only show the progress bar on a cold
         # scan. A warm scan refreshes the tail silently under the shown rows.
         self._panel.clear()
@@ -1302,6 +1320,8 @@ class ApprovalsPlugin(Plugin):
         worker.batch_fetched.connect(self._on_batch)
         worker.rows_ready.connect(
             lambda c, a, rows, e=epoch: self._on_rows(c, a, rows, e))
+        worker.pairs_zeroed.connect(
+            lambda c, a, pairs, e=epoch: self._on_zeroed(c, a, pairs, e))
         worker.progress.connect(
             lambda c, a, s, t, e=epoch: self._on_progress(c, a, s, t, e))
         worker.scan_done.connect(
@@ -1337,6 +1357,13 @@ class ApprovalsPlugin(Plugin):
             self._panel.append_rows(rows)
             self._scan_pairs |= {(r.token.lower(), r.spender.lower()) for r in rows}
 
+    def _on_zeroed(self, chain_id, addr_l, pairs, epoch) -> None:
+        # Pairs the scan read as DEFINITIVELY zero — the only ones a completed
+        # scan may prune. A pair whose read merely failed never lands here, so a
+        # transient glitch can't drop a real cap.
+        if self._fresh(chain_id, addr_l, epoch):
+            self._scan_zeroed |= {(t.lower(), s.lower()) for (t, s) in pairs}
+
     def _on_progress(self, chain_id, addr_l, seen, total, epoch) -> None:
         if self._panel is not None and self._fresh(chain_id, addr_l, epoch):
             self._panel.set_progress(int(seen), int(total or 0))
@@ -1345,10 +1372,11 @@ class ApprovalsPlugin(Plugin):
         if self._panel is None or not self._fresh(chain_id, addr_l, epoch):
             return
         if complete:
-            # Drop cached caps the fresh scan didn't re-confirm (revoked
-            # elsewhere), then persist the reconciled state + how far the logs
-            # indexer served (the incremental resume point).
-            self._panel.prune_to(self._scan_pairs)
+            # Drop only caps the fresh scan definitively read as zero (revoked
+            # elsewhere) — never a cap it just couldn't re-read — then persist
+            # the reconciled state + how far the logs indexer served (the
+            # incremental resume point).
+            self._panel.prune_zeroed(self._scan_zeroed)
             self._persist(logs_head)
         else:
             # Stopped/failed before finishing — don't treat the view as loaded,

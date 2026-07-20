@@ -97,7 +97,7 @@ def _pairs(got):
 
 def test_log_window_discovers_a_pair(monkeypatch):
     monkeypatch.setattr(ap, "fetch_allowances",
-                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, 42))
+                        lambda client, owner, pairs, **k: (dict.fromkeys(pairs, 42), set(pairs)))
     log_src = _FakeLogSource([[_log(TOKEN, A, SPENDER, 500)]])   # short window → end
     got = _run(_worker(log_src))
     assert (TOKEN.lower(), SPENDER.lower()) in _pairs(got)
@@ -107,7 +107,7 @@ def test_log_window_discovers_a_pair(monkeypatch):
 
 
 def test_windows_walk_the_from_block_cursor(monkeypatch):
-    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: {})
+    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: ({}, set()))
     # a full window (1000 rows, all block 100) then a short one ends it
     full = [_log(TOKEN, A, "0x" + "%040x" % i, 100) for i in range(ScanWorker.LOG_PAGE)]
     tail = [_log(TOKEN, A, SPENDER, 150)]
@@ -120,7 +120,7 @@ def test_windows_walk_the_from_block_cursor(monkeypatch):
 
 
 def test_incremental_from_block_passed_through(monkeypatch):
-    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: {})
+    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: ({}, set()))
     log_src = _FakeLogSource([[]])                  # nothing new since the cursor
     got = _run(_worker(log_src, from_block=999))
     assert log_src.from_blocks == [999]
@@ -129,7 +129,7 @@ def test_incremental_from_block_passed_through(monkeypatch):
 
 
 def test_log_source_failure_reports_incomplete(monkeypatch):
-    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: {})
+    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: ({}, set()))
 
     class _Boom:
         def fetch(self, chain, address, from_block=0):
@@ -144,7 +144,7 @@ def test_recent_tail_patches_the_indexer_gap(monkeypatch):
     # Logs cover up to block 500; a fresh approval at block 600 isn't indexed
     # yet but IS in the account's recent txs → the tail patch must catch it.
     monkeypatch.setattr(ap, "fetch_allowances",
-                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, 5))
+                        lambda client, owner, pairs, **k: (dict.fromkeys(pairs, 5), set(pairs)))
     new_spender = "0x" + "bb" * 20
     log_src = _FakeLogSource([[_log(TOKEN, A, SPENDER, 500)]])
     tail = [_tx(2, 600, _approve(new_spender), h="0xfresh")]   # newer than logs_head=500
@@ -160,7 +160,7 @@ def test_recent_tail_stops_at_logs_head(monkeypatch):
     # The tail walk must NOT descend below logs_head (that region is covered by
     # the log walk) — one page whose oldest block <= head, then stop.
     monkeypatch.setattr(ap, "fetch_allowances",
-                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, 1))
+                        lambda client, owner, pairs, **k: (dict.fromkeys(pairs, 1), set(pairs)))
     log_src = _FakeLogSource([[_log(TOKEN, A, SPENDER, 500)]])
     page = [_tx(3, 550, h="0x550"), _tx(2, 490, h="0x490")]   # oldest 490 <= head 500
     tx_src = _FakeTxSource([page, [_tx(1, 100, h="0xdeep")]])  # a 2nd page must not be read
@@ -170,7 +170,7 @@ def test_recent_tail_stops_at_logs_head(monkeypatch):
 
 
 def test_interruption_stops_before_fetching(monkeypatch):
-    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: {})
+    monkeypatch.setattr(ap, "fetch_allowances", lambda *a, **k: ({}, set()))
     log_src = _FakeLogSource([[_log(TOKEN, A, SPENDER, 100)]])
     w = _worker(log_src)
     monkeypatch.setattr(w, "isInterruptionRequested", lambda: True)
@@ -196,7 +196,7 @@ def _snap_worker(monkeypatch, *, allowance, **kw):
     # A snapshot approve produces the candidate pair via the initial _emit_rows,
     # so these exercise row-building without needing any log windows.
     monkeypatch.setattr(ap, "fetch_allowances",
-                        lambda client, owner, pairs, **k: dict.fromkeys(pairs, allowance))
+                        lambda client, owner, pairs, **k: (dict.fromkeys(pairs, allowance), set(pairs)))
     return _worker(_FakeLogSource([]),
                    snapshot=[_tx(0, 100, _approve(SPENDER))], **kw)
 
@@ -256,3 +256,23 @@ def test_price_source_failure_leaves_rows_unpriced(monkeypatch):
     got = _run(_snap_worker(monkeypatch, allowance=5_000_000, price_source=_Boom()))
     assert got["rows"][0][0].price_usd is None
     assert got["done"] == [True]
+
+
+# --- ReconcileWorker: omit a failed read (no false removal) -----------------
+
+def test_reconcile_omits_a_pair_whose_read_failed(monkeypatch):
+    from qeth.plugins.approvals import ReconcileWorker
+    kept = (TOKEN.lower(), SPENDER.lower())
+    gone = (TOKEN.lower(), ("0x" + "22" * 20).lower())
+    failed = (TOKEN.lower(), ("0x" + "33" * 20).lower())
+    # found = {kept: 9}, read = {kept, gone} (gone read as zero; failed absent).
+    monkeypatch.setattr(ap, "fetch_allowances",
+                        lambda client, owner, pairs, **k: ({kept: 9}, {kept, gone}))
+    w = ReconcileWorker(CHAIN, A, [kept, gone, failed], client_factory=_FakeClient)
+    out: list = []
+    w.reconciled.connect(lambda c, a, values: out.append(values))
+    w.run()
+    values = out[0]
+    assert values[kept] == 9            # positive → updated
+    assert values[gone] == 0            # definitively zero → removed
+    assert failed not in values         # read failed → OMITTED (leaf left as-is)

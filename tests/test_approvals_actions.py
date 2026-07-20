@@ -278,18 +278,34 @@ def test_kick_passes_cached_pairs_to_worker(plugin):
     assert PAIR in plugin._scan._known_pairs           # worker re-checks cached pairs
 
 
-def test_scan_done_prunes_and_persists(plugin):
+def test_scan_done_prunes_zeroed_and_persists(plugin):
     plugin._cache.save(CHAIN.chain_id, OWNER, [_row(spender=SPENDER)], 100)
     plugin._loaded_for = None
     plugin._kick(force=True)                            # renders the cached (old) pair
     other = "0x" + "cc" * 20
     plugin._on_rows(CHAIN.chain_id, OWNER.lower(), [_row(spender=other)], plugin._epoch)
+    # the old cached pair was read as DEFINITIVELY zero (revoked elsewhere)
+    plugin._on_zeroed(CHAIN.chain_id, OWNER.lower(), {PAIR}, plugin._epoch)
     plugin._on_done(CHAIN.chain_id, OWNER.lower(), True, 12345, plugin._epoch)
-    # old pair pruned (not re-confirmed), new one kept + persisted
+    # zeroed pair pruned, new one kept + persisted
     assert {r.spender for r in plugin._panel.all_rows()} == {other}
     loaded = plugin._cache.load(CHAIN.chain_id, OWNER)
     assert loaded is not None and {r.spender for r in loaded[0]} == {other}
     assert loaded[1] == 12345                          # logs_head persisted as the cursor
+
+
+def test_scan_done_keeps_a_cap_it_could_not_reread(plugin):
+    # THE TRANSIENT-READ PRUNE FIX: a cached cap the scan didn't definitively
+    # read as zero (its allowance() call reverted/failed this pass) must SURVIVE
+    # a completed scan — a momentary RPC hiccup can't delete a real approval.
+    plugin._cache.save(CHAIN.chain_id, OWNER, [_row(spender=SPENDER)], 100)
+    plugin._loaded_for = None
+    plugin._kick(force=True)                            # renders the cached pair
+    # scan completes having read NOTHING as zero (empty zeroed set)
+    plugin._on_done(CHAIN.chain_id, OWNER.lower(), True, 200, plugin._epoch)
+    assert {r.spender for r in plugin._panel.all_rows()} == {SPENDER}   # preserved
+    loaded = plugin._cache.load(CHAIN.chain_id, OWNER)
+    assert loaded is not None and {r.spender for r in loaded[0]} == {SPENDER}
 
 
 def test_incomplete_scan_does_not_prune_or_persist(plugin):

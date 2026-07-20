@@ -157,10 +157,22 @@ def approve_pairs_in(txs: Iterable[Transaction], account: str) -> set[tuple[str,
 def fetch_allowances(
     client: EthClient, owner: str, pairs: Iterable[tuple[str, str]],
     *, batch_size: int = 100,
-) -> dict[tuple[str, str], int]:
+) -> tuple[dict[tuple[str, str], int], set[tuple[str, str]]]:
     """One multicall pass reading ``allowance(owner, spender)`` for every pair —
-    always the SAME owner (the selected account). Keeps only calls that
-    succeeded with a positive allowance; reverts (non-ERC-20s) drop silently."""
+    always the SAME owner (the selected account).
+
+    Returns ``(found, read)``:
+
+    - ``found`` — ``{pair: value}`` for calls that succeeded with a POSITIVE
+      allowance (the displayed caps).
+    - ``read`` — every pair whose call SUCCEEDED (returned a decodable uint,
+      including exactly 0). A pair in ``read`` but not ``found`` was
+      definitively read as zero (revoked); a pair in NEITHER had its call
+      revert/fail this pass (a non-ERC-20, or a transient glitch).
+
+    The distinction matters for pruning: a cached cap must only be dropped when
+    it was DEFINITIVELY read as zero, never on a transient read failure — else a
+    momentary RPC hiccup deletes a real approval from the persisted cache."""
     owner_word = _pad_address(owner)
     pending: dict[tuple[str, str], object] = {}
     with client.multicall(batch_size=batch_size) as mc:
@@ -168,8 +180,11 @@ def fetch_allowances(
             calldata = _SEL_ALLOWANCE + owner_word + _pad_address(spender)
             pending[(token, spender)] = mc.add(
                 token, calldata, decoder=_decode_uint256)
-    out: dict[tuple[str, str], int] = {}
+    found: dict[tuple[str, str], int] = {}
+    read: set[tuple[str, str]] = set()
     for key, p in pending.items():
-        if p.success and isinstance(p.value, int) and p.value > 0:  # type: ignore[attr-defined]
-            out[key] = p.value                                       # type: ignore[attr-defined]
-    return out
+        if p.success and isinstance(p.value, int):    # type: ignore[attr-defined]
+            read.add(key)
+            if p.value > 0:                            # type: ignore[attr-defined]
+                found[key] = p.value                   # type: ignore[attr-defined]
+    return found, read
