@@ -2067,6 +2067,26 @@ class TestRpcEventBroadcast:
             asyncio.run(go())
         ws.send_str.assert_not_awaited()
 
+    def test_unsupported_wallet_methods_get_clean_32601_not_proxied(self):
+        # These wallet_* methods aren't implemented; they must return a
+        # deterministic -32601 rather than being proxied to the chain RPC
+        # (which also can't serve them and would answer with upstream noise).
+        from unittest.mock import AsyncMock
+        from qeth.rpc import RpcError
+        server = self._make_server()
+        # If any of these reached _proxy the test would make a network call;
+        # the hermeticity guard would fail it. Assert -32601 instead.
+        server._proxy = AsyncMock(side_effect=AssertionError("must not proxy"))
+        for method in (
+            "wallet_watchAsset", "wallet_getPermissions",
+            "wallet_requestPermissions", "wallet_revokePermissions",
+            "wallet_getCapabilities", "wallet_sendCalls",
+        ):
+            with pytest.raises(RpcError) as ei:
+                asyncio.run(server._dispatch(method, [], origin="https://d.example"))
+            assert ei.value.code == -32601
+            server._proxy.assert_not_awaited()
+
 
 def test_chain_added_signal_carries_ids_above_qint32(qtbot):
     """Dapp-supplied chain ids (wallet_addEthereumChain) can exceed qint32 —

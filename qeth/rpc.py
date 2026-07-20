@@ -40,6 +40,20 @@ class RpcError(Exception):
 _RPC_URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 _EXPLORER_URL_SCHEMES = frozenset({"http", "https"})
 
+# wallet_*-namespaced methods qeth doesn't implement. Answered with a clean
+# -32601 rather than proxied to the chain RPC (which can't serve them either
+# and returns messier, provider-specific errors). See _dispatch.
+_UNSUPPORTED_WALLET_METHODS = frozenset({
+    "wallet_watchAsset",
+    "wallet_getPermissions",
+    "wallet_requestPermissions",
+    "wallet_revokePermissions",
+    "wallet_getCapabilities",
+    "wallet_sendCalls",
+    "wallet_getCallsStatus",
+    "wallet_showCallsStatus",
+})
+
 
 def _require_safe_chain_urls(rpc_url: str, explorer: str) -> None:
     """Reject a dapp-supplied chain whose RPC or explorer URL isn't a normal
@@ -813,6 +827,16 @@ class RpcServer:
                 -32601,
                 "eth_signTransaction not supported (use eth_sendTransaction)",
             )
+
+        if method in _UNSUPPORTED_WALLET_METHODS:
+            # Wallet-namespaced methods qeth doesn't implement. Without this
+            # they'd fall through to _proxy and hit the chain RPC — which also
+            # doesn't implement them, but answers with a provider-specific
+            # error (or a transport failure). Reply with a clean, deterministic
+            # -32601 so every dapp/connector sees "method not supported" and
+            # falls back (e.g. wallet_requestPermissions → eth_requestAccounts)
+            # instead of surfacing upstream noise.
+            raise RpcError(-32601, f"{method} is not supported by qeth")
 
         if method == "eth_sendRawTransaction":
             # A dapp-submitted, pre-signed tx. Broadcast ONLY via the user's
