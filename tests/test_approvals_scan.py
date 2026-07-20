@@ -6,6 +6,8 @@ lists; fetch_allowances + metadata are stubbed so no network/chain is touched.
 
 from types import SimpleNamespace
 
+import pytest
+
 import qeth.plugins.approvals as ap
 from qeth.plugins.approvals import ScanWorker
 from qeth.plugins.approvals.discovery import _APPROVAL_TOPIC0
@@ -15,6 +17,13 @@ CHAIN = SimpleNamespace(chain_id=1, name="Ethereum", symbol="ETH")
 A = "0x" + "a1" * 20
 TOKEN = "0x" + "cc" * 20
 SPENDER = "0x" + "ee" * 20
+
+
+@pytest.fixture(autouse=True)
+def _no_softname_network(monkeypatch):
+    # The soft-label residual path calls Blockscout — keep the suite hermetic by
+    # default; the dedicated soft-label tests override this with their own stub.
+    monkeypatch.setattr(ap, "fetch_contract_display_name", lambda *a, **k: "")
 
 
 def _approve(spender):
@@ -70,6 +79,14 @@ class _FakeClient:
     def multicall_erc20_balances(self, tokens, holder, **k):
         return {t.lower(): self.BALANCES[t.lower()]
                 for t in tokens if t.lower() in self.BALANCES}
+
+    # ERC-20 name/symbol probe for spender soft-labels; {} = "no spender is a
+    # token" (a test opts in by setting ERC20_META).
+    ERC20_META: dict = {}
+
+    def multicall_erc20_metadata(self, tokens, **k):
+        return {t.lower(): self.ERC20_META[t.lower()]
+                for t in tokens if t.lower() in self.ERC20_META}
 
 
 class _FakeMeta:

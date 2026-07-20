@@ -12,6 +12,7 @@ without HTTP, mirroring the ``qeth.plugins.tokens.risk._parse_report`` pattern.
 
 import enum
 import json
+import re
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
@@ -571,3 +572,53 @@ def _fetch_transfer_logs_one(transport, timeout, chain, endpoint, key,
         )
     result = data.get("result")
     return result if isinstance(result, list) else []
+
+
+# A bare proxy shell's ContractName ("BeaconProxy", "TransparentUpgradeableProxy",
+# "ERC1967Proxy") identifies the pattern, not the contract — useless as a "who is
+# this" label, so it's dropped in favour of the implementation's name.
+_PROXY_NAME_RE = re.compile(r"proxy", re.IGNORECASE)
+
+
+def meaningful_contract_name(name: str | None, implementations) -> str:
+    """A human contract name from a Blockscout v2 smart-contract payload: the
+    implementation's name for a proxy (so a ``BeaconProxy`` reads as its logic
+    contract, e.g. ``VToken``), else the contract's own name — either way
+    dropping bare proxy-shell names. ``""`` when nothing meaningful remains."""
+    for impl in implementations or []:
+        nm = (impl.get("name") or "").strip() if isinstance(impl, dict) else ""
+        if nm and not _PROXY_NAME_RE.search(nm):
+            return nm
+    own = (name or "").strip()
+    if own and not _PROXY_NAME_RE.search(own):
+        return own
+    return ""
+
+
+def fetch_contract_display_name(
+    chain_id: int, address: str, *,
+    instances: dict[int, str] | None = None,
+    timeout: float = 15.0,
+    transport: "Transport | None" = None,
+) -> str:
+    """The verified contract's human name from the chain's Blockscout instance
+    (v2 ``/api/v2/smart-contracts/{address}``, keyless), proxy-resolved to its
+    implementation and stripped of bare proxy-shell names. ``""`` on an
+    unverified contract, an unsupported chain, or any error — a best-effort
+    *soft* label (self-reported, forgeable), never a definitive name-tag."""
+    instances = instances if instances is not None else BLOCKSCOUT_INSTANCES
+    base = instances.get(chain_id)
+    if not base:
+        return ""
+    transport = transport or _urllib_transport
+    url = (f"{base.rstrip('/')}/api/v2/smart-contracts/"
+           f"{urllib.parse.quote(address)}")
+    try:
+        data = json.loads(transport(url, timeout))
+    except Exception:
+        return ""
+    # Blockscout returns 404 / error bodies as dicts too — an unverified
+    # contract has no is_verified flag (mirrors BlockscoutAbiSource._fetch_v2).
+    if not isinstance(data, dict) or not data.get("is_verified"):
+        return ""
+    return meaningful_contract_name(data.get("name"), data.get("implementations"))

@@ -114,7 +114,11 @@ class ApprovalRow:
     symbol: str = ""
     name: str = ""
     decimals: int = 18
-    spender_label: str = ""   # "Uniswap: Router" etc., "" when unknown
+    spender_label: str = ""   # definitive public name-tag (OLI), "" when unknown
+    # A SELF-REPORTED name shown only when there's no name-tag: the spender's own
+    # ERC-20 name (it's a token) or its verified ABI contract name (proxy-resolved).
+    # Rendered in italic — forgeable, so lower-trust than a name-tag. "" when none.
+    spender_soft_label: str = ""
     price_usd: Decimal | None = None   # USD per whole token; None = unpriced
     # (the USD *value* of the cap is derived: allowance/10**decimals * price_usd,
     # so it stays correct after a reconcile changes `allowance` in place)

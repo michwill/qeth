@@ -34,6 +34,7 @@ from ...token_metadata import TokenMetadataCache
 from ...transactions import (
     ApprovalLogSource, BlockscoutTransactionSource,
     EtherscanV2TransactionSource, RoutedTransactionSource,
+    fetch_contract_display_name,
 )
 from ..transactions import _encode_approve
 from .discovery import (
@@ -229,6 +230,10 @@ class ScanWorker(QThread):
     LOG_PAGE = 1000               # explorer logs-API row cap per window
     RECENT_TX_PAGES = 5           # cap on the lag-patch tail (never the full history)
     MAX_ATTEMPTS = 3
+    # Per-scan budget for the per-address Blockscout contract-name lookups (the
+    # ERC-20-name multicall is batched/free and never capped) — bounds cold-scan
+    # fan-out on a huge account; the residual just shows the bare address.
+    SOFT_NAME_HTTP_CAP = 60
 
     def __init__(self, chain, address: str, log_source, tx_source, snapshot,
                  metadata_cache, *, from_block=0, label_source=None,
@@ -247,6 +252,8 @@ class ScanWorker(QThread):
         self._known_pairs = set(known_pairs or ())   # cached pairs to re-check
         self._priced: dict[str, Decimal | None] = {}   # token -> unit price (memo)
         self._balances: dict[str, int] = {}            # token -> holder balance (memo)
+        self._soft_labels: dict[str, str] = {}         # spender -> soft name (memo; "" = none)
+        self._softname_budget = self.SOFT_NAME_HTTP_CAP
         self._client_factory = client_factory or EthClient
         self._head = 0               # chain head, for block-% progress
 
@@ -417,7 +424,10 @@ class ScanWorker(QThread):
                 self._meta.put_many(cid, client.multicall_erc20_metadata(missing))
             except Exception:
                 log.debug("approvals metadata read failed", exc_info=True)
-        labels = self._fetch_labels(cid, sorted({s for (_t, s) in found}))
+        spenders = sorted({s for (_t, s) in found})
+        labels = self._fetch_labels(cid, spenders)
+        soft = self._fetch_soft_labels(
+            client, cid, [s for s in spenders if not labels.get(s)])
         self._fetch_balances(client, tokens)
         # Price finite-allowance tokens (for the cap USD sort) AND every token
         # actually HELD (for the "at risk" tag — most held tokens have an
@@ -433,6 +443,8 @@ class ScanWorker(QThread):
                 symbol=m.get("symbol") or "", name=m.get("name") or "",
                 decimals=int(m.get("decimals") or 18),
                 spender_label=labels.get(spender, ""),
+                spender_soft_label=(
+                    "" if labels.get(spender) else soft.get(spender, "")),
                 price_usd=prices.get(token),
                 token_balance=self._balances.get(token, 0)))
         self.rows_ready.emit(cid, addr_l, rows)
@@ -478,6 +490,45 @@ class ScanWorker(QThread):
         except Exception:
             log.debug("approvals label fetch failed", exc_info=True)
             return {}
+
+    def _fetch_soft_labels(self, client, cid: int,
+                           spenders: list[str]) -> dict[str, str]:
+        """Best-effort SELF-REPORTED names for spenders with no public name-tag:
+        the spender's own ERC-20 name (keyless multicall), then — for the
+        residual — its verified ABI contract name (keyless Blockscout, proxy-
+        resolved). Memoized so streaming batches don't refetch; the per-address
+        contract-name lookups are budgeted (``SOFT_NAME_HTTP_CAP``) so a huge
+        account doesn't fan out unboundedly. Rendered in italic (lower-trust)."""
+        need = [s for s in spenders if s not in self._soft_labels]
+        if need:
+            try:
+                meta = client.multicall_erc20_metadata(need)
+            except Exception:
+                meta = {}
+                log.debug("approvals soft-name metadata read failed", exc_info=True)
+            residual = []
+            for s in need:
+                m = meta.get(s)
+                if m:                                    # the spender IS an ERC-20
+                    self._soft_labels[s] = m.get("name") or m.get("symbol") or ""
+                else:
+                    residual.append(s)
+            skipped = 0
+            for s in residual:
+                if self._softname_budget <= 0:
+                    self._soft_labels[s] = ""            # over budget → bare address
+                    skipped += 1
+                    continue
+                self._softname_budget -= 1
+                try:
+                    self._soft_labels[s] = fetch_contract_display_name(cid, s)
+                except Exception:
+                    self._soft_labels[s] = ""
+                    log.debug("approvals contract-name fetch failed", exc_info=True)
+            if skipped:
+                log.debug("approvals: %d spender contract-name lookups skipped "
+                          "(per-scan budget)", skipped)
+        return {s: self._soft_labels.get(s, "") for s in spenders}
 
 
 class ReconcileWorker(QThread):
@@ -773,12 +824,34 @@ class ApprovalsPanel(QWidget):
         return node
 
     @staticmethod
-    def _leaf_text(r: ApprovalRow, reveal: bool) -> str:
-        """Column-0 text for a spender leaf: its name-tag normally, its actual
-        address when ``reveal`` (hover / selection) — or always the address
-        when there's no name-tag. ElideMiddle truncates a long value to fit."""
-        if r.spender_label and not reveal:
-            return r.spender_label
+    def _leaf_display(r: ApprovalRow, reveal: bool) -> tuple[str, bool]:
+        """(column-0 text, italic?) for a spender leaf. ``reveal`` (hover /
+        selection) always shows the plain address (regular). Otherwise, in
+        order: a definitive public name-tag (regular) › a self-reported soft
+        name (ITALIC — forgeable, so we flag lower confidence) › the bare
+        address. ElideMiddle truncates a long value to fit."""
+        if reveal:
+            return r.spender, False
+        if r.spender_label:
+            return r.spender_label, False
+        if r.spender_soft_label:
+            return r.spender_soft_label, True
+        return r.spender, False
+
+    @staticmethod
+    def _set_italic(leaf: QTreeWidgetItem, italic: bool) -> None:
+        f = leaf.font(0)
+        if f.italic() != italic:
+            f.setItalic(italic)
+            leaf.setFont(0, f)
+
+    @staticmethod
+    def _leaf_tooltip(r: ApprovalRow) -> str:
+        if r.spender_label:
+            return f"{r.spender_label}\n{r.spender}"
+        if r.spender_soft_label:
+            return (f"{r.spender_soft_label} — self-reported name (unverified, "
+                    f"could be spoofed)\n{r.spender}")
         return r.spender
 
     def _add_row(self, r: ApprovalRow) -> None:
@@ -806,13 +879,14 @@ class ApprovalsPanel(QWidget):
             node.setData(1, _RISK_ROLE, tag)
 
     def _fill_leaf(self, leaf: QTreeWidgetItem, r: ApprovalRow) -> None:
-        leaf.setText(0, self._leaf_text(r, reveal=leaf is self._hovered))
+        text, italic = self._leaf_display(r, reveal=leaf is self._hovered)
+        leaf.setText(0, text)
+        self._set_italic(leaf, italic)
         leaf.setText(1, _allowance_cell(r))
         leaf.setTextAlignment(
             1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         leaf.setData(1, _USD_SORT_ROLE, _row_sort_value(r))
-        leaf.setToolTip(0, f"{r.spender_label}\n{r.spender}"
-                        if r.spender_label else r.spender)
+        leaf.setToolTip(0, self._leaf_tooltip(r))
         leaf.setData(0, _ROW_ROLE, r)
 
     def all_rows(self) -> list[ApprovalRow]:
@@ -952,7 +1026,9 @@ class ApprovalsPanel(QWidget):
 
     def _refresh_reveal(self) -> None:
         """Rewrite each named leaf's column-0 text so the hovered / selected one
-        shows its address and the rest show their name-tag."""
+        shows its (regular-weight) address and the rest show their name — a
+        name-tag regular, a soft name italic. A bare-address leaf has nothing to
+        toggle and is skipped."""
         hovered = self._hovered
         current = self.tree.currentItem()
         self.tree.blockSignals(True)
@@ -963,12 +1039,14 @@ class ApprovalsPanel(QWidget):
             for ci in range(node.childCount()):
                 leaf = node.child(ci)
                 r = leaf.data(0, _ROW_ROLE)
-                if not isinstance(r, ApprovalRow) or not r.spender_label:
+                if not isinstance(r, ApprovalRow) or not (
+                        r.spender_label or r.spender_soft_label):
                     continue
                 reveal = leaf is hovered or (leaf is current and leaf.isSelected())
-                want = self._leaf_text(r, reveal)
-                if leaf.text(0) != want:
-                    leaf.setText(0, want)
+                text, italic = self._leaf_display(r, reveal)
+                if leaf.text(0) != text:
+                    leaf.setText(0, text)
+                self._set_italic(leaf, italic)
         self.tree.blockSignals(False)
 
     def _apply_token_icon(self, node: QTreeWidgetItem, token: str) -> None:

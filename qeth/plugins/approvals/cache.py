@@ -60,6 +60,7 @@ class ApprovalsCache:
                     symbol=d.get("symbol", ""), name=d.get("name", ""),
                     decimals=int(d.get("decimals", 18)),
                     spender_label=d.get("spender_label", ""),
+                    spender_soft_label=d.get("spender_soft_label", ""),
                     price_usd=Decimal(price) if price is not None else None,
                     token_balance=int(d.get("token_balance", 0))))
             except (KeyError, ValueError, TypeError):
@@ -79,6 +80,7 @@ class ApprovalsCache:
                     "allowance": str(r.allowance), "symbol": r.symbol,
                     "name": r.name, "decimals": r.decimals,
                     "spender_label": r.spender_label,
+                    "spender_soft_label": r.spender_soft_label,
                     "price_usd": str(r.price_usd) if r.price_usd is not None else None,
                     "token_balance": str(r.token_balance),
                 } for r in rows],
