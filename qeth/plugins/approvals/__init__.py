@@ -76,7 +76,9 @@ _IC_MODIFY = (("document-edit", "edit-rename", "accessories-text-editor"),
 _IC_REVOKE = (("edit-delete", "list-remove", "user-trash"),
               QStyle.StandardPixmap.SP_TrashIcon)
 _IC_COPY = (("edit-copy",), QStyle.StandardPixmap.SP_FileDialogContentsView)
-_IC_EXPLORER = (("internet-web-browser", "web-browser", "applications-internet"),
+# Same primary name + order as the Transactions tab's explorer button, so both
+# resolve to the same themed icon.
+_IC_EXPLORER = (("applications-internet", "internet-web-browser", "web-browser"),
                 QStyle.StandardPixmap.SP_ComputerIcon)
 _IC_REFRESH = (("view-refresh", "reload"), QStyle.StandardPixmap.SP_BrowserReload)
 _IC_STOP = (("media-playback-stop", "process-stop"),
