@@ -230,31 +230,41 @@ class ApprovalsMachine(RuleBasedStateMachine):
 
     @rule(zero=st.booleans())
     def scan_finishes_with_maybe_zeroed(self, zero):
-        # A completed scan prunes ONLY pairs it read as DEFINITIVELY zero. A
-        # shown cap the scan did NOT zero must survive (the transient-read fix);
-        # a zeroed one must go. Value oracle over prune_zeroed.
-        w = self.plugin._scan
-        if w is None or not isValid(w) or self.panel is None:
+        # A completed FRESH scan prunes ONLY pairs it read as DEFINITIVELY zero:
+        # a shown cap it did NOT zero must survive (the transient-read fix); a
+        # zeroed one must go. Value oracle over prune_zeroed.
+        #
+        # Force a fresh scan and drive ITS emissions, so the completion isn't
+        # ignored as stale — a prior epoch bump (e.g. cap_change_confirms with
+        # kick=True) makes an in-flight scan's scan_done a correct no-op, and
+        # that staleness path is already covered by cap_change_confirms.
+        if self.panel is None:
             return
-        rows = self.panel.all_rows()
-        if not rows:
+        self.plugin._kick(force=True)
+        w = self.plugin._scan
+        if w is None or not isValid(w):
             return
         cid, addr = self._view()
-        target = (rows[0].token.lower(), rows[0].spender.lower())
-        others = {(r.token.lower(), r.spender.lower()) for r in rows} - {target}
+        keep = ("0x" + "51" * 20, SPENDER.lower())
+        gone = ("0x" + "52" * 20, SPENDER.lower())
+        w.rows_ready.emit(cid, addr, [
+            ApprovalRow(token=keep[0], spender=SPENDER, allowance=1,
+                        symbol="K", decimals=0),
+            ApprovalRow(token=gone[0], spender=SPENDER, allowance=1,
+                        symbol="G", decimals=0)])
         if zero:
-            w.pairs_zeroed.emit(cid, addr, {target})
+            w.pairs_zeroed.emit(cid, addr, {gone})      # gone read as zero
         w.scan_done.emit(cid, addr, True, 0)            # complete → prune runs
         w.finished.emit()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         if self.panel is None:
             return
         after = {(r.token.lower(), r.spender.lower()) for r in self.panel.all_rows()}
+        assert keep in after                            # never-zeroed cap survives
         if zero:
-            assert target not in after                  # zeroed → pruned
+            assert gone not in after                    # zeroed → pruned
         else:
-            assert target in after                      # not zeroed → survives
-        assert others <= after                          # a non-zeroed cap never drops
+            assert gone in after                        # not zeroed → survives
 
     @rule()
     def stop(self):

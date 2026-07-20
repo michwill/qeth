@@ -308,6 +308,29 @@ def test_scan_done_keeps_a_cap_it_could_not_reread(plugin):
     assert loaded is not None and {r.spender for r in loaded[0]} == {SPENDER}
 
 
+def test_stale_scan_completion_is_ignored_but_fresh_prunes(plugin):
+    # Proves the product behaviour a stateful-test oracle mis-asserted: a scan
+    # whose epoch was bumped by an intervening re-kick is STALE, and its
+    # scan_done/pairs_zeroed are correctly ignored (the superseding scan is the
+    # authority) — so a zeroed pair is NOT pruned by a stale completion. The
+    # SAME emissions at the current epoch DO prune. Not a product bug.
+    plugin._panel.append_rows([_row(spender=SPENDER)])
+    plugin._loaded_for = (CHAIN.chain_id, OWNER.lower())
+    stale = plugin._epoch
+    plugin._epoch += 1                                  # a re-kick/reconcile bumped it
+
+    # Stale completion (old epoch) → ignored: the cap survives.
+    plugin._on_zeroed(CHAIN.chain_id, OWNER.lower(), {PAIR}, stale)
+    plugin._on_done(CHAIN.chain_id, OWNER.lower(), True, 0, stale)
+    assert {r.spender for r in plugin._panel.all_rows()} == {SPENDER}   # NOT pruned
+
+    # Fresh completion (current epoch) → the zeroed cap is pruned.
+    fresh = plugin._epoch
+    plugin._on_zeroed(CHAIN.chain_id, OWNER.lower(), {PAIR}, fresh)
+    plugin._on_done(CHAIN.chain_id, OWNER.lower(), True, 0, fresh)
+    assert plugin._panel.all_rows() == []                              # pruned
+
+
 def test_incomplete_scan_does_not_prune_or_persist(plugin):
     plugin._panel.append_rows([_row()])
     plugin._on_done(CHAIN.chain_id, OWNER.lower(), False, 0, plugin._epoch)  # stopped
