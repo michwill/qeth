@@ -1479,7 +1479,12 @@ class TokensPlugin(Plugin):
         if (self.host is not None
                 and self.host.current_chain().chain_id == chain_id
                 and self.host.selected_address):
-            self._refresh(self.host.selected_address)
+            # FORCE a full discovery round, not a plain _refresh: a discovery
+            # that lands WHILE the initial pipeline is still in flight (the
+            # network vault-provenance scan almost always does) would otherwise
+            # short-circuit on the in-flight guard and not surface its new tokens
+            # until the next 60s tick / account switch / restart.
+            self._invalidate_view_and_refresh()
 
     def _refresh(self, address: str) -> None:
         if self.host is None or self._panel is None:
