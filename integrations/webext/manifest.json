@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "qeth Companion",
+  "version": "0.1.0",
+  "description": "Connects dapps in this browser to the qeth desktop wallet on 127.0.0.1:1248.",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "qeth",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16-off.png",
+      "32": "icons/icon32-off.png",
+      "48": "icons/icon48-off.png",
+      "128": "icons/icon128-off.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*", "file://*/*"],
+      "js": ["relay.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["http://*/*", "https://*/*", "file://*/*"],
+      "js": ["config.js", "provider.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:1248"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "qeth-companion@qeth.org",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": ["alarms"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
