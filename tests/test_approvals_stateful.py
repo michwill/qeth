@@ -228,6 +228,34 @@ class ApprovalsMachine(RuleBasedStateMachine):
         w.finished.emit()                               # host deleteLater()s it
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # C++ gone
 
+    @rule(zero=st.booleans())
+    def scan_finishes_with_maybe_zeroed(self, zero):
+        # A completed scan prunes ONLY pairs it read as DEFINITIVELY zero. A
+        # shown cap the scan did NOT zero must survive (the transient-read fix);
+        # a zeroed one must go. Value oracle over prune_zeroed.
+        w = self.plugin._scan
+        if w is None or not isValid(w) or self.panel is None:
+            return
+        rows = self.panel.all_rows()
+        if not rows:
+            return
+        cid, addr = self._view()
+        target = (rows[0].token.lower(), rows[0].spender.lower())
+        others = {(r.token.lower(), r.spender.lower()) for r in rows} - {target}
+        if zero:
+            w.pairs_zeroed.emit(cid, addr, {target})
+        w.scan_done.emit(cid, addr, True, 0)            # complete → prune runs
+        w.finished.emit()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        if self.panel is None:
+            return
+        after = {(r.token.lower(), r.spender.lower()) for r in self.panel.all_rows()}
+        if zero:
+            assert target not in after                  # zeroed → pruned
+        else:
+            assert target in after                      # not zeroed → survives
+        assert others <= after                          # a non-zeroed cap never drops
+
     @rule()
     def stop(self):
         self.plugin._stop_scan()
