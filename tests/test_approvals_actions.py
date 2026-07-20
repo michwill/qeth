@@ -134,24 +134,35 @@ def test_confirm_schedules_and_runs_reconcile(plugin):
 
 def test_reconcile_zero_removes_leaf(plugin):
     plugin._panel.append_rows([_row()])
-    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 0}, plugin._epoch)
+    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 0})
     assert plugin._panel.tree.topLevelItemCount() == 0
 
 
 def test_reconcile_nonzero_updates_leaf(plugin):
     plugin._panel.append_rows([_row(allowance=_MAX)])
-    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 5_000_000},
-                          plugin._epoch)
+    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 5_000_000})
     leaf = plugin._panel.tree.topLevelItem(0).child(0)
     assert leaf.text(1) == _format_allowance(5_000_000, 6) == "5"    # no symbol
     assert not leaf.isDisabled()
 
 
-def test_stale_epoch_reconcile_ignored(plugin):
+def test_reconcile_applies_despite_epoch_change(plugin):
+    # Regression: a _kick (e.g. re-visiting the tab) between scheduling and
+    # completing a reconcile bumps _epoch — the reconcile must STILL apply, so a
+    # just-confirmed modify's new value isn't dropped. (This used to be gated on
+    # the epoch and silently lost.)
+    plugin._panel.append_rows([_row(allowance=_MAX)])
+    plugin._epoch += 5                                  # a kick happened in between
+    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 5_000_000})
+    assert plugin._panel.tree.topLevelItem(0).child(0).text(1) == "5"
+
+
+def test_reconcile_dropped_when_account_changed(plugin):
     plugin._panel.append_rows([_row()])
-    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 0},
-                          plugin._epoch - 1)
-    assert plugin._panel.tree.topLevelItemCount() == 1
+    # the reconcile was for OWNER; the user has since switched accounts
+    plugin.host.selected_address = "0x" + "b2" * 20
+    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 0})
+    assert plugin._panel.tree.topLevelItemCount() == 1  # not applied to the new view
 
 
 def test_invalidate_clears_reconcile_queue(plugin):
@@ -290,7 +301,7 @@ def test_incomplete_scan_does_not_prune_or_persist(plugin):
 def test_reconcile_zero_persists_the_removal(plugin):
     plugin._panel.append_rows([_row()])
     plugin._scan_pairs = {PAIR}
-    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 0}, plugin._epoch)
+    plugin._on_reconciled(CHAIN.chain_id, OWNER.lower(), {PAIR: 0})
     loaded = plugin._cache.load(CHAIN.chain_id, OWNER)
     assert loaded is not None and loaded[0] == []      # cache reflects the revoke
 

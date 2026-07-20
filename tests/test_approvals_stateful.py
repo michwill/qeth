@@ -27,7 +27,9 @@ from shiboken6 import isValid
 
 from qeth import QULONGLONG
 from qeth.chains import DEFAULT_CHAINS
-from qeth.plugins.approvals import ApprovalsPlugin
+from qeth.plugins.approvals import (
+    ApprovalsPlugin, ReconcileWorker, _format_allowance,
+)
 from qeth.plugins.approvals.cache import ApprovalsCache
 from qeth.plugins.approvals.discovery import _APPROVAL_TOPIC0, ApprovalRow
 from qeth.token_metadata import TokenMetadataCache
@@ -141,6 +143,37 @@ class ApprovalsMachine(RuleBasedStateMachine):
     @rule()
     def activate(self):
         self.plugin.on_activated()
+
+    @rule(value=st.integers(min_value=0, max_value=1000), kick=st.booleans())
+    def cap_change_confirms(self, value, kick):
+        # A modify/revoke of a shown cap: its on_confirmed schedules a reconcile,
+        # the read worker is spawned, and the fresh value lands — optionally
+        # AFTER a scan/visit bumped _epoch (kick=True). The displayed cap MUST
+        # reflect the fresh value regardless. (The reconcile used to be gated on
+        # the epoch, so a bump between scheduling and completing dropped it — the
+        # exact "modify confirmed but the list didn't change" bug.)
+        rows = self.panel.all_rows() if self.panel is not None else []
+        if not rows:
+            return
+        r = rows[0]
+        pair = (r.token.lower(), r.spender.lower())
+        cid, addr = self._view()
+        self.plugin._schedule_reconcile(pair)           # the modify's on_confirmed
+        self.plugin._run_reconcile()                    # spawn + capture-epoch
+        worker = next((w for w in reversed(self.host.started)
+                       if isValid(w) and isinstance(w, ReconcileWorker)), None)
+        if worker is None:
+            return
+        if kick:
+            self.plugin._epoch += 1                     # a scan / re-visit in between
+        worker.reconciled.emit(cid, addr, {pair: value})   # the fresh on-chain read
+        leaf = self.panel._leaf_for(*pair)
+        if value > 0:
+            assert leaf is not None and \
+                leaf.text(1) == _format_allowance(value, r.decimals), \
+                "confirmed cap change didn't update the displayed allowance"
+        else:
+            assert leaf is None, "revoked cap still shown after confirm"
 
     @rule(same_acct=st.booleans())
     def approve_confirms(self, same_acct):

@@ -1062,7 +1062,17 @@ class ApprovalsPlugin(Plugin):
         self.on_account_changed(self.host.selected_address if self.host else None)
 
     def on_activated(self) -> None:
-        self._kick()
+        # If the loaded-for guard skips a full re-scan, still re-read the shown
+        # caps' allowances — so a change made while we were away (or on another
+        # tab) is reflected on return, not left stale behind the guard.
+        if not self._kick():
+            self._refresh_displayed()
+
+    def _refresh_displayed(self) -> None:
+        if self._panel is None:
+            return
+        for r in self._panel.all_rows():
+            self._schedule_reconcile((r.token.lower(), r.spender.lower()))
 
     def shutdown(self) -> None:
         self._invalidate()
@@ -1195,14 +1205,15 @@ class ApprovalsPlugin(Plugin):
         if not owner:
             return
         chain = self.host.current_chain()
-        epoch = self._epoch
         worker = ReconcileWorker(chain, owner, pairs)
-        worker.reconciled.connect(
-            lambda c, a, vals, e=epoch: self._on_reconciled(c, a, vals, e))
+        worker.reconciled.connect(self._on_reconciled)
         self._start(worker)
 
-    def _on_reconciled(self, chain_id, addr_l, values, epoch) -> None:
-        if self._panel is None or not self._fresh(chain_id, addr_l, epoch):
+    def _on_reconciled(self, chain_id, addr_l, values) -> None:
+        # A targeted re-read applies as long as the account/chain still matches —
+        # NOT gated on the scan epoch, which a _kick between scheduling and
+        # completing would bump (dropping a just-confirmed modify's update).
+        if self._panel is None or self._current_view() != (chain_id, addr_l):
             return
         for (token, spender), value in values.items():
             if value > 0:
@@ -1212,15 +1223,18 @@ class ApprovalsPlugin(Plugin):
                 self._scan_pairs.discard((token.lower(), spender.lower()))
         self._persist()                              # keep the cache in step with a revoke
 
-    def _kick(self, *, force: bool = False) -> None:
+    def _kick(self, *, force: bool = False) -> bool:
+        """Start a (re-)scan. Returns True if a scan was started, False when the
+        loaded-for guard short-circuited it (so a caller can re-read caps another
+        way)."""
         view = self._current_view()
         if view is None or self._panel is None or self.host is None:
-            return
+            return False
         if not force and self._loaded_for == view:
-            return
+            return False
         addr = self.host.selected_address
         if not addr:
-            return
+            return False
         self._loaded_for = view
         self._epoch += 1
         epoch = self._epoch
@@ -1255,6 +1269,7 @@ class ApprovalsPlugin(Plugin):
         worker.finished.connect(lambda w=worker: self._forget_scan(w))
         self._scan = worker
         self._start(worker)
+        return True
 
     def _start(self, worker: QThread) -> None:
         if self.host is not None and hasattr(self.host, "start_worker"):
