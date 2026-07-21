@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "qeth",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "Connects dapps in this browser to the qeth desktop wallet on 127.0.0.1:1248.",
   "minimum_chrome_version": "116",
   "background": {
@@ -19,14 +19,27 @@
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*", "file://*/*"],
-      "js": ["relay.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file://*/*"
+      ],
+      "js": [
+        "relay.js"
+      ],
       "run_at": "document_start",
       "all_frames": true
     },
     {
-      "matches": ["http://*/*", "https://*/*", "file://*/*"],
-      "js": ["config.js", "provider.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file://*/*"
+      ],
+      "js": [
+        "config.js",
+        "provider.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"
@@ -41,8 +54,13 @@
       "strict_min_version": "128.0"
     }
   },
-  "permissions": ["alarms"],
-  "host_permissions": ["http://*/*", "https://*/*"],
+  "permissions": [
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

@@ -1,5 +1,5 @@
 Name:           qeth
-Version:        0.20.0
+Version:        0.21.0
 Release:        1%{?dist}
 Summary:        Qt Ethereum wallet with Ledger support and a Frame-compatible JSON-RPC server
 
@@ -130,6 +130,15 @@ install -Dm0644 qeth/assets/logos/qeth-icon-rounded.svg \
 %{_datadir}/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
 
 %changelog
+* Wed Jul 22 2026 Michael Egorov <michwill@yieldbasis.com> - 0.21.0-1
+- Browser extension (Chrome + Firefox, MV3) connecting dapps to the wallet, the
+  same role the Falkon connector plays inside Falkon; the Firefox add-on is
+  AMO-signed.
+- Falkon connector: a navigation-bar status button showing whether the wallet is
+  connected and on which network / account.
+- Faster Transactions tab: fixed a multi-second scroll hang when a new batch of
+  transactions streamed into a long list.
+
 * Sun Jul 19 2026 Michael Egorov <michwill@yieldbasis.com> - 0.20.0-1
 - Air-gapped QR signer (Keystone / Keycard): account import plus transaction,
   message, and typed-data signing over an animated-QR + camera exchange.
