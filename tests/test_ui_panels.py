@@ -890,6 +890,97 @@ class TestTransactionListPanel:
         # blockSignals discards them.
         assert fires == []
 
+    def test_coins_column_is_fixed_and_grows_incrementally(self, qtbot, tmp_qeth):
+        """Regression: the coins column must be Fixed, not ResizeToContents.
+        Activities resolve one row at a time (async), and setData into a
+        ResizeToContents column re-measures ALL rows — O(rows) per activity,
+        which froze a long list for ~2s while a new batch streamed in. Instead
+        the width grows from a running max (_max_coins_px) as activities land,
+        so each apply is O(1); it never shrinks below the widest seen."""
+        from PySide6.QtWidgets import QHeaderView
+        from qeth.plugins.transactions import _C_COINS
+        from qeth.tx_activity import Activity, AssetLeg
+        panel = TransactionListPanel()
+        qtbot.addWidget(panel)
+        panel.set_context(ETH, ADDR)
+        txs = [_tx(hash="0x" + format(i, "064x"), nonce=i) for i in range(5)]
+        panel.show_transactions(txs)
+        # Fixed even after show_transactions restores per-column resize modes.
+        assert (panel.table.horizontalHeader().sectionResizeMode(_C_COINS)
+                == QHeaderView.ResizeMode.Fixed)
+
+        wide = Activity("Multiswap",
+                        (AssetLeg("USDC", "0x1"), AssetLeg("DAI", "0x2"),
+                         AssetLeg("WETH", "0x3")),
+                        (AssetLeg("USDT", "0x4"), AssetLeg("WBTC", "0x5")))
+        panel.set_activities({txs[0].hash: wide})
+        grown = panel.table.columnWidth(_C_COINS)
+        assert grown > 0 and panel._max_coins_px == grown
+        # A subsequent narrower activity must not shrink the column.
+        narrow = Activity("Transfer", (AssetLeg("USDC", "0x1"),), ())
+        panel.set_activities({txs[1].hash: narrow})
+        assert panel.table.columnWidth(_C_COINS) == grown
+
+    def test_set_activities_applies_via_hash_index(self, qtbot, tmp_qeth):
+        """set_activities resolves each hash straight to its row through the
+        hash→row index (O(delta), not an O(rows) sweep per batch), and the
+        index stays correct after append + prepend shuffle the row numbers."""
+        from qeth.plugins.transactions import _C_VERB
+        from qeth.tx_activity import Activity
+        panel = TransactionListPanel()
+        qtbot.addWidget(panel)
+        panel.set_context(ETH, ADDR)
+        base = [_tx(hash="0x" + format(i, "064x"), nonce=i) for i in (30, 29, 28)]
+        panel.show_transactions(base)
+        panel.append_transactions(
+            [_tx(hash="0x" + format(i, "064x"), nonce=i) for i in (27, 26)])
+        panel.prepend_transactions(
+            [_tx(hash="0x" + format(i, "064x"), nonce=i) for i in (32, 31)])
+        # Index maps every hash to the row actually holding it.
+        for row in range(panel.table.rowCount()):
+            h = panel._tx_at(row).hash
+            assert panel._row_of[h] == row
+        # An activity lands on the right row via the index, wherever it moved to.
+        target = "0x" + format(28, "064x")
+        panel.set_activities({target: Activity("Landed")})
+        assert (panel.table.item(panel._row_of[target], _C_VERB).text()
+                == "Landed")
+
+    def test_update_tx_by_hash_uses_index(self, qtbot, tmp_qeth):
+        """update_tx_by_hash finds the row via the O(1) index and repaints it
+        in place; a hash that isn't shown returns False."""
+        panel = TransactionListPanel()
+        qtbot.addWidget(panel)
+        panel.set_context(ETH, ADDR)
+        panel.show_transactions(
+            [_tx(hash="0x" + format(i, "064x"), nonce=i, pending=True)
+             for i in (7, 6)])
+        h = "0x" + format(6, "064x")
+        assert panel.update_tx_by_hash(_tx(hash=h, nonce=6, success=True)) is True
+        row = panel._row_of[h]
+        assert panel.table.item(row, 0).toolTip() == "Success"   # repainted
+        assert panel.update_tx_by_hash(_tx(hash="0x" + "ff" * 32)) is False
+
+    def test_identity_label_style_survives_deleted_label(self, qtbot, tmp_qeth):
+        """Regression: the contract-identity fetch is async; by the time it
+        returns the dialog/row may be gone, freeing the QLabel's C++ half.
+        _style_identity_label must no-op on a dead wrapper instead of raising
+        'Internal C++ object already deleted'."""
+        import shiboken6
+        from types import SimpleNamespace
+        from PySide6.QtWidgets import QLabel
+        from qeth.plugins.transactions import _style_identity_label
+        badge = SimpleNamespace(text="Curve Finance: Router", level="info")
+        lbl = QLabel("identifying…")
+        shiboken6.delete(lbl)                 # free the C++ half now
+        assert not shiboken6.isValid(lbl)
+        _style_identity_label(lbl, badge)     # must not raise
+        # And a live label still renders normally.
+        live = QLabel("")
+        qtbot.addWidget(live)
+        _style_identity_label(live, badge)
+        assert live.text() == "Curve Finance: Router"
+
 
 class TestFocusAwareDelegate:
     """The list delegate must never paint the per-cell focus rectangle

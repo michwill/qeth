@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTabWidget, QTextEdit, QToolButton,
     QVBoxLayout, QWidget,
 )
+from shiboken6 import isValid as _qt_alive   # is a Qt C++ object still alive?
 
 from ... import QULONGLONG
 from ...abi import (
@@ -2333,6 +2334,12 @@ class TransactionListPanel(QWidget):
         # (assets moved, out → in) with no text inside it. Until a row's
         # activity resolves (or on a chain with no source) both stay empty.
         self._activities: dict[str, Activity] = {}
+        # hash → its current table row, so set_activities / update_tx_by_hash
+        # jump straight to the row instead of scanning all N (the O(N)-per-batch
+        # that, combined with the coins re-measure, made a long list hang while
+        # new activities streamed in). Maintained in _populate_row; rebuilt after
+        # a prepend shifts every row (see _reindex_rows).
+        self._row_of: dict[str, int] = {}
         self._icons: IconCache | None = None
         self._token_info: Callable[..., object] | None = None
         # Plugin-supplied callback (chain, address, txs) → fetch their
@@ -2401,7 +2408,13 @@ class TransactionListPanel(QWidget):
         self.table.setColumnWidth(_C_STATUS, _STATUS_COL_W)
         h.setSectionResizeMode(_C_NONCE, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(_C_TIME, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(_C_COINS, QHeaderView.ResizeMode.ResizeToContents)
+        # Coins is Fixed, sized by hand (_max_coins_px / _fit_verb_column),
+        # NOT ResizeToContents. Activities resolve one row at a time (async),
+        # and a ResizeToContents column re-measures ALL rows on every setData
+        # into it — so streaming 50 activities into a 5k-row list was ~700 ms
+        # (O(rows) per activity). Tracking the widest summary incrementally and
+        # setting the width once makes each apply O(1).
+        h.setSectionResizeMode(_C_COINS, QHeaderView.ResizeMode.Fixed)
         # Draw the coins icon 1:1 so the style can't rescale it per row (which
         # renders the thin flow arrow at inconsistent sizes). See the delegate.
         self.table.setItemDelegateForColumn(_C_COINS, _CoinsIconDelegate(self.table))
@@ -2419,9 +2432,12 @@ class TransactionListPanel(QWidget):
         h.setMinimumSectionSize(24)
         self.table.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # Widest verb text seen so far (px) — the verb column's natural
-        # width; tracked incrementally so the fit never scans all rows.
+        # Widest verb text / coins content seen so far (px) — the natural
+        # widths of the two hand-sized columns; tracked incrementally so the
+        # fit never scans all rows (both columns are Fixed, so setting an item
+        # into them never triggers a full re-measure).
         self._max_verb_px = 0
+        self._max_coins_px = 0
         v.addWidget(self.table, 1)
 
         # The empty-state / loading / error label sits stacked under the
@@ -2561,11 +2577,12 @@ class TransactionListPanel(QWidget):
         if not mapping:
             return
         self._activities.update(mapping)
-        for row in range(self.table.rowCount()):
-            tx = self._tx_at(row)
-            if tx is None or tx.hash not in mapping:
-                continue
-            self._apply_activity(row, mapping[tx.hash])
+        # O(len(mapping)), not O(rows): look each hash's row up in the index
+        # rather than sweeping the whole table for every resolved batch.
+        for h, act in mapping.items():
+            row = self._row_of.get(h)
+            if row is not None:
+                self._apply_activity(row, act)
         self._fit_verb_column()
 
     def _apply_activity(self, row: int, activity: Activity) -> None:
@@ -2585,6 +2602,16 @@ class TransactionListPanel(QWidget):
         if coins is not None:
             coins.setData(_COINS_ROLE, summary)
             coins.setToolTip(self._coins_tooltip(summary))
+            self._note_coins_width(summary)
+
+    def _note_coins_width(self, summary: TxSummary) -> None:
+        """Fold one summary's rendered width into the running max that sizes
+        the (Fixed) coins column. O(1) — the whole reason a streamed activity
+        doesn't re-measure every row. Mirrors the delegate's sizeHint formula
+        so the column ends up exactly as wide as ResizeToContents would."""
+        self._max_coins_px = max(
+            self._max_coins_px,
+            coins_content_width(summary) + 2 * _CoinsIconDelegate._HPAD)
 
     @staticmethod
     def _coins_tooltip(summary: TxSummary) -> str:
@@ -2615,6 +2642,11 @@ class TransactionListPanel(QWidget):
         # set in __init__ drifts wider (~60px) before the layout settles, which
         # left the small ✓ swimming in empty space. Re-pin it on every render.
         t.setColumnWidth(_C_STATUS, _STATUS_COL_W)
+        # Coins is Fixed (see __init__): apply the width its widest resolved
+        # summary needs — accumulated in _max_coins_px as activities land, so
+        # this never scans the rows. (Clamped up to minimumSectionSize before
+        # any activity has resolved.)
+        t.setColumnWidth(_C_COINS, self._max_coins_px)
         hdr = t.horizontalHeader()
         others = sum(t.columnWidth(i)
                      for i in (_C_STATUS, _C_NONCE, _C_TIME, _C_COINS))
@@ -2741,16 +2773,19 @@ class TransactionListPanel(QWidget):
 
     def show_loading(self) -> None:
         self.table.setRowCount(0)
+        self._row_of.clear()
         self.status_lbl.setText("Loading transactions…")
         self.status_lbl.setVisible(True)
 
     def show_error(self, msg: str) -> None:
         self.table.setRowCount(0)
+        self._row_of.clear()
         self.status_lbl.setText(f"Couldn't load transactions: {msg}")
         self.status_lbl.setVisible(True)
 
     def show_empty(self) -> None:
         self.table.setRowCount(0)
+        self._row_of.clear()
         self.status_lbl.setText("No transactions yet for this account.")
         self.status_lbl.setVisible(True)
 
@@ -2758,7 +2793,9 @@ class TransactionListPanel(QWidget):
         self.table.setRowCount(0)
         self.status_lbl.setVisible(False)
         self._activities.clear()
+        self._row_of.clear()
         self._max_verb_px = 0
+        self._max_coins_px = 0
         self._chain = None
         self._viewer = None
 
@@ -2767,7 +2804,11 @@ class TransactionListPanel(QWidget):
             self.show_empty()
             return
         self.status_lbl.setVisible(False)
-        self._max_verb_px = 0   # this view's verbs re-measure from scratch
+        # This view's verb / coins widths re-measure from scratch, and the
+        # hash→row index is rebuilt wholesale as _populate_row repaints rows.
+        self._max_verb_px = 0
+        self._max_coins_px = 0
+        self._row_of.clear()
         h = self.table.horizontalHeader()
         col_count = self.table.columnCount()
         # ResizeToContents columns re-measure all rows of that column
@@ -2823,6 +2864,7 @@ class TransactionListPanel(QWidget):
         for tx in reversed(txs):
             self.table.insertRow(0)
             self._populate_row(0, tx)
+        self._reindex_rows()   # every existing row shifted down — rebuild
         self._request_activities(txs)
         self._fit_verb_column()
         # insertRow(0) can leave the view's *current* index on the new
@@ -2838,12 +2880,11 @@ class TransactionListPanel(QWidget):
         updated (typically pending → confirmed via receipt).
         Returns True if a matching row was found. Cheaper than a
         full show_transactions when the cache is large — no
-        rebuild, no header re-measurement."""
-        for row in range(self.table.rowCount()):
-            existing = self._tx_at(row)
-            if existing is not None and existing.hash == tx.hash:
-                self._populate_row(row, tx)
-                return True
+        rebuild, no header re-measurement. O(1) via the hash→row index."""
+        row = self._row_of.get(tx.hash)
+        if row is not None and self._tx_at(row) is not None:
+            self._populate_row(row, tx)
+            return True
         return False
 
     def _populate_row(self, row: int, tx: Transaction) -> None:
@@ -2892,10 +2933,22 @@ class TransactionListPanel(QWidget):
         self.table.setItem(row, _C_TIME, time_item)
         self.table.setItem(row, _C_VERB, verb_item)
         self.table.setItem(row, _C_COINS, coins_item)
+        self._row_of[tx.hash] = row     # keep the hash→row index current
 
         activity = self._activities.get(tx.hash)
         if activity is not None:
             self._apply_activity(row, activity)
+
+    def _reindex_rows(self) -> None:
+        """Rebuild the hash→row index from the current table order. Needed
+        after a prepend: insertRow(0) shifts every existing row down, so the
+        per-row entries _populate_row wrote are stale. O(rows), but prepend is
+        rare (a page-1 refresh finding newer txs) and already O(rows) itself."""
+        self._row_of = {
+            tx.hash: row
+            for row in range(self.table.rowCount())
+            if (tx := self._tx_at(row)) is not None
+        }
 
     def _tx_at(self, row: int) -> Transaction | None:
         item = self.table.item(row, _C_VERB)
@@ -3677,6 +3730,11 @@ _IDENTITY_TINT = {
 def _style_identity_label(label: QLabel, badge) -> None:
     """Render an IdentityBadge into ``label``: a tinted pill for warn /
     caution, muted plain text for a neutral EOA, normal text otherwise."""
+    if not _qt_alive(label):
+        # The identity fetch is async; by the time it returns the dialog may
+        # have closed or the row been rebuilt, freeing the QLabel's C++ half.
+        # Touching it then raises "Internal C++ object already deleted".
+        return
     label.setText(badge.text)
     tint = _IDENTITY_TINT.get(badge.level)
     if tint:
@@ -3710,6 +3768,8 @@ def _make_identity_row(*, to_addr: str | None, chain,
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
     def _apply(badge) -> None:
+        if not _qt_alive(label):     # async return after the row/dialog is gone
+            return
         if badge is not None:
             _style_identity_label(label, badge)
         else:
@@ -5979,6 +6039,8 @@ class SendTokenDialog(_TxComposerDialog):
     def _on_identity_ready(self, addr: str, badge) -> None:
         if self._identity_label is None or addr != self._identity_last_addr:
             return   # stale: recipient changed while this lookup was in flight
+        if not _qt_alive(self._identity_label):
+            return   # dialog closed mid-fetch — the QLabel's C++ half is gone
         if badge is None:
             self._identity_label.setText("")
             self._identity_label.setStyleSheet("")
