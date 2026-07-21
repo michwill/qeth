@@ -34,6 +34,12 @@ dependencies = [
     "hexbytes>=1",
     "requests>=2.31",
     "rlp>=4",
+    # Fast C JSON codec for the transaction cache (qeth/transactions_cache.py):
+    # a busy wallet's 10k-tx / 13 MB cache serialized on the main thread while
+    # scrolling; ujson roughly halves encode/decode vs stdlib and is
+    # arbitrary-precision-int correct (uint256 value_wei). The import is guarded
+    # + falls back to stdlib json, so a build without it still works (slower).
+    "ujson>=5",
 ]
 
 [project.optional-dependencies]
@@ -129,6 +135,7 @@ ty = "2099-01-01T00:00:00Z"
 markers = [
     "network: requires live network and external services",
     "browser: launches headless Chromium/Firefox with the webext against a stub RpcServer; needs chromedriver/geckodriver on PATH and a free port 1248",
+    "real_tx_saver: opt out of the conftest sync-saver patch to exercise AsyncTransactionSaver's real off-thread write",
 ]
 addopts = "-m 'not network and not browser'"
 # pytest-qt: tell it which Qt binding we use. The "offscreen" Qt

@@ -70,7 +70,9 @@ from ...transactions import (
     BlockscoutTransactionSource, EtherscanV2TransactionSource,
     RoutedTransactionSource, Transaction, TransactionSource,
 )
-from ...transactions_cache import TransactionCache, merge_txs
+from ...transactions_cache import (
+    AsyncTransactionSaver, TransactionCache, merge_txs,
+)
 from ...activity_cache import ActivityCache
 from ...token_metadata import TokenMetadataCache
 from ...tx_activity import (
@@ -994,6 +996,12 @@ class TransactionsPlugin(Plugin):
                 source = blockscout
         self._source: TransactionSource = source
         self._disk_cache = disk_cache if disk_cache is not None else TransactionCache()
+        # Persist tx-cache writes off the main thread — a 10k-tx save is ~40 ms
+        # even with ujson, which stutters the scroll when a history walk fetches
+        # page after page. Reads self._disk_cache at write time so a swapped
+        # cache (tests) still works. Coalesces + flushed on shutdown.
+        self._saver = AsyncTransactionSaver(
+            lambda c, a, t: self._disk_cache.save(c, a, t))
         # ABI machinery for the details dialog. Lazy fetch + disk-
         # cache so each contract address is looked up at most once.
         # Prefer Etherscan v2 (reliable, proxy-aware) when the store has a
@@ -1172,6 +1180,7 @@ class TransactionsPlugin(Plugin):
             self._nonce_timer.stop()
         if self._live_watcher is not None:
             self._live_watcher.stop()
+        self._saver.close()           # drain the last off-thread write, join the thread
 
     # --- ws live watcher wiring -------------------------------------------
 
@@ -1456,7 +1465,7 @@ class TransactionsPlugin(Plugin):
             disk = self._disk_cache.load(chain.chain_id, addr_lower)
             self._cache[key] = list(disk) if disk else []
         self._cache[key] = merge_txs([pending], self._cache[key])
-        self._disk_cache.save(chain.chain_id, addr_lower, self._cache[key])
+        self._saver.submit(chain.chain_id, addr_lower, self._cache[key])
         # If the panel is currently showing this view, prepend the
         # single new pending row instead of rebuilding the whole
         # table — full repaints on big caches are exactly the
@@ -1524,7 +1533,7 @@ class TransactionsPlugin(Plugin):
                 if not t.pending:
                     return    # already confirmed (race with Blockscout)
                 txs[i] = _confirmed_from_receipt(t, receipt)
-                self._disk_cache.save(chain_id, key[1], txs)
+                self._saver.submit(chain_id, key[1], txs)
                 # No longer pending → drop it from the live snapshot so the ws
                 # watcher stops re-probing (and re-confirming) it every block.
                 # Fixes the duplicate deliveries at the source; _confirmed_seen
@@ -1643,7 +1652,7 @@ class TransactionsPlugin(Plugin):
                 txs[i] = replace(
                     t, pending=False, dropped=True, raw_signed=None,
                 )
-                self._disk_cache.save(chain_id, key[1], txs)
+                self._saver.submit(chain_id, key[1], txs)
                 # Terminal → drop it from the live snapshot so the ws watcher
                 # stops re-probing it every block (as on confirm).
                 self._rebuild_live_snapshot()
@@ -2171,7 +2180,7 @@ class TransactionsPlugin(Plugin):
         # equality (frozen dataclasses, deterministic merge order) catches
         # both new rows and updated fields (pending→confirmed, reorg fixes).
         if merged != existing:
-            self._disk_cache.save(chain_id, address_lower, merged)
+            self._saver.submit(chain_id, address_lower, merged)
 
         new_rows = [t for t in page if t.hash not in existing_hashes]
         oldest = min((t.block_number for t in merged), default=None)

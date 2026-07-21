@@ -149,6 +149,20 @@ socket.create_connection = _guarded_create_connection
 
 
 @pytest.fixture(autouse=True)
+def _sync_tx_cache_saver(request, monkeypatch):
+    """The transactions plugin persists its tx cache OFF the main thread
+    (``AsyncTransactionSaver``). In tests, make that write synchronous so a test
+    can read the file back right after ``add_pending`` / a fetched page lands.
+    The off-thread behaviour itself is exercised with ``@pytest.mark.real_tx_saver``."""
+    if request.node.get_closest_marker("real_tx_saver"):
+        return
+    from qeth.transactions_cache import AsyncTransactionSaver
+    monkeypatch.setattr(
+        AsyncTransactionSaver, "submit",
+        lambda self, chain_id, address, txs: self._write(chain_id, address, txs))
+
+
+@pytest.fixture(autouse=True)
 def _network_guard(request):
     """Per-test switch for the socket guard above + loud teardown report."""
     global _net_allowed

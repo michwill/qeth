@@ -1,7 +1,11 @@
 """Tests for qeth.transactions_cache — disk persistence for past txs."""
 
+import threading
+
+import pytest
+
 from qeth.transactions import Transaction
-from qeth.transactions_cache import TransactionCache, merge_txs
+from qeth.transactions_cache import AsyncTransactionSaver, TransactionCache, merge_txs
 
 
 def _tx(hash_suffix: str = "ab", **kw) -> Transaction:
@@ -164,3 +168,70 @@ class TestMergeTxs:
         o = _tx("oo", nonce=10)
         merged = merge_txs([n], [o])
         assert merged == [n, o]
+
+
+# --- fast serializer + stdlib fallback -------------------------------------
+
+def test_serialization_fallback_without_ujson(tmp_qeth, monkeypatch):
+    # Force the stdlib-json path (a build without ujson) — same on-disk bytes,
+    # so the cache round-trips, big uint256 wei included.
+    import qeth.transactions_cache as tc
+    monkeypatch.setattr(tc, "ujson", None)
+    c = TransactionCache()
+    txs = [_tx("a1", value_wei=2 ** 200), _tx("a2", nonce=11)]
+    c.save(1, ADDR, txs)
+    assert c.load(1, ADDR) == txs
+
+
+# --- AsyncTransactionSaver (off-thread, coalesced persistence) -------------
+
+@pytest.mark.real_tx_saver
+def test_async_saver_writes_off_the_main_thread():
+    main = threading.current_thread()
+    seen = []
+    saver = AsyncTransactionSaver(
+        lambda cid, addr, txs: seen.append((threading.current_thread(), cid, addr, list(txs))))
+    try:
+        saver.submit(1, ADDR, [_tx("a1")])
+        saver.flush()
+        assert len(seen) == 1
+        thread, cid, addr, txs = seen[0]
+        assert thread is not main                    # the whole point: OFF the UI thread
+        assert cid == 1 and addr == ADDR.lower() and len(txs) == 1
+    finally:
+        saver.close()
+
+
+@pytest.mark.real_tx_saver
+def test_async_saver_coalesces_a_burst_keeping_the_latest():
+    started, release, writes = threading.Event(), threading.Event(), []
+
+    def write(cid, addr, txs):
+        if not writes:                               # hold the FIRST write open
+            started.set()
+            release.wait(1.0)
+        writes.append(len(txs))
+
+    saver = AsyncTransactionSaver(write)
+    try:
+        saver.submit(1, ADDR, [_tx("00")])           # kicks the (blocking) first write
+        assert started.wait(1.0)                     # worker is inside write()
+        for n in (2, 3, 7):                          # pile up behind it → coalesce
+            saver.submit(1, ADDR, [_tx(f"{i:02x}") for i in range(n)])
+        release.set()
+        saver.flush()
+        assert writes == [1, 7]                      # 4 submits → 2 writes, newest (7) wins
+    finally:
+        release.set()
+        saver.close()
+
+
+@pytest.mark.real_tx_saver
+def test_async_saver_close_drains_then_ignores():
+    done = []
+    saver = AsyncTransactionSaver(lambda c, a, t: done.append(len(t)))
+    saver.submit(1, ADDR, [_tx("a1"), _tx("a2")])
+    saver.close()                                    # must flush the queued write first
+    assert done == [2]
+    saver.submit(1, ADDR, [_tx("a3")])               # no-op after close
+    assert done == [2]

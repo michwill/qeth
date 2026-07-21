@@ -7,6 +7,8 @@ plugins do in response to lifecycle calls.
 """
 
 
+import threading
+
 import pytest
 from PySide6.QtCore import Qt
 
@@ -450,6 +452,39 @@ class TestTransactionsPlugin:
         assert reloaded is not None
         assert len(reloaded) == 1
         assert reloaded[0].hash == fetched[0].hash
+
+    @pytest.mark.real_tx_saver
+    def test_fetched_page_persists_off_the_main_thread(self, qtbot, tmp_qeth):
+        # The scroll hang was a big-cache save on the MAIN thread in
+        # _on_page_fetched. It must now persist off-thread (real saver, not the
+        # conftest sync patch) — otherwise scrolling a busy wallet freezes.
+        from qeth.transactions_cache import TransactionCache
+        plugin = TransactionsPlugin()
+        host = _StubHost(address=ADDR)
+        plugin.attach(host)
+        qtbot.addWidget(plugin.widget())
+        main = threading.current_thread()
+        save_threads = []
+        real = plugin._disk_cache
+
+        class _RecCache:
+            def save(self, cid, a, txs):
+                save_threads.append(threading.current_thread())
+                real.save(cid, a, txs)
+
+            def load(self, cid, a):
+                return real.load(cid, a)
+
+        plugin._disk_cache = _RecCache()          # the saver's lambda reads this at write time
+        fetched = [Transaction(
+            chain_id=1, hash="0x" + "cd" * 32, block_number=11, timestamp=2,
+            nonce=1, from_addr=ADDR, to_addr="0xbeef", value_wei=0, gas_used=0,
+            gas_price_wei=0, method_id="", input_data="0x", success=True)]
+        plugin._on_page_fetched(ETH.chain_id, ADDR.lower(), 1, fetched, True)
+        plugin._saver.flush()                     # wait for the off-thread write
+        assert save_threads and main not in save_threads   # persisted, but NOT on the UI thread
+        assert TransactionCache().load(ETH.chain_id, ADDR)[0].hash == fetched[0].hash
+        plugin.shutdown()
 
     def test_is_full_history(self):
         """Cache completeness is derived from the data itself: sent
