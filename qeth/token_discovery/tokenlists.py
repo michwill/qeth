@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar
 from collections.abc import Iterable
@@ -307,6 +307,13 @@ DEFAULT_SOURCES: list[TokenListSource] = [
 # Merged index
 # ---------------------------------------------------------------------------
 
+def _is_http_logo(uri: str | None) -> bool:
+    """True for a logo URI qeth can fetch directly (``http(s)``). A non-http
+    URI (``ipfs://``) or ``None`` is worth replacing with a later source's
+    http logo — belt-and-suspenders behind ``icons._normalize_icon_url``."""
+    return uri is not None and uri.startswith(("http://", "https://"))
+
+
 class TokenLists:
     """Loads multiple TokenListSource implementations and merges them.
 
@@ -343,9 +350,18 @@ class TokenLists:
                         self.cache_dir, self.ttl_seconds, self.timeout
                     ):
                         key = (entry.chain_id, entry.address)
-                        if key not in new_index:
+                        existing = new_index.get(key)
+                        if existing is None:
                             new_index[key] = entry
                             added += 1
+                        elif (not _is_http_logo(existing.logo_uri)
+                              and _is_http_logo(entry.logo_uri)):
+                            # First (most-trusted) source keeps the entry's
+                            # identity, but its non-http logo (ipfs://, or
+                            # none) is shadowing a fetchable one — borrow the
+                            # later source's http(s) logo so the icon loads.
+                            new_index[key] = replace(
+                                existing, logo_uri=entry.logo_uri)
                 except Exception as e:
                     log.warning("source %s failed entirely: %s", src.name, e)
                     continue

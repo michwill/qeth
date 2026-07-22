@@ -1907,6 +1907,11 @@ class TokensPlugin(Plugin):
                 chain, native_wei, visible, entries, prices,
                 apply_dust_filter=apply_dust,
             )
+        # Ensure every visible token has its icon requested even on the
+        # in-place update path (which doesn't run show_balances' per-row
+        # request) — e.g. a token discovered before the token lists loaded,
+        # or whose logo URL only became fetchable after a lists refresh.
+        self._panel.request_missing_icons(chain.chain_id, entries)
 
         # Cache the normal-mode visible set (post-dust + force-show; never the
         # spotlight superset) PLUS any held tokens the user HID. The disk cache
@@ -2851,6 +2856,30 @@ class TokenListPanel(QWidget):
                 bal_cell.set_value(value)
         self.table.setSortingEnabled(True)
         return True
+
+    def request_missing_icons(self, chain_id: int, entries: dict) -> None:
+        """(Re)request an icon for any displayed token row that still lacks
+        one. A token first painted before its list entry (hence its logo URL)
+        was available never gets a second chance otherwise: the in-place
+        balance-update path doesn't run show_balances' per-row icon request,
+        so a token discovered before the token lists finished loading would
+        stay iconless until a full re-render. Idempotent — ``request()``
+        no-ops for an already-cached or in-flight icon."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if not key:
+                continue
+            cid, addr = key
+            if (cid != chain_id or not isinstance(addr, str)
+                    or addr == self.NATIVE_CONTRACT
+                    or self._icons.get(cid, addr) is not None):
+                continue
+            entry = entries.get((cid, addr.lower()))
+            if entry is not None and entry.logo_uri:
+                self._icons.request(cid, addr, entry.logo_uri)
 
     def show_error(self, msg: str) -> None:
         self.table.setRowCount(0)

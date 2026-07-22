@@ -36,16 +36,37 @@ FETCH_TIMEOUT = 10.0
 # oversize body is detected without slurping it whole.
 _MAX_ICON_BYTES = 2 * 1024 * 1024   # 2 MiB
 
+# Public IPFS gateway for ``ipfs://`` logo URIs. Token lists (Uniswap's default
+# in particular) serve many logos as ``ipfs://<cid>[/path]``, which urllib can't
+# fetch — rewrite them onto a well-known HTTPS gateway so the icon loads. The
+# SSRF host check in _safe_icon_fetch still applies (to the fixed public host).
+_IPFS_GATEWAY = "https://ipfs.io/ipfs/"
+
+
+def _normalize_icon_url(url: str) -> str:
+    """Rewrite an ``ipfs://`` URI onto a public HTTPS gateway; pass anything
+    else through unchanged. Handles the ``ipfs://ipfs/<cid>`` double-prefix some
+    lists emit; CID case is preserved (base58 CIDv0 is case-sensitive)."""
+    if url.startswith("ipfs://"):
+        rest = url[len("ipfs://"):].lstrip("/")
+        if rest.startswith("ipfs/"):
+            rest = rest[len("ipfs/"):]
+        return _IPFS_GATEWAY + rest
+    return url
+
 
 def _safe_icon_fetch(url: str) -> bytes:
     """Fetch an icon URL defensively and return its body (capped).
 
     A token list's ``logoURI`` is third-party data, so the URL is untrusted:
-    restrict it to ``http(s)`` (no ``file://`` local reads, no ``ftp://`` …),
-    refuse obvious loopback/private/link-local hosts (a poisoned list shouldn't
-    turn the wallet into an SSRF probe of the user's LAN or its own
-    127.0.0.1:1248 RPC), and cap the read so a huge body can't exhaust memory.
-    Raises ``ValueError`` on a rejected URL, propagates transport errors."""
+    ``ipfs://`` is rewritten onto a public gateway first, then the URL is
+    restricted to ``http(s)`` (no ``file://`` local reads, no ``ftp://`` …),
+    obvious loopback/private/link-local hosts are refused (a poisoned list
+    shouldn't turn the wallet into an SSRF probe of the user's LAN or its own
+    127.0.0.1:1248 RPC), and the read is capped so a huge body can't exhaust
+    memory. Raises ``ValueError`` on a rejected URL, propagates transport
+    errors."""
+    url = _normalize_icon_url(url)
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) icon URL: {url!r}")

@@ -181,6 +181,47 @@ class TestLoadFailureTolerant:
         assert e.source == "a"
 
 
+class TestMergeLogoPreference:
+    """First source wins the entry's identity, but a non-http logo (e.g.
+    Uniswap's ``ipfs://`` UNI logo) must not shadow a later source's fetchable
+    ``http(s)`` one — otherwise the token shows without an icon."""
+
+    def _src(self, name, addr, sym, logo):
+        from qeth.token_discovery import TokenListSource, TokenListEntry
+
+        class _S(TokenListSource):
+            def fetch_entries(self, cache_dir, ttl, timeout):
+                yield TokenListEntry(
+                    chain_id=1, address=addr, symbol=sym, name=sym,
+                    decimals=18, source=name, logo_uri=logo,
+                )
+        _S.name = name
+        return _S()
+
+    def test_ipfs_logo_upgraded_to_a_later_http_logo(self, tmp_qeth):
+        trusted = self._src("trusted", "0xuni", "UNI", "ipfs://QmXtt")
+        backup = self._src("backup", "0xuni", "UNI-B", "https://cdn/uni.png")
+        lists = TokenLists(sources=[trusted, backup])
+        lists.load()
+        e = lists.get(1, "0xuni")
+        assert e.symbol == "UNI" and e.source == "trusted"   # identity kept
+        assert e.logo_uri == "https://cdn/uni.png"           # logo borrowed
+
+    def test_existing_http_logo_is_not_replaced(self, tmp_qeth):
+        a = self._src("a", "0xaaaa", "A", "https://a/logo.png")
+        b = self._src("b", "0xaaaa", "B", "https://b/logo.png")
+        lists = TokenLists(sources=[a, b])
+        lists.load()
+        assert lists.get(1, "0xaaaa").logo_uri == "https://a/logo.png"
+
+    def test_no_later_http_logo_leaves_ipfs_in_place(self, tmp_qeth):
+        # icons._normalize_icon_url still makes this one fetchable.
+        a = self._src("a", "0xbbbb", "A", "ipfs://QmABC")
+        lists = TokenLists(sources=[a])
+        lists.load()
+        assert lists.get(1, "0xbbbb").logo_uri == "ipfs://QmABC"
+
+
 def test_curve_logo_path_is_per_chain(monkeypatch, tmp_path):
     """curve-assets serves token icons from images/assets/ for mainnet and
     images/assets-<slug>/ for every other chain. The logo URL must follow

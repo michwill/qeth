@@ -1235,3 +1235,62 @@ def test_context_menu_opens_on_justify_gap_columns(qtbot, tmp_qeth, monkeypatch)
         y = panel.table.rowViewportPosition(0) + 4
         panel._on_context_menu(QPoint(x, y))
         assert _FakeMenu.opened == [1], f"menu didn't open on gap {gap}"
+
+
+class TestRequestMissingIcons:
+    """A token first painted before its list entry (hence its logo URL) was
+    available must get its icon (re)requested on a later discovery. The
+    in-place balance-update path doesn't run show_balances' per-row request,
+    so without request_missing_icons a token discovered before the token
+    lists loaded (e.g. a freshly-received UNI) would stay iconless."""
+
+    TOK = "0x" + "ab" * 20
+
+    def _entries(self, logo="https://cdn.example/uni.png"):
+        from qeth.token_discovery import TokenListEntry
+        return {(1, self.TOK): TokenListEntry(
+            chain_id=1, address=self.TOK, symbol="UNI", name="Uniswap",
+            decimals=18, source="coingecko", logo_uri=logo)}
+
+    def _paint_iconless(self, qtbot, store, icons):
+        tok = TokenBalance(contract=self.TOK, symbol="UNI", name="Uniswap",
+                           decimals=18, balance_raw=10 ** 18)
+        panel = TokenListPanel(icons, store)
+        qtbot.addWidget(panel)
+        # entries={} → the row is painted with no icon and no request.
+        panel.render_full(ETH, 0, [tok], {}, {}, apply_dust_filter=False)
+        return panel
+
+    def test_requests_icon_a_row_missed(self, qtbot, tmp_qeth, monkeypatch):
+        store = Store.load()
+        icons = IconCache()
+        calls = []
+        monkeypatch.setattr(icons, "request",
+                            lambda cid, c, url: calls.append((cid, c.lower(), url)))
+        panel = self._paint_iconless(qtbot, store, icons)
+        assert calls == []                          # nothing requested yet
+        panel.request_missing_icons(1, self._entries())
+        assert calls == [(1, self.TOK, "https://cdn.example/uni.png")]
+
+    def test_no_request_when_icon_already_cached(self, qtbot, tmp_qeth, monkeypatch):
+        from PySide6.QtGui import QPixmap
+        store = Store.load()
+        icons = IconCache()
+        panel = self._paint_iconless(qtbot, store, icons)
+        icons._mem[(1, self.TOK)] = QPixmap(8, 8)   # icon already present
+        calls = []
+        monkeypatch.setattr(icons, "request",
+                            lambda cid, c, url: calls.append((cid, c, url)))
+        panel.request_missing_icons(1, self._entries())
+        assert calls == []
+
+    def test_no_request_without_a_logo_or_entry(self, qtbot, tmp_qeth, monkeypatch):
+        store = Store.load()
+        icons = IconCache()
+        panel = self._paint_iconless(qtbot, store, icons)
+        calls = []
+        monkeypatch.setattr(icons, "request",
+                            lambda cid, c, url: calls.append((cid, c, url)))
+        panel.request_missing_icons(1, {})                     # no entry at all
+        panel.request_missing_icons(1, self._entries(logo=None))  # entry, no logo
+        assert calls == []
